@@ -28,7 +28,7 @@
 extern "C" {
 #endif
 
-#define BEAVER_DEFAULT_BIND    "0.0.0.0"
+#define BEAVER_DEFAULT_BIND    "127.0.0.1" /* loopback-only by default */
 #define BEAVER_DEFAULT_PORT    5672    /* default AMQP port */
 #define BEAVER_DEFAULT_BACKLOG 511     /* listen() backlog */
 
@@ -71,6 +71,16 @@ struct beaver_conn {
 
     uint32_t         frame_max;       /* negotiated AMQP max frame size */
 
+    /* Heartbeats: once negotiated (Connection.TuneOk), hb_timer fires every
+     * interval/2 to emit a heartbeat frame and to check that the peer has sent
+     * SOMETHING within 2 intervals - otherwise the connection is declared dead
+     * and closed (reclaims half-open connections and their protocol state). */
+    uv_timer_t       hb_timer;
+    uint32_t         hb_interval_ms;  /* negotiated heartbeat * 1000; 0 = off */
+    uint64_t         last_recv_ms;    /* uv_now() at the most recent read */
+    int              n_handles;       /* live uv handles (tcp [+ hb timer]) */
+    int              n_handles_closed;/* freed once every handle has closed */
+
     int              closing;         /* guard so we uv_close exactly once */
     int              send_paused;     /* delivery paused: write buffer is full */
     int              read_paused;     /* reads paused: cluster backpressure */
@@ -98,6 +108,9 @@ struct beaver_server {
     beaver_http_server_t *http;       /* management server (worker 0 only) */
     beaver_stats_t      *stats;       /* shared aggregate counters (not owned) */
     struct cluster_node *cluster;     /* cluster control plane, or NULL (not owned) */
+
+    int                  max_connections;  /* refuse accepts beyond this; 0 = off */
+    uint32_t             max_message_size; /* max publish body bytes; 0 = default */
 
     uv_signal_t          sig_int;     /* SIGINT/SIGTERM (worker 0 only) */
     uv_signal_t          sig_term;
@@ -195,6 +208,11 @@ int beaver_conn_send_full(const beaver_conn_t *conn);
 
 /* Begin closing a single connection (idempotent), on its own loop thread. */
 void beaver_conn_close(beaver_conn_t *conn);
+
+/* Arm the negotiated AMQP heartbeat (from Connection.TuneOk): send a heartbeat
+ * frame every `seconds`/2 and close the connection if the peer sends nothing
+ * for 2*`seconds`. No-op if seconds == 0. Call on the connection's loop. */
+void beaver_conn_enable_heartbeat(beaver_conn_t *conn, uint16_t seconds);
 
 /* Pause reads on a producer connection for cluster flow control (TCP
  * backpressure). A per-server timer resumes it once the cluster reports it is no

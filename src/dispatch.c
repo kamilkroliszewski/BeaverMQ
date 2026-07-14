@@ -48,6 +48,7 @@ typedef struct consumer {
     beaver_queue_t  *queue;      /* owned reference */
     char            *queue_name; /* owned */
     int              no_ack;
+    uint16_t         prefetch;   /* max unacked in flight; 0 = unlimited */
 
     unacked_t       *unacked;
     size_t           n_unacked, cap_unacked;
@@ -428,6 +429,12 @@ static void service_group(beaver_dispatcher_t *d, group_t *g)
                 cand->conn->send_paused = 1;
                 continue;
             }
+            /* Basic.Qos: a manual-ack consumer with a full prefetch window
+             * takes no more deliveries until acks/nacks free slots (the
+             * ack path re-notifies this queue to resume). */
+            if (!cand->no_ack && cand->prefetch &&
+                cand->n_unacked >= cand->prefetch)
+                continue;
             c = cand;
             break;
         }
@@ -496,7 +503,7 @@ static int group_add(group_t *g, consumer_t *c)
 int dispatcher_add_consumer(beaver_dispatcher_t *d, beaver_conn_t *conn,
                             uint16_t channel, const char *tag,
                             const char *vhost, const char *queue_name,
-                            int no_ack)
+                            int no_ack, uint16_t prefetch)
 {
     beaver_queue_t *q = broker_get_queue(d->broker, vhost, queue_name);
     if (!q)
@@ -528,6 +535,7 @@ int dispatcher_add_consumer(beaver_dispatcher_t *d, beaver_conn_t *conn,
     c->queue      = q; /* take the reference from broker_get_queue */
     c->queue_name = strdup(vkey);   /* composite: used only as the group key */
     c->no_ack     = no_ack;
+    c->prefetch   = prefetch;
     if (!c->tag || !c->queue_name) {
         free(c->tag);
         free(c->queue_name);
@@ -581,25 +589,88 @@ int dispatcher_add_consumer(beaver_dispatcher_t *d, beaver_conn_t *conn,
     return 0;
 }
 
-void dispatcher_ack(beaver_dispatcher_t *d, beaver_conn_t *conn,
-                    uint16_t channel, uint64_t delivery_tag)
+/*
+ * Settle unacked deliveries on (conn, channel). Shared by ack and nack:
+ *   - `multiple` settles every delivery with tag <= delivery_tag (or ALL
+ *     outstanding when delivery_tag == 0), per AMQP semantics;
+ *   - `requeue` (nack only) puts the message back on its queue for redelivery
+ *     instead of discarding it.
+ * Returns the number of deliveries settled. Queues that had deliveries
+ * settled are re-notified: acks free prefetch slots, requeues need delivery.
+ */
+static size_t settle_unacked(beaver_dispatcher_t *d, beaver_conn_t *conn,
+                             uint16_t channel, uint64_t delivery_tag,
+                             int multiple, int requeue)
 {
+    size_t settled = 0;
     for (consumer_t *c = d->consumers; c; c = c->next) {
         if (c->conn != conn || c->channel != channel)
             continue;
-        for (size_t i = 0; i < c->n_unacked; i++) {
-            if (c->unacked[i].tag == delivery_tag) {
-                queue_consume_on_ack(c->queue, c->unacked[i].msg->cluster_id);
-                message_unref(c->unacked[i].msg);
-                c->unacked[i] = c->unacked[c->n_unacked - 1];
-                c->n_unacked--;
-                LOG_DEBUG("ack delivery_tag=%" PRIu64 " on '%s'",
-                          delivery_tag, c->tag);
-                return;
+        size_t here = 0;
+        for (size_t i = 0; i < c->n_unacked; ) {
+            uint64_t t = c->unacked[i].tag;
+            int match = multiple ? (delivery_tag == 0 || t <= delivery_tag)
+                                 : (t == delivery_tag);
+            if (!match) {
+                i++;
+                continue;
             }
+            beaver_message_t *msg = c->unacked[i].msg;
+            if (requeue) {
+                /* Back on the queue (at the tail); the message stays in the
+                 * cluster unacked set so the consume watermark cannot pass it. */
+                queue_enqueue(c->queue, msg);
+            } else {
+                /* Consumed-and-gone: let the watermark pass it so replicas
+                 * drop their copies too. */
+                queue_consume_on_ack(c->queue, msg->cluster_id);
+            }
+            message_unref(msg);
+            c->unacked[i] = c->unacked[c->n_unacked - 1];
+            c->n_unacked--;
+            here++;
+            if (!multiple)
+                break;
+        }
+        if (here) {
+            settled += here;
+            dispatcher_notify(d, c->queue); /* freed slots / requeued backlog */
+            if (!multiple)
+                break;
         }
     }
-    LOG_WARN("ack for unknown delivery_tag=%" PRIu64, delivery_tag);
+    return settled;
+}
+
+void dispatcher_ack(beaver_dispatcher_t *d, beaver_conn_t *conn,
+                    uint16_t channel, uint64_t delivery_tag, int multiple)
+{
+    if (settle_unacked(d, conn, channel, delivery_tag, multiple, 0) == 0)
+        LOG_WARN("ack for unknown delivery_tag=%" PRIu64 " (multiple=%d)",
+                 delivery_tag, multiple);
+}
+
+void dispatcher_nack(beaver_dispatcher_t *d, beaver_conn_t *conn,
+                     uint16_t channel, uint64_t delivery_tag,
+                     int multiple, int requeue)
+{
+    size_t n = settle_unacked(d, conn, channel, delivery_tag, multiple, requeue);
+    if (n == 0)
+        LOG_WARN("nack/reject for unknown delivery_tag=%" PRIu64, delivery_tag);
+    else
+        LOG_DEBUG("nack delivery_tag=%" PRIu64 " (multiple=%d requeue=%d): "
+                  "%zu settled", delivery_tag, multiple, requeue, n);
+}
+
+void dispatcher_set_prefetch(beaver_dispatcher_t *d, beaver_conn_t *conn,
+                             uint16_t channel, uint16_t prefetch)
+{
+    for (consumer_t *c = d->consumers; c; c = c->next) {
+        if (c->conn == conn && c->channel == channel) {
+            c->prefetch = prefetch;
+            dispatcher_notify(d, c->queue); /* a raised limit may unblock */
+        }
+    }
 }
 
 void dispatcher_resume_conn(beaver_dispatcher_t *d, beaver_conn_t *conn)

@@ -18,10 +18,13 @@
 #include "cluster.h"
 #include "authstore.h"
 #include "logger.h"
+#include "version.h"
 
 #include <jansson.h>
 
+#include <arpa/inet.h>
 #include <inttypes.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <strings.h>
 #include <stdlib.h>
@@ -108,7 +111,8 @@ static char *build_overview(beaver_http_server_t *h)
     json_t *root = json_object();
 
     json_object_set_new(root, "broker", json_string("BeaverMQ"));
-    json_object_set_new(root, "version", json_string("1.0"));
+    json_object_set_new(root, "version", json_string(BEAVER_VERSION));
+    json_object_set_new(root, "build", json_string(beaver_build_stamp));
     json_object_set_new(root, "workers", json_integer((json_int_t)h->nservers));
     json_object_set_new(root, "uptime_seconds",
                         json_integer((json_int_t)(time(NULL) - h->start_time)));
@@ -350,7 +354,6 @@ static void http_respond(http_conn_t *c, int status, const char *status_text,
                       "Content-Type: %s\r\n"
                       "Content-Length: %zu\r\n"
                       "Connection: close\r\n"
-                      "Access-Control-Allow-Origin: *\r\n"
                       "\r\n",
                       status, status_text, ctype, body_len);
     if (hn < 0) {
@@ -447,17 +450,47 @@ static size_t b64_decode(const char *in, size_t inlen, char *out, size_t outcap)
     return o;
 }
 
-/* Authenticate the request against the authstore via HTTP Basic auth.
- * Returns: 2 = administrator, 1 = valid non-admin user, 0 = no/bad credentials.
- * While the store has NO users (first boot) everything is allowed (3) so the
- * operator can create the initial admin; the moment a user exists, all
- * management access requires credentials. */
-static int mgmt_authenticate(http_conn_t *c, const char *head, size_t head_len)
+/* Is this HTTP connection's peer the loopback interface? Used to confine the
+ * first-boot bootstrap window (no users -> open access) to localhost, so a
+ * remote attacker can never race the operator to create the first admin. */
+static int http_peer_is_loopback(http_conn_t *c)
 {
+    struct sockaddr_storage ss;
+    int len = (int)sizeof(ss);
+    if (uv_tcp_getpeername(&c->handle, (struct sockaddr *)&ss, &len) != 0)
+        return 0;
+    if (ss.ss_family == AF_INET) {
+        uint32_t a = ntohl(((struct sockaddr_in *)&ss)->sin_addr.s_addr);
+        return (a >> 24) == 127;             /* 127.0.0.0/8 */
+    }
+    if (ss.ss_family == AF_INET6) {
+        const struct in6_addr *a6 = &((struct sockaddr_in6 *)&ss)->sin6_addr;
+        if (IN6_IS_ADDR_LOOPBACK(a6))
+            return 1;
+        if (IN6_IS_ADDR_V4MAPPED(a6))        /* ::ffff:127.x.x.x */
+            return a6->s6_addr[12] == 127;
+    }
+    return 0;
+}
+
+/* Authenticate the request against the authstore via HTTP Basic auth.
+ * Returns: 3 = bootstrap window (loopback, no users yet), 2 = administrator,
+ * 1 = valid non-admin user, 0 = no/bad credentials. The authenticated
+ * username is copied into user_out ("" in the bootstrap window).
+ * While the store has NO users (first boot), LOOPBACK requests are allowed
+ * so the local operator can create the initial admin; remote requests are
+ * refused even then. The moment a user exists, all management access requires
+ * credentials. */
+static int mgmt_authenticate(http_conn_t *c, const char *head, size_t head_len,
+                             char *user_out, size_t user_cap)
+{
+    if (user_cap)
+        user_out[0] = '\0';
     authstore_t *as = c->server->nservers > 0
                       ? (authstore_t *)c->server->servers[0]->authstore : NULL;
-    if (!as) return 3;
-    if (authstore_is_open(as)) return 3;    /* bootstrap window */
+    if (!as) return http_peer_is_loopback(c) ? 3 : 0;
+    if (authstore_is_open(as))              /* bootstrap window */
+        return http_peer_is_loopback(c) ? 3 : 0;
 
     /* Find "Authorization: Basic <b64>" among the request headers. */
     for (const char *p = head; p + 21 < head + head_len; p++) {
@@ -477,6 +510,12 @@ static int mgmt_authenticate(http_conn_t *c, const char *head, size_t head_len)
             *colon = '\0';
             if (!authstore_verify(as, plain, colon + 1)) return 0;
             uint32_t tags = authstore_user_tags(as, plain);
+            size_t ul = strlen(plain);
+            if (user_cap) {
+                if (ul >= user_cap) ul = user_cap - 1;
+                memcpy(user_out, plain, ul);
+                user_out[ul] = '\0';
+            }
             return (tags & AUTH_TAG_ADMINISTRATOR) ? 2 : 1;
         }
     }
@@ -633,7 +672,8 @@ static json_t *build_permissions(beaver_http_server_t *h)
 
 /* Apply a config change: through Raft when clustered (consistent on every node),
  * else directly on the local authstore. `op` selects the mutation; unused string
- * args are passed as "". Returns 0 on success. */
+ * args are passed as "". Returns 0 on success, -1 on bad input/OOM, or -2 when
+ * the cluster cannot currently commit (no leader / no quorum). */
 enum cfg_op { CFG_ADD_VHOST, CFG_DEL_VHOST, CFG_ADD_USER, CFG_DEL_USER,
               CFG_SET_PERM, CFG_CLEAR_PERM };
 static int cfg_apply(beaver_http_server_t *h, enum cfg_op op,
@@ -644,6 +684,11 @@ static int cfg_apply(beaver_http_server_t *h, enum cfg_op op,
     authstore_t *as = http_auth(h);
     if (!as) return -1;
     if (cl) {
+        /* Without a reachable leader a proposal would only sit in the inbox
+         * while the client saw a bogus "ok" - refuse honestly instead, so the
+         * operator learns the cluster is down rather than "losing" the change. */
+        if (cluster_health(cl) != CL_HEALTH_OK)
+            return -2;
         switch (op) {
         case CFG_ADD_VHOST:  return cluster_replicate_add_vhost(cl, a);
         case CFG_DEL_VHOST:  return cluster_replicate_del_vhost(cl, a);
@@ -676,6 +721,19 @@ static const char *jstr(json_t *o, const char *k, const char *dflt)
     return (v && json_is_string(v)) ? json_string_value(v) : dflt;
 }
 
+/* Vhost/user names end up in the broker's composite "<vhost>\x01<name>"
+ * registry keys and in log lines, so control bytes are never allowed (same
+ * rule the AMQP layer enforces). */
+static int mgmt_name_ok(const char *s)
+{
+    if (!s || !s[0])
+        return 0;
+    for (; *s; s++)
+        if ((unsigned char)*s < 0x20 || (unsigned char)*s == 0x7f)
+            return 0;
+    return 1;
+}
+
 /* URL-decode in place (handles %XX and '+'); returns the new length. */
 static size_t url_decode(char *s)
 {
@@ -701,6 +759,21 @@ static uint32_t parse_tags(const char *s)
     return t;
 }
 
+/* Answer a cfg_apply() outcome: ok, 400 (bad input), or 503 (cluster down). */
+static void respond_cfg_result(http_conn_t *c, int rc, const char *badreq_msg)
+{
+    if (rc == -2) {
+        http_respond_error(c, 503, "Service Unavailable",
+                           "cluster has no leader/quorum; check /api/cluster");
+    } else if (rc) {
+        http_respond_error(c, 400, "Bad Request", badreq_msg);
+    } else {
+        json_t *o = json_object();
+        json_object_set_new(o, "status", json_string("ok"));
+        respond_obj(c, o);
+    }
+}
+
 /* Handle POST/DELETE on the management endpoints. Returns 1 if it owned the
  * route (responded), 0 if the path is not a management mutation. */
 static int handle_mgmt(http_conn_t *c, const char *method, const char *path,
@@ -714,10 +787,9 @@ static int handle_mgmt(http_conn_t *c, const char *method, const char *path,
     if (is_post && strcmp(path, "/api/vhosts") == 0) {
         json_error_t err; json_t *j = json_loadb(body, body_len, 0, &err);
         const char *name = j ? jstr(j, "name", "") : "";
-        int rc = (name[0]) ? cfg_apply(h, CFG_ADD_VHOST, name, "", "", "", "", 0) : -1;
+        int rc = mgmt_name_ok(name) ? cfg_apply(h, CFG_ADD_VHOST, name, "", "", "", "", 0) : -1;
         if (j) json_decref(j);
-        if (rc) http_respond_error(c, 400, "Bad Request", "missing/invalid 'name'");
-        else { json_t *o = json_object(); json_object_set_new(o,"status",json_string("ok")); respond_obj(c,o); }
+        respond_cfg_result(c, rc, "missing/invalid 'name'");
         return 1;
     }
     if (is_post && strcmp(path, "/api/users") == 0) {
@@ -726,13 +798,12 @@ static int handle_mgmt(http_conn_t *c, const char *method, const char *path,
         const char *pass = j ? jstr(j,"password","") : "";
         uint32_t tags = parse_tags(j ? jstr(j,"tags","") : "");
         int rc = -1;
-        if (name[0] && pass[0]) {
-            char hash[80]; authstore_hash_password(pass, hash, sizeof hash);
+        if (mgmt_name_ok(name) && pass[0]) {
+            char hash[AUTHSTORE_HASH_MAX]; authstore_hash_password(pass, hash, sizeof hash);
             rc = cfg_apply(h, CFG_ADD_USER, name, hash, "", "", "", tags);
         }
         if (j) json_decref(j);
-        if (rc) http_respond_error(c, 400, "Bad Request", "missing 'name'/'password'");
-        else { json_t *o=json_object(); json_object_set_new(o,"status",json_string("ok")); respond_obj(c,o); }
+        respond_cfg_result(c, rc, "missing 'name'/'password'");
         return 1;
     }
     if (is_post && strcmp(path, "/api/permissions") == 0) {
@@ -744,20 +815,19 @@ static int handle_mgmt(http_conn_t *c, const char *method, const char *path,
         const char *rd   = j ? jstr(j,"read",".*") : ".*";
         int rc = (user[0] && vh[0]) ? cfg_apply(h, CFG_SET_PERM, user, vh, cf, wr, rd, 0) : -1;
         if (j) json_decref(j);
-        if (rc) http_respond_error(c, 400, "Bad Request", "missing 'user'/'vhost'");
-        else { json_t *o=json_object(); json_object_set_new(o,"status",json_string("ok")); respond_obj(c,o); }
+        respond_cfg_result(c, rc, "missing 'user'/'vhost'");
         return 1;
     }
     if (is_del && strncmp(path, "/api/vhosts/", 12) == 0) {
         char name[256]; snprintf(name, sizeof name, "%s", path + 12); url_decode(name);
-        cfg_apply(h, CFG_DEL_VHOST, name, "", "", "", "", 0);
-        json_t *o=json_object(); json_object_set_new(o,"status",json_string("ok")); respond_obj(c,o);
+        respond_cfg_result(c, cfg_apply(h, CFG_DEL_VHOST, name, "", "", "", "", 0),
+                           "delete failed");
         return 1;
     }
     if (is_del && strncmp(path, "/api/users/", 11) == 0) {
         char name[256]; snprintf(name, sizeof name, "%s", path + 11); url_decode(name);
-        cfg_apply(h, CFG_DEL_USER, name, "", "", "", "", 0);
-        json_t *o=json_object(); json_object_set_new(o,"status",json_string("ok")); respond_obj(c,o);
+        respond_cfg_result(c, cfg_apply(h, CFG_DEL_USER, name, "", "", "", "", 0),
+                           "delete failed");
         return 1;
     }
     if (is_del && strncmp(path, "/api/permissions/", 17) == 0) {
@@ -769,8 +839,8 @@ static int handle_mgmt(http_conn_t *c, const char *method, const char *path,
         char user[256], vh[256];
         snprintf(user, sizeof user, "%s", rest); url_decode(user);
         snprintf(vh, sizeof vh, "%s", slash + 1); url_decode(vh);
-        cfg_apply(h, CFG_CLEAR_PERM, user, vh, "", "", "", 0);
-        json_t *o=json_object(); json_object_set_new(o,"status",json_string("ok")); respond_obj(c,o);
+        respond_cfg_result(c, cfg_apply(h, CFG_CLEAR_PERM, user, vh, "", "", "", 0),
+                           "delete failed");
         return 1;
     }
     return 0;
@@ -818,12 +888,26 @@ static void handle_request(http_conn_t *c)
 
     beaver_http_server_t *h = c->server;
 
+    /* Liveness/build probe - deliberately UNAUTHENTICATED (no broker state
+     * beyond the version): lets a deploy script confirm which build the
+     * running process is, so a stale not-restarted broker is caught at once. */
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/healthz") == 0) {
+        json_t *o = json_object();
+        json_object_set_new(o, "status", json_string("ok"));
+        json_object_set_new(o, "version", json_string(BEAVER_VERSION));
+        json_object_set_new(o, "build", json_string(beaver_build_stamp));
+        respond_obj(c, o);
+        return;
+    }
+
     /* Access control: everything (API + dashboard) requires HTTP Basic auth once
      * any user exists; mutations additionally require the administrator tag. On
      * a fresh broker (no users) access is open so the first admin can be made. */
     char *head_end = memmem(c->inbuf, c->inbuf_len, "\r\n\r\n", 4);
     size_t head_len = head_end ? (size_t)(head_end - c->inbuf) + 4 : c->inbuf_len;
-    int auth_level = mgmt_authenticate(c, c->inbuf, head_len);
+    char auth_user[128];
+    int auth_level = mgmt_authenticate(c, c->inbuf, head_len,
+                                       auth_user, sizeof auth_user);
     if (auth_level == 0) {
         http_respond_401(c);
         return;
@@ -841,7 +925,14 @@ static void handle_request(http_conn_t *c)
         if (body) { body += 4; body_len = c->inbuf_len - (size_t)(body - c->inbuf); }
         if (handle_mgmt(c, method, path, body ? body : "", body_len))
             return;
-        http_respond_error(c, 404, "Not Found", "no such API resource");
+        /* A known read-only endpoint hit with POST/DELETE is 405, not 404. */
+        if (strcmp(path, "/api/overview") == 0 || strcmp(path, "/api/queues") == 0 ||
+            strcmp(path, "/api/exchanges") == 0 ||
+            strcmp(path, "/api/connections") == 0 ||
+            strcmp(path, "/api/cluster") == 0 || strcmp(path, "/api") == 0)
+            http_respond_error(c, 405, "Method Not Allowed", "read-only endpoint");
+        else
+            http_respond_error(c, 404, "Not Found", "no such API resource");
         return;
     }
 
@@ -850,7 +941,16 @@ static void handle_request(http_conn_t *c)
         return;
     }
 
-    if (strcmp(path, "/api/overview") == 0)
+    if (strcmp(path, "/api/whoami") == 0) {
+        /* Who is making this request: drives the GUI's login indicator. */
+        json_t *o = json_object();
+        json_object_set_new(o, "user", json_string(auth_user));
+        json_object_set_new(o, "level",
+            json_string(auth_level == 3 ? "open"
+                        : auth_level == 2 ? "administrator" : "user"));
+        respond_obj(c, o);
+    }
+    else if (strcmp(path, "/api/overview") == 0)
         http_respond_json(c, build_overview(h));
     else if (strcmp(path, "/api/queues") == 0)
         http_respond_json(c, build_queues(h));

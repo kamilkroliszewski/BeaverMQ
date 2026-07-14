@@ -59,17 +59,33 @@ void dispatcher_free(beaver_dispatcher_t *d);
 void dispatcher_request_close(beaver_dispatcher_t *d);
 
 /*
- * Register a consumer on a queue (within `vhost`). Returns 0 on success, -1 if
- * the queue does not exist or on allocation failure. Schedules any backlog.
+ * Register a consumer on a queue (within `vhost`). `prefetch` caps the number
+ * of unacked deliveries in flight to this consumer (0 = unlimited; ignored for
+ * no_ack consumers). Returns 0 on success, -1 if the queue does not exist or
+ * on allocation failure. Schedules any backlog.
  */
 int dispatcher_add_consumer(beaver_dispatcher_t *d, beaver_conn_t *conn,
                             uint16_t channel, const char *tag,
                             const char *vhost, const char *queue_name,
-                            int no_ack);
+                            int no_ack, uint16_t prefetch);
 
-/* Acknowledge a delivery on (conn, channel). Drops the tracked message. */
+/* Acknowledge a delivery on (conn, channel). Drops the tracked message(s).
+ * With `multiple`, acks every delivery up to and including delivery_tag
+ * (delivery_tag 0 = everything outstanding), per AMQP Basic.Ack semantics. */
 void dispatcher_ack(beaver_dispatcher_t *d, beaver_conn_t *conn,
-                    uint16_t channel, uint64_t delivery_tag);
+                    uint16_t channel, uint64_t delivery_tag, int multiple);
+
+/* Negative acknowledgement (Basic.Nack / Basic.Reject): drop the tracked
+ * delivery (or every one up to delivery_tag when `multiple`); if `requeue`,
+ * the message goes back on its queue for redelivery, else it is discarded. */
+void dispatcher_nack(beaver_dispatcher_t *d, beaver_conn_t *conn,
+                     uint16_t channel, uint64_t delivery_tag,
+                     int multiple, int requeue);
+
+/* Apply a Basic.Qos prefetch count to every existing consumer on (conn,
+ * channel); newly added consumers get it via dispatcher_add_consumer. */
+void dispatcher_set_prefetch(beaver_dispatcher_t *d, beaver_conn_t *conn,
+                             uint16_t channel, uint16_t prefetch);
 
 /* Cancel a single consumer (Basic.Cancel) by tag, requeuing its unacked. */
 void dispatcher_cancel(beaver_dispatcher_t *d, beaver_conn_t *conn,

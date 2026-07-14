@@ -19,6 +19,7 @@
 #include "cluster.h"
 #include "config.h"
 #include "authstore.h"
+#include "version.h"
 
 #include <uv.h>
 
@@ -177,6 +178,8 @@ static int worker_init(app_t *app, worker_t *w, int id)
     w->server.authstore  = app->authstore;
     w->server.dispatcher = w->dispatcher;
     w->server.stats      = &app->stats;
+    w->server.max_connections  = app->config.max_connections;
+    w->server.max_message_size = app->config.max_message_size;
     beaver_server_install_shutdown_async(&w->server);
     return 0;
 }
@@ -430,6 +433,9 @@ static int cli_add_user(int argc, char **argv)
             fprintf(stderr, "error: authentication required - pass -u admin:password\n");
         else if (status == 403)
             fprintf(stderr, "error: the -u user is not an administrator\n");
+        else if (status == 503)
+            fprintf(stderr, "error: the cluster has no leader/quorum - start the "
+                    "other nodes, or run standalone (cluster = off)\n");
         else
             fprintf(stderr, "error: HTTP %d creating user\n", status);
         return 1;
@@ -464,6 +470,12 @@ int main(int argc, char **argv)
     /* Subcommands (no broker start). */
     if (argc > 1 && strcmp(argv[1], "add-user") == 0)
         return cli_add_user(argc - 2, argv + 2);
+    if (argc > 1 && (strcmp(argv[1], "--version") == 0 ||
+                     strcmp(argv[1], "-v") == 0 ||
+                     strcmp(argv[1], "version") == 0)) {
+        printf("BeaverMQ %s (build %s)\n", BEAVER_VERSION, beaver_build_stamp);
+        return 0;
+    }
 
     log_init(LOG_LEVEL_INFO, stderr);
     /* Ignore SIGPIPE so a write to a vanished peer returns EPIPE (handled by
@@ -484,16 +496,29 @@ int main(int argc, char **argv)
     memset(&app, 0, sizeof(app));
     config_defaults(&app.config);
 
-    /* CLI arg: a config file path, or a bare number as an AMQP port override. */
+    /* CLI arg: a config file path, or a bare number as an AMQP port override.
+     * Anything else (a typo, an unknown subcommand, a missing file) is a hard
+     * error - silently starting a full broker with default config instead of
+     * e.g. running `add-user` is far worse than refusing. */
     const char *cli_conf = NULL;
     int cli_port = 0;
     if (argc > 1) {
         char *end = NULL;
         long p = strtol(argv[1], &end, 10);
-        if (*end == '\0' && p > 0 && p < 65536)
+        if (*end == '\0' && p > 0 && p < 65536) {
             cli_port = (int)p;
-        else
+        } else if (file_readable(argv[1])) {
             cli_conf = argv[1];
+        } else {
+            fprintf(stderr,
+                "error: '%s' is neither a readable config file, a port number, "
+                "nor a known subcommand\n"
+                "usage: beavermq [config.conf | amqp_port]\n"
+                "       beavermq add-user <name> <password> [tags] "
+                "[-u admin:pw] [-H host] [-p http_port]\n"
+                "       beavermq --version\n", argv[1]);
+            return 2;
+        }
     }
 
     char conf_path[600];
@@ -505,7 +530,9 @@ int main(int argc, char **argv)
     config_resolve_threads(&app.config);
     log_set_level(app.config.log_level);
 
-    LOG_INFO("BeaverMQ starting up (%d worker thread%s, AMQP :%d, HTTP :%d)",
+    LOG_INFO("BeaverMQ %s (build %s) starting up "
+             "(%d worker thread%s, AMQP :%d, HTTP :%d)",
+             BEAVER_VERSION, beaver_build_stamp,
              app.config.threads, app.config.threads == 1 ? "" : "s",
              app.config.amqp_port, app.config.http_port);
     raise_fd_limit();

@@ -190,6 +190,10 @@ a { color: inherit; text-decoration: none; }
 .pill.bad   { color: var(--red); border-color: var(--red-weak); background: var(--red-weak); }
 .pill.bad .dot   { background: var(--red); box-shadow: 0 0 0 3px var(--red-weak); }
 
+/* Access-control mutation errors: must be VISIBLE, not muted gray. */
+.access-msg      { color: var(--red); font-weight: 600; }
+.access-msg-card { border-color: var(--red); }
+
 .btn {
   display: inline-flex; align-items: center; gap: 7px; justify-content: center;
   height: 34px; padding: 0 12px; border-radius: var(--radius-sm);

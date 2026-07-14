@@ -59,7 +59,12 @@ int authstore_check(authstore_t *s, const char *user, const char *vhost,
                     auth_perm_t kind, const char *object);
 
 /* ---- helpers ------------------------------------------------------------- */
-/* Produce a storable salted-SHA-256 hash for `password` (hex). out_cap >= 80. */
+/* Max stored password-hash length, including the NUL terminator. */
+#define AUTHSTORE_HASH_MAX 128
+
+/* Produce a storable password hash (PBKDF2-HMAC-SHA256, salted, versioned
+ * "$p2$..." format). out_cap must be >= AUTHSTORE_HASH_MAX. Legacy single-round
+ * salted-SHA-256 hashes are still accepted by authstore_verify(). */
 void authstore_hash_password(const char *password, char *out, size_t out_cap);
 
 /* ---- enumeration (management API; callback under the read lock) ----------- */

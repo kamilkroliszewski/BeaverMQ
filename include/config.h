@@ -10,6 +10,8 @@
 
 #include "logger.h"
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -26,8 +28,14 @@ typedef struct {
     log_level_t log_level;
     char        web_root[512];  /* "" = auto-detect */
 
+    /* Resource limits (DoS protection). */
+    int      max_connections;   /* max concurrent AMQP connections; 0 = unlimited */
+    uint32_t max_message_size;  /* max message body bytes; 0 = built-in cap */
+
     /* Clustering (optional; disabled unless cluster_nodes is configured). */
     int  cluster_enabled;
+    int  cluster_explicit;      /* `cluster` key was set: it wins over the
+                                 * implicit enable from cluster_nodes */
     int  node_id;               /* this node's id; index into cluster_nodes */
     int  cluster_nnodes;        /* number of entries parsed from cluster_nodes */
     char cluster_nodes[BEAVER_MAX_CLUSTER_NODES][72]; /* "ip:port" per node id */

@@ -122,6 +122,14 @@ const app = createApp({
       <span class="grow"></span>
       <span class="cluster" v-if="overview">cluster <b>{{ ov.broker }}</b></span>
       <span class="pill" :class="connected ? 'ok' : 'bad'"><span class="dot"></span>{{ connected ? 'Connected' : 'Offline' }}</span>
+      <span class="pill" v-if="me" :class="me.level === 'open' ? 'bad' : 'ok'"
+            :title="me.level === 'open'
+                    ? 'No users configured - open bootstrap access from localhost'
+                    : 'Signed in as ' + me.user + ' (' + me.level + ')'">
+        <span class="dot"></span>{{ me.level === 'open' ? 'no auth (bootstrap)' : me.user }}
+      </span>
+      <button class="btn" v-if="me && me.level !== 'open'" @click="logout"
+              title="Sign out (the browser forgets the Basic-auth credentials and prompts again)">Logout</button>
       <span class="muted" style="font-size:12px" v-if="lastUpdated">{{ lastUpdated }}</span>
       <select class="select" v-model.number="refreshMs">
         <option v-for="o in refreshOpts" :key="o.v" :value="o.v">{{ o.t === 'Paused' ? o.t : 'every ' + o.t }}</option>
@@ -368,7 +376,7 @@ const app = createApp({
 
       <!-- ===== ACCESS CONTROL ===== -->
       <section v-show="view === 'access'" class="grid" style="gap:16px">
-        <div v-if="accessMsg" class="card" style="padding:10px 16px"><span class="muted">{{ accessMsg }}</span></div>
+        <div v-if="accessMsg" class="card access-msg-card" style="padding:10px 16px"><span class="access-msg">{{ accessMsg }}</span></div>
 
         <div class="card">
           <div class="card-head"><h2>Virtual hosts</h2><span class="sub">{{ vhosts.length }} total</span></div>
@@ -577,6 +585,7 @@ const app = createApp({
       /* Access-control page state. */
       vhosts: [], users: [], perms: [],
       accessMsg: '',
+      me: null,        /* /api/whoami: { user, level } - login indicator */
       newVhost: '',
       newUser: { name: '', password: '', admin: false },
       newPerm: { user: '', vhost: '', configure: '.*', write: '.*', read: '.*' },
@@ -772,6 +781,17 @@ const app = createApp({
     applyTheme() { document.documentElement.setAttribute('data-theme', this.theme); },
     toggleTheme() { this.theme = this.theme === 'dark' ? 'light' : 'dark'; },
 
+    /* HTTP Basic auth has no server-side session to destroy. The XHR below
+     * supplies deliberately-wrong credentials through the browser's own auth
+     * machinery, which overwrites the cached ones; the reload then gets a 401
+     * and the browser shows its login prompt again. */
+    logout() {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/api/whoami', true, 'logout', String(Date.now()));
+      xhr.onloadend = () => location.reload();
+      try { xhr.send(); } catch (e) { location.reload(); }
+    },
+
     restartTimer() {
       if (this._timer) { clearInterval(this._timer); this._timer = null; }
       if (this.refreshMs > 0) this._timer = setInterval(() => this.fetchAll(), this.refreshMs);
@@ -837,7 +857,7 @@ const app = createApp({
       try {
         /* allSettled: one slow/failed endpoint must not discard the others'
          * data nor falsely flip the connection state to offline. */
-        const [ovR, qsR, xsR, csR, clR, vhR, usR, pmR] = await Promise.allSettled([
+        const [ovR, qsR, xsR, csR, clR, vhR, usR, pmR, meR] = await Promise.allSettled([
           fetch('/api/overview').then((r) => r.json()),
           fetch('/api/queues').then((r) => r.json()),
           fetch('/api/exchanges').then((r) => r.json()),
@@ -846,6 +866,7 @@ const app = createApp({
           fetch('/api/vhosts').then((r) => r.json()),
           fetch('/api/users').then((r) => r.json()),
           fetch('/api/permissions').then((r) => r.json()),
+          fetch('/api/whoami').then((r) => r.json()),
         ]);
         const ov = ovR.status === 'fulfilled' ? ovR.value : null;
         const arr = (r) => (r.status === 'fulfilled' && Array.isArray(r.value)) ? r.value : null;
@@ -858,6 +879,8 @@ const app = createApp({
         this.vhosts = arr(vhR) || this.vhosts;
         this.users  = arr(usR) || this.users;
         this.perms  = arr(pmR) || this.perms;
+        if (meR.status === 'fulfilled' && meR.value && meR.value.level)
+          this.me = meR.value;
         this.process(ov, arr(qsR), arr(xsR), arr(csR));
       } catch (e) {
         this.connected = false;

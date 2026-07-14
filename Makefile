@@ -58,8 +58,22 @@ else
 all: $(BIN)
 endif
 
+# --- Build stamp -------------------------------------------------------------
+# Regenerated at every link so `beavermq --version`, the startup log and
+# /api/healthz identify EXACTLY which build a process is running - a stale
+# binary/process after a deploy is then immediately visible.
+VERSION_SRC := $(BUILD_DIR)/version.c
+VERSION_OBJ := $(OBJ_DIR)/version.o
+
+.PHONY: version_src
+version_src:
+$(VERSION_OBJ): version_src | $(OBJ_DIR)
+	@printf 'const char beaver_build_stamp[] = "%s";\n' \
+		"$$(date '+%Y-%m-%d %H:%M:%S')" > $(VERSION_SRC)
+	@$(CC) $(CFLAGS) -c $(VERSION_SRC) -o $@
+
 # --- Linking ---------------------------------------------------------------
-$(BIN): $(LIB_OBJS) $(MAIN_OBJ)
+$(BIN): $(LIB_OBJS) $(MAIN_OBJ) $(VERSION_OBJ)
 	@echo "  LD    $@"
 	@$(CC) $^ $(LDFLAGS) $(LDLIBS) -o $@
 
@@ -69,9 +83,9 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
 	@$(CC) $(CFLAGS) -c $< -o $@
 
 # Each test binary links against all non-main library objects.
-$(BUILD_DIR)/%: $(TEST_DIR)/%.c $(LIB_OBJS) | $(BUILD_DIR)
+$(BUILD_DIR)/%: $(TEST_DIR)/%.c $(LIB_OBJS) $(VERSION_OBJ) | $(BUILD_DIR)
 	@echo "  CCLD  $@"
-	@$(CC) $(CFLAGS) $< $(LIB_OBJS) $(LDFLAGS) $(LDLIBS) -o $@
+	@$(CC) $(CFLAGS) $< $(LIB_OBJS) $(VERSION_OBJ) $(LDFLAGS) $(LDLIBS) -o $@
 
 # --- Convenience targets ---------------------------------------------------
 test: $(TEST_BINS)

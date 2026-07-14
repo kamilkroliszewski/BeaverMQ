@@ -17,9 +17,15 @@ void config_defaults(beaver_config_t *c)
     c->threads   = 0; /* auto */
     c->amqp_port = 5672;
     c->http_port = 15672;
-    snprintf(c->bind_addr, sizeof(c->bind_addr), "%s", "0.0.0.0");
+    /* Secure default: loopback only. Binding to 0.0.0.0 exposes the (plaintext)
+     * AMQP + management listeners to the network; the operator must opt in via
+     * the `bind` key once auth is configured. */
+    snprintf(c->bind_addr, sizeof(c->bind_addr), "%s", "127.0.0.1");
     c->log_level = LOG_LEVEL_INFO;
     c->web_root[0] = '\0';
+
+    c->max_connections  = 0;                  /* unlimited (bounded by fds)   */
+    c->max_message_size = 16u * 1024u * 1024u; /* 16 MiB, like RabbitMQ 4.x   */
 
     c->cluster_enabled = 0;
     c->node_id         = 0;
@@ -62,6 +68,22 @@ static int parse_threads(const char *v, int *out)
     return 0;
 }
 
+/* Parse a byte size: a plain number with an optional k/K or m/M suffix
+ * (multiples of 1024). Returns 0 on success. */
+static int parse_size(const char *v, uint32_t *out)
+{
+    char *end = NULL;
+    unsigned long n = strtoul(v, &end, 10);
+    if (end == v)
+        return -1;
+    if (*end == 'k' || *end == 'K') { n *= 1024ul; end++; }
+    else if (*end == 'm' || *end == 'M') { n *= 1024ul * 1024ul; end++; }
+    if (*end != '\0' || n > 0xFFFFFFFFul)
+        return -1;
+    *out = (uint32_t)n;
+    return 0;
+}
+
 /* Parse on/off/true/false/yes/no/1/0. Returns 0 on success. */
 static int parse_bool(const char *v, int *out)
 {
@@ -98,8 +120,12 @@ static void parse_cluster_nodes(beaver_config_t *c, const char *val,
         snprintf(c->cluster_nodes[n], sizeof(c->cluster_nodes[n]), "%s", tok);
         n++;
     }
-    c->cluster_nnodes  = n;
-    c->cluster_enabled = (n > 0);
+    c->cluster_nnodes = n;
+    /* A node list implies clustering, but an EXPLICIT `cluster = on/off` always
+     * wins - regardless of key order in the file (`cluster = off` above a
+     * cluster_nodes line must still disable it). */
+    if (!c->cluster_explicit)
+        c->cluster_enabled = (n > 0);
 }
 
 static void apply_kv(beaver_config_t *c, const char *key, const char *val,
@@ -120,9 +146,21 @@ static void apply_kv(beaver_config_t *c, const char *key, const char *val,
             LOG_WARN("config(%s): invalid log_level '%s'", src, val);
     } else if (strcmp(key, "web_root") == 0) {
         snprintf(c->web_root, sizeof(c->web_root), "%s", val);
+    } else if (strcmp(key, "max_connections") == 0) {
+        int n = atoi(val);
+        if (n < 0)
+            LOG_WARN("config(%s): invalid max_connections '%s'", src, val);
+        else
+            c->max_connections = n;
+    } else if (strcmp(key, "max_message_size") == 0) {
+        if (parse_size(val, &c->max_message_size) != 0)
+            LOG_WARN("config(%s): invalid max_message_size '%s' "
+                     "(bytes, or with k/m suffix)", src, val);
     } else if (strcmp(key, "cluster") == 0) {
         if (parse_bool(val, &c->cluster_enabled) != 0)
             LOG_WARN("config(%s): invalid cluster '%s' (use on/off)", src, val);
+        else
+            c->cluster_explicit = 1;
     } else if (strcmp(key, "node_id") == 0) {
         c->node_id = atoi(val);
     } else if (strcmp(key, "cluster_nodes") == 0) {
@@ -179,6 +217,10 @@ void config_apply_env(beaver_config_t *c)
     if ((v = getenv("BEAVERMQ_BIND")))       apply_kv(c, "bind", v, "env");
     if ((v = getenv("BEAVERMQ_LOG_LEVEL")))  apply_kv(c, "log_level", v, "env");
     if ((v = getenv("BEAVERMQ_WEB_ROOT")))   apply_kv(c, "web_root", v, "env");
+    if ((v = getenv("BEAVERMQ_MAX_CONNECTIONS")))
+        apply_kv(c, "max_connections", v, "env");
+    if ((v = getenv("BEAVERMQ_MAX_MESSAGE_SIZE")))
+        apply_kv(c, "max_message_size", v, "env");
     if ((v = getenv("BEAVERMQ_CLUSTER")))       apply_kv(c, "cluster", v, "env");
     if ((v = getenv("BEAVERMQ_NODE_ID")))       apply_kv(c, "node_id", v, "env");
     if ((v = getenv("BEAVERMQ_CLUSTER_NODES"))) apply_kv(c, "cluster_nodes", v, "env");

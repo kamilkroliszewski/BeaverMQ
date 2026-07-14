@@ -27,7 +27,7 @@
 static void on_new_connection(uv_stream_t *server_stream, int status);
 static void alloc_buffer(uv_handle_t *handle, size_t suggested, uv_buf_t *buf);
 static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf);
-static void on_conn_close(uv_handle_t *handle);
+static void on_conn_handle_closed(uv_handle_t *handle);
 static void on_write(uv_write_t *req, int status);
 
 typedef struct {
@@ -133,6 +133,7 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
     beaver_conn_t *conn = stream->data;
 
     if (nread > 0) {
+        conn->last_recv_ms = uv_now(conn->server->loop); /* heartbeat liveness */
         atomic_fetch_add_explicit(&conn->bytes_received, (uint64_t)nread,
                                   memory_order_relaxed);
         atomic_fetch_add_explicit(&conn->server->stats->total_bytes,
@@ -155,12 +156,30 @@ static void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
 
 /* ---- connection teardown ------------------------------------------------- */
 
-static void on_conn_close(uv_handle_t *handle)
+/* Shared close callback for every uv handle embedded in the connection (the
+ * TCP handle and, when initialized, the heartbeat timer). The connection is
+ * freed only after the LAST handle has closed - freeing earlier would leave
+ * libuv holding a pointer into freed memory. */
+static void on_conn_handle_closed(uv_handle_t *handle)
 {
     beaver_conn_t *conn = handle->data;
+    if (++conn->n_handles_closed < conn->n_handles)
+        return;
     protocol_conn_free(conn->proto); /* safe even if NULL */
     free(conn->rbuf);
     free(conn);
+}
+
+/* Close every uv handle the connection owns (exactly once each). */
+static void conn_close_handles(beaver_conn_t *conn)
+{
+    if (conn->n_handles > 1) {
+        uv_timer_stop(&conn->hb_timer);
+        if (!uv_is_closing((uv_handle_t *)&conn->hb_timer))
+            uv_close((uv_handle_t *)&conn->hb_timer, on_conn_handle_closed);
+    }
+    if (!uv_is_closing((uv_handle_t *)&conn->handle))
+        uv_close((uv_handle_t *)&conn->handle, on_conn_handle_closed);
 }
 
 void beaver_conn_close(beaver_conn_t *conn)
@@ -183,7 +202,37 @@ void beaver_conn_close(beaver_conn_t *conn)
     LOG_INFO("conn #%" PRIu64 " (%s): disconnected; %" PRId64 " active",
              conn->id, conn->peer, active);
 
-    uv_close((uv_handle_t *)&conn->handle, on_conn_close);
+    conn_close_handles(conn);
+}
+
+/* ---- heartbeats ----------------------------------------------------------- */
+
+/* A complete AMQP heartbeat frame: type 8, channel 0, empty payload, 0xCE. */
+static const uint8_t HEARTBEAT_FRAME[8] = { 8, 0, 0, 0, 0, 0, 0, 0xCE };
+
+static void on_heartbeat_timer(uv_timer_t *timer)
+{
+    beaver_conn_t *conn = timer->data;
+    if (conn->closing)
+        return;
+    uint64_t now = uv_now(conn->server->loop);
+    if (now - conn->last_recv_ms > 2ull * conn->hb_interval_ms) {
+        LOG_WARN("conn #%" PRIu64 " (%s): no traffic for 2 heartbeat "
+                 "intervals; closing dead connection", conn->id, conn->peer);
+        beaver_conn_close(conn);
+        return;
+    }
+    beaver_conn_send(conn, HEARTBEAT_FRAME, sizeof(HEARTBEAT_FRAME));
+}
+
+void beaver_conn_enable_heartbeat(beaver_conn_t *conn, uint16_t seconds)
+{
+    if (seconds == 0 || conn->n_handles < 2 || conn->closing)
+        return; /* heartbeats disabled, or the timer never initialized */
+    conn->hb_interval_ms = (uint32_t)seconds * 1000u;
+    conn->last_recv_ms   = uv_now(conn->server->loop);
+    uv_timer_start(&conn->hb_timer, on_heartbeat_timer,
+                   conn->hb_interval_ms / 2, conn->hb_interval_ms / 2);
 }
 
 /* ---- write path ---------------------------------------------------------- */
@@ -336,22 +385,40 @@ static void on_new_connection(uv_stream_t *server_stream, int status)
     }
     conn->handle.data = conn;
     conn->server      = server;
+    conn->n_handles   = 1;
     conn->id = atomic_fetch_add_explicit(&server->stats->next_conn_id, 1,
                                          memory_order_relaxed) + 1;
+    /* Heartbeat timer (armed later, once TuneOk negotiates an interval). */
+    if (uv_timer_init(server->loop, &conn->hb_timer) == 0) {
+        conn->hb_timer.data = conn;
+        conn->n_handles = 2;
+    }
+    conn->last_recv_ms = uv_now(server->loop);
 
     rc = uv_accept(server_stream, (uv_stream_t *)&conn->handle);
     if (rc != 0 || server->shutting_down) {
-        uv_close((uv_handle_t *)&conn->handle, on_conn_close);
+        conn_close_handles(conn);
         return;
     }
 
     fill_peername(conn);
+
+    /* Connection cap (DoS guard): accept (to drain the backlog), then refuse. */
+    if (server->max_connections > 0 &&
+        atomic_load_explicit(&server->stats->active_conns,
+                             memory_order_relaxed) >= server->max_connections) {
+        LOG_WARN("conn #%" PRIu64 " (%s): refused - max_connections (%d) reached",
+                 conn->id, conn->peer, server->max_connections);
+        conn_close_handles(conn);
+        return;
+    }
+
     uv_tcp_nodelay(&conn->handle, 1); /* low latency: disable Nagle */
 
     conn->proto = protocol_conn_new(conn);
     if (!conn->proto) {
         LOG_ERROR("conn #%" PRIu64 ": OOM allocating protocol state", conn->id);
-        uv_close((uv_handle_t *)&conn->handle, on_conn_close);
+        conn_close_handles(conn);
         return;
     }
 

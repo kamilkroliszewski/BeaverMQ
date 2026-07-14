@@ -140,19 +140,32 @@ void log_log(log_level_t level, const char *file, int line,
         FILE *stream = active_stream();
         const char *fname = short_file(file);
 
+        /* Compose the whole line into one buffer and emit it with a single
+         * fwrite: one syscall per line instead of one per fprintf conversion,
+         * which matters because every worker thread serializes on g_lock. */
+        char lin[2304];
+        int ln;
         if (use_color(stream)) {
-            fprintf(stream,
-                    "%s%s%s %s%-5s%s %s[%s:%d]%s %s\n",
-                    COLOR_DIM, ts, COLOR_RESET,
-                    LEVEL_COLORS[level], LEVEL_NAMES[level], COLOR_RESET,
-                    COLOR_DIM, fname, line, COLOR_RESET,
-                    msg);
+            ln = snprintf(lin, sizeof(lin),
+                          "%s%s%s %s%-5s%s %s[%s:%d]%s %s\n",
+                          COLOR_DIM, ts, COLOR_RESET,
+                          LEVEL_COLORS[level], LEVEL_NAMES[level], COLOR_RESET,
+                          COLOR_DIM, fname, line, COLOR_RESET,
+                          msg);
         } else {
-            fprintf(stream,
-                    "%s %-5s [%s:%d] %s\n",
-                    ts, LEVEL_NAMES[level], fname, line, msg);
+            ln = snprintf(lin, sizeof(lin),
+                          "%s %-5s [%s:%d] %s\n",
+                          ts, LEVEL_NAMES[level], fname, line, msg);
         }
-        fflush(stream);
+        if (ln > 0) {
+            if ((size_t)ln >= sizeof(lin))
+                ln = (int)sizeof(lin) - 1; /* truncated: emit what fits */
+            fwrite(lin, 1, (size_t)ln, stream);
+            /* stderr is unbuffered anyway; for buffered streams (a log file),
+             * flush only the levels an operator must see immediately. */
+            if (level >= LOG_LEVEL_WARN)
+                fflush(stream);
+        }
     }
 
     pthread_mutex_unlock(&g_lock);

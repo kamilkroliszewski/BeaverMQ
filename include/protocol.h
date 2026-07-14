@@ -80,6 +80,8 @@ typedef struct beaver_proto beaver_proto_t;
 #define BMQP_BASIC_GET_OK      71  /* S->C */
 #define BMQP_BASIC_GET_EMPTY   72  /* S->C */
 #define BMQP_BASIC_ACK         80  /* C->S */
+#define BMQP_BASIC_REJECT      90  /* C->S */
+#define BMQP_BASIC_NACK       120  /* C->S (RabbitMQ extension) */
 
 /* ---- queue/exchange flag bits (in the u8 flags argument) ----------------- */
 #define BMQP_FLAG_PASSIVE      0x01

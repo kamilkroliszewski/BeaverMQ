@@ -31,10 +31,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Sanity cap for a single message body (prevents a hostile body-size field
- * from triggering a huge allocation). */
+/* Sanity cap for a single message body when max_message_size is unset
+ * (prevents a hostile body-size field from triggering a huge allocation). */
 #define AMQP_MAX_BODY_SIZE (128u * 1024u * 1024u)
 #define AMQP_DEFAULT_FRAME_MAX 131072u
+#define AMQP_CHANNEL_MAX 2047u        /* advertised in Connection.Tune */
+#define AMQP_HEARTBEAT_SECONDS 60u    /* suggested in Connection.Tune */
+
+/* One open channel: its id plus per-channel state (Basic.Qos prefetch). */
+typedef struct {
+    uint16_t id;
+    uint16_t prefetch;   /* Basic.Qos prefetch-count; 0 = unlimited */
+} proto_chan_t;
 
 struct beaver_proto {
     beaver_conn_t *conn;        /* owning connection (back-pointer) */
@@ -57,8 +65,8 @@ struct beaver_proto {
     uint32_t       frame_max;
     uint16_t       heartbeat;
 
-    /* Set of currently-open channel ids (small; most clients use 1). */
-    uint16_t      *channels;
+    /* Set of currently-open channels (small; most clients use 1). */
+    proto_chan_t  *channels;
     size_t         n_channels;
     size_t         cap_channels;
 
@@ -130,6 +138,18 @@ static void copy_str(char *dst, size_t cap, const char *src, size_t n)
     dst[c] = '\0';
 }
 
+/* Vhost / queue / exchange names travel into the broker's composite
+ * "<vhost>\x01<name>" registry key, so control bytes (including \x01 itself)
+ * must never appear in them - otherwise crafted names could alias objects
+ * across vhosts. Rejects ASCII control characters and DEL. */
+static int name_ok(const char *s)
+{
+    for (; *s; s++)
+        if ((unsigned char)*s < 0x20 || (unsigned char)*s == 0x7f)
+            return 0;
+    return 1;
+}
+
 /* ---- input buffer management --------------------------------------------- */
 
 static int inbuf_append(beaver_proto_t *p, const uint8_t *data, size_t len)
@@ -159,32 +179,39 @@ static int inbuf_append(beaver_proto_t *p, const uint8_t *data, size_t len)
 
 /* ---- channel bookkeeping ------------------------------------------------- */
 
-static int channel_is_open(beaver_proto_t *p, uint16_t ch)
+static proto_chan_t *channel_find(beaver_proto_t *p, uint16_t ch)
 {
     for (size_t i = 0; i < p->n_channels; i++)
-        if (p->channels[i] == ch)
-            return 1;
-    return 0;
+        if (p->channels[i].id == ch)
+            return &p->channels[i];
+    return NULL;
+}
+
+static int channel_is_open(beaver_proto_t *p, uint16_t ch)
+{
+    return channel_find(p, ch) != NULL;
 }
 
 static int channel_add(beaver_proto_t *p, uint16_t ch)
 {
     if (p->n_channels == p->cap_channels) {
         size_t nc = p->cap_channels ? p->cap_channels * 2 : 4;
-        uint16_t *na = realloc(p->channels, nc * sizeof(uint16_t));
+        proto_chan_t *na = realloc(p->channels, nc * sizeof(proto_chan_t));
         if (!na)
             return 0;
         p->channels     = na;
         p->cap_channels = nc;
     }
-    p->channels[p->n_channels++] = ch;
+    p->channels[p->n_channels].id       = ch;
+    p->channels[p->n_channels].prefetch = 0;
+    p->n_channels++;
     return 1;
 }
 
 static void channel_remove(beaver_proto_t *p, uint16_t ch)
 {
     for (size_t i = 0; i < p->n_channels; i++) {
-        if (p->channels[i] == ch) {
+        if (p->channels[i].id == ch) {
             p->channels[i] = p->channels[--p->n_channels];
             return;
         }
@@ -504,9 +531,9 @@ static void handle_connection(beaver_proto_t *p, uint16_t channel,
 
         bmqp_buf_t a;
         bmqp_buf_init(&a);
-        bmqp_buf_put_u16(&a, 2047);                   /* channel-max */
+        bmqp_buf_put_u16(&a, AMQP_CHANNEL_MAX);        /* channel-max */
         bmqp_buf_put_u32(&a, AMQP_DEFAULT_FRAME_MAX);  /* frame-max   */
-        bmqp_buf_put_u16(&a, 0);                       /* heartbeat (we suggest 0) */
+        bmqp_buf_put_u16(&a, AMQP_HEARTBEAT_SECONDS);  /* heartbeat suggestion */
         send_method(p, 0, BMQP_CLASS_CONNECTION, BMQP_CONNECTION_TUNE, &a);
         bmqp_buf_free(&a);
         break;
@@ -519,7 +546,15 @@ static void handle_connection(beaver_proto_t *p, uint16_t channel,
             proto_fatal(p, "malformed Connection.TuneOk");
             return;
         }
-        p->conn->frame_max = p->frame_max ? p->frame_max : AMQP_DEFAULT_FRAME_MAX;
+        /* Spec: the client must pick a frame-max no larger than what we
+         * offered (0 = "use yours"); clamp rather than trust the wire. */
+        if (p->frame_max == 0 || p->frame_max > AMQP_DEFAULT_FRAME_MAX)
+            p->frame_max = AMQP_DEFAULT_FRAME_MAX;
+        p->conn->frame_max = p->frame_max;
+        /* The TuneOk heartbeat is the negotiated value; 0 disables. Arm the
+         * sender/dead-peer timer accordingly. */
+        if (p->heartbeat)
+            beaver_conn_enable_heartbeat(p->conn, p->heartbeat);
         LOG_INFO("conn #%" PRIu64 ": Connection.TuneOk "
                  "(channel_max=%u frame_max=%u heartbeat=%u)",
                  p->conn->id, p->channel_max, p->frame_max, p->heartbeat);
@@ -535,6 +570,10 @@ static void handle_connection(beaver_proto_t *p, uint16_t channel,
             return;
         }
         copy_str(p->vhost, sizeof(p->vhost), vh, vhlen);
+        if (!name_ok(p->vhost)) {
+            send_connection_close(p, 530, "NOT_ALLOWED - illegal vhost name");
+            return;
+        }
         struct authstore *as = p->conn->server->authstore;
         if (as) {
             if (!authstore_vhost_exists(as, p->vhost)) {
@@ -597,6 +636,11 @@ static void handle_channel(beaver_proto_t *p, uint16_t channel,
         bmqp_read_shortstr(r, &n);  /* reserved-1 */
         if (channel == 0) {
             proto_fatal(p, "Channel.Open on reserved channel 0");
+            return;
+        }
+        if (channel > AMQP_CHANNEL_MAX) {
+            proto_fatal(p, "Channel.Open: channel %u exceeds channel-max %u",
+                        channel, AMQP_CHANNEL_MAX);
             return;
         }
         if (channel_is_open(p, channel)) {
@@ -662,6 +706,12 @@ static void handle_exchange(beaver_proto_t *p, uint16_t channel,
         char ename[256], etype[32];
         copy_str(ename, sizeof(ename), ex, en);
         copy_str(etype, sizeof(etype), ty, tn);
+        if (!name_ok(ename)) {
+            send_channel_close(p, channel, 406,
+                               "PRECONDITION_FAILED - illegal exchange name",
+                               BMQP_CLASS_EXCHANGE, BMQP_EXCHANGE_DECLARE);
+            return;
+        }
         proto_advance(p, BMQP_STATE_ACTIVE);
         if (!require_perm(p, channel, AUTH_CONFIGURE, ename,
                           BMQP_CLASS_EXCHANGE, BMQP_EXCHANGE_DECLARE))
@@ -724,6 +774,12 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         if (qname[0] == '\0') /* server-generated name for anonymous queues */
             snprintf(qname, sizeof(qname), "amq.gen-%" PRIu64 "-%" PRIu64,
                      p->conn->id, ++p->consumer_seq);
+        else if (!name_ok(qname)) {
+            send_channel_close(p, channel, 406,
+                               "PRECONDITION_FAILED - illegal queue name",
+                               BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE);
+            return;
+        }
         proto_advance(p, BMQP_STATE_ACTIVE);
         if (!require_perm(p, channel, AUTH_CONFIGURE, qname,
                           BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE))
@@ -771,6 +827,12 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         copy_str(qname, sizeof(qname), q, qn);
         copy_str(ename, sizeof(ename), e, en);
         copy_str(key, sizeof(key), k, kn);
+        if (!name_ok(qname) || !name_ok(ename)) {
+            send_channel_close(p, channel, 406,
+                               "PRECONDITION_FAILED - illegal queue/exchange name",
+                               BMQP_CLASS_QUEUE, BMQP_QUEUE_BIND);
+            return;
+        }
         /* AMQP: binding needs WRITE on the exchange (source) + READ on the
          * queue (destination). */
         if (!require_perm(p, channel, AUTH_WRITE, ename,
@@ -818,14 +880,22 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
 
     switch (method) {
     case BMQP_BASIC_QOS: {
-        bmqp_read_u32(r);  /* prefetch-size */
-        bmqp_read_u16(r);  /* prefetch-count */
-        bmqp_read_u8(r);   /* global bit */
+        bmqp_read_u32(r);                        /* prefetch-size (unsupported) */
+        uint16_t prefetch = bmqp_read_u16(r);    /* prefetch-count */
+        bmqp_read_u8(r);                         /* global bit (per-channel here) */
         if (r->error) {
             proto_fatal(p, "malformed Basic.Qos");
             return;
         }
-        /* We don't enforce prefetch yet; acknowledge so clients proceed. */
+        /* Remember the count on the channel (applies to consumers registered
+         * later) and update every consumer already on this channel. */
+        proto_chan_t *ch = channel_find(p, channel);
+        if (ch)
+            ch->prefetch = prefetch;
+        dispatcher_set_prefetch(p->conn->server->dispatcher, p->conn, channel,
+                                prefetch);
+        LOG_INFO("conn #%" PRIu64 " ch=%u: Basic.Qos prefetch=%u",
+                 p->conn->id, channel, prefetch);
         send_method(p, channel, BMQP_CLASS_BASIC, BMQP_BASIC_QOS_OK, NULL);
         break;
     }
@@ -845,6 +915,10 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
         p->pub_channel = channel;
         copy_str(p->pub_exchange, sizeof(p->pub_exchange), e, en);
         copy_str(p->pub_routing_key, sizeof(p->pub_routing_key), k, kn);
+        if (!name_ok(p->pub_exchange)) {
+            proto_fatal(p, "illegal exchange name in Basic.Publish");
+            return;
+        }
         break;
     }
     case BMQP_BASIC_CONSUME: {
@@ -866,13 +940,21 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
         if (ctag[0] == '\0')
             snprintf(ctag, sizeof(ctag), "ctag-%" PRIu64 "-%" PRIu64,
                      p->conn->id, ++p->consumer_seq);
+        if (!name_ok(qname)) {
+            send_channel_close(p, channel, 406,
+                               "PRECONDITION_FAILED - illegal queue name",
+                               BMQP_CLASS_BASIC, BMQP_BASIC_CONSUME);
+            return;
+        }
         proto_advance(p, BMQP_STATE_ACTIVE);
         if (!require_perm(p, channel, AUTH_READ, qname,
                           BMQP_CLASS_BASIC, BMQP_BASIC_CONSUME))
             return;
 
+        proto_chan_t *ch = channel_find(p, channel);
         if (dispatcher_add_consumer(p->conn->server->dispatcher, p->conn,
-                                    channel, ctag, p->vhost, qname, no_ack) != 0) {
+                                    channel, ctag, p->vhost, qname, no_ack,
+                                    ch ? ch->prefetch : 0) != 0) {
             proto_fatal(p, "Basic.Consume: queue '%s' does not exist", qname);
             return;
         }
@@ -922,6 +1004,12 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
         }
         char qname[256];
         copy_str(qname, sizeof(qname), q, qn);
+        if (!name_ok(qname)) {
+            send_channel_close(p, channel, 406,
+                               "PRECONDITION_FAILED - illegal queue name",
+                               BMQP_CLASS_BASIC, BMQP_BASIC_GET);
+            return;
+        }
         if (!require_perm(p, channel, AUTH_READ, qname,
                           BMQP_CLASS_BASIC, BMQP_BASIC_GET))
             return;
@@ -962,15 +1050,44 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
     }
     case BMQP_BASIC_ACK: {
         uint64_t delivery_tag = bmqp_read_u64(r);
-        bmqp_read_u8(r);   /* multiple bit */
+        uint8_t multiple = bmqp_read_u8(r) & 0x01;
         if (r->error) {
             proto_fatal(p, "malformed Basic.Ack");
             return;
         }
         dispatcher_ack(p->conn->server->dispatcher, p->conn, channel,
-                       delivery_tag);
-        LOG_DEBUG("conn #%" PRIu64 " ch=%u: Basic.Ack delivery_tag=%" PRIu64,
-                  p->conn->id, channel, delivery_tag);
+                       delivery_tag, multiple);
+        LOG_DEBUG("conn #%" PRIu64 " ch=%u: Basic.Ack delivery_tag=%" PRIu64
+                  " multiple=%u", p->conn->id, channel, delivery_tag, multiple);
+        break;
+    }
+    case BMQP_BASIC_REJECT: {
+        /* delivery-tag (u64), requeue bit. Single-delivery negative ack. */
+        uint64_t delivery_tag = bmqp_read_u64(r);
+        uint8_t requeue = bmqp_read_u8(r) & 0x01;
+        if (r->error) {
+            proto_fatal(p, "malformed Basic.Reject");
+            return;
+        }
+        dispatcher_nack(p->conn->server->dispatcher, p->conn, channel,
+                        delivery_tag, 0 /* multiple */, requeue);
+        LOG_DEBUG("conn #%" PRIu64 " ch=%u: Basic.Reject delivery_tag=%" PRIu64
+                  " requeue=%u", p->conn->id, channel, delivery_tag, requeue);
+        break;
+    }
+    case BMQP_BASIC_NACK: {
+        /* delivery-tag (u64), bits: 0x01 multiple, 0x02 requeue (RabbitMQ
+         * extension; the batch-capable Basic.Reject). */
+        uint64_t delivery_tag = bmqp_read_u64(r);
+        uint8_t bits = bmqp_read_u8(r);
+        if (r->error) {
+            proto_fatal(p, "malformed Basic.Nack");
+            return;
+        }
+        dispatcher_nack(p->conn->server->dispatcher, p->conn, channel,
+                        delivery_tag, bits & 0x01, (bits & 0x02) != 0);
+        LOG_DEBUG("conn #%" PRIu64 " ch=%u: Basic.Nack delivery_tag=%" PRIu64
+                  " bits=0x%x", p->conn->id, channel, delivery_tag, bits);
         break;
     }
     default:
@@ -1001,8 +1118,12 @@ static void handle_content_header(beaver_proto_t *p,
         proto_fatal(p, "malformed content header");
         return;
     }
-    if (body_size > AMQP_MAX_BODY_SIZE) {
-        proto_fatal(p, "message body size %" PRIu64 " exceeds limit", body_size);
+    uint64_t body_limit = p->conn->server->max_message_size
+                          ? p->conn->server->max_message_size
+                          : AMQP_MAX_BODY_SIZE;
+    if (body_size > body_limit) {
+        proto_fatal(p, "message body size %" PRIu64 " exceeds max_message_size "
+                    "%" PRIu64, body_size, body_limit);
         return;
     }
 

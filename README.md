@@ -21,8 +21,11 @@ web dashboard.
   default exchange (route by queue name).
 - **Push delivery** — consumers receive messages instantly via the event loop;
   competing consumers share a queue round‑robin.
-- **Acknowledgements** — manual ack with requeue‑on‑disconnect, or
-  fire‑and‑forget (`no_ack`).
+- **Acknowledgements** — manual ack (including `multiple`), `basic.nack` /
+  `basic.reject` with requeue, requeue‑on‑disconnect, or fire‑and‑forget
+  (`no_ack`).
+- **Flow control** — enforced `basic.qos` prefetch windows per consumer and
+  negotiated heartbeats (dead connections are detected and reaped).
 - **Management API + dashboard** — JSON REST API and a Vuetify SPA on port
   `15672`.
 - **Memory‑safe** — every module is verified leak‑free and race‑free under
@@ -131,8 +134,8 @@ You should see (with auto‑detected cores):
 
 ```
 INFO  BeaverMQ starting up (4 worker threads, AMQP :5672, HTTP :15672)
-INFO  BeaverMQ management API listening on http://0.0.0.0:15672
-INFO  BeaverMQ ready on 0.0.0.0:5672 across 4 cores; Ctrl-C to stop
+INFO  BeaverMQ management API listening on http://127.0.0.1:15672
+INFO  BeaverMQ ready on 127.0.0.1:5672 across 4 cores; Ctrl-C to stop
 ```
 
 Stop it with **Ctrl‑C** (or `SIGTERM`): every worker drains its connections,
@@ -149,8 +152,10 @@ in `$BEAVERMQ_CONF`, the current directory, or next to the binary.
 threads   = auto      # worker threads; "auto" = number of CPU cores, or e.g. 4
 amqp_port = 5672
 http_port = 15672
-bind      = 0.0.0.0
+bind      = 127.0.0.1 # default: loopback only; 0.0.0.0 exposes it to the network
 log_level = info      # debug | info | warn | error
+# max_connections  = 4096   # concurrent AMQP connections (0 = unlimited)
+# max_message_size = 16m    # max message body (bytes, k/m suffix; default 16m)
 ```
 
 | Setting   | Config key  | Env var               | CLI                       |
@@ -161,6 +166,8 @@ log_level = info      # debug | info | warn | error
 | Bind addr | `bind`      | `BEAVERMQ_BIND`       | —                         |
 | Log level | `log_level` | `BEAVERMQ_LOG_LEVEL`  | —                         |
 | Web root  | `web_root`  | `BEAVERMQ_WEB_ROOT`   | —                         |
+| Max conns | `max_connections` | `BEAVERMQ_MAX_CONNECTIONS` | —              |
+| Max msg   | `max_message_size` | `BEAVERMQ_MAX_MESSAGE_SIZE` | —            |
 
 ```bash
 BEAVERMQ_THREADS=2 ./build/beavermq        # force 2 workers
@@ -201,7 +208,7 @@ network; keep `heartbeat_ms` roughly `election_timeout_ms / 5` or smaller.
 differs — it tells a node which entry in the list is itself. The `ip:port` is
 the internal mesh endpoint (default port **6672**, distinct from AMQP 5672 /
 HTTP 15672); its port also sets what this node listens on. The mesh binds to
-`bind` (default `0.0.0.0`).
+`bind` (loopback by default - a real cluster must set e.g. `bind = 0.0.0.0`).
 
 **Example: 3 VMs at 10.0.0.10 / .11 / .12** — identical `beavermq.conf` except
 `node_id`:
