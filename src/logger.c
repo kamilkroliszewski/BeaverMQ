@@ -6,6 +6,9 @@
  *     write, so log lines from concurrent threads never interleave.
  *   - The mutex uses PTHREAD_MUTEX_INITIALIZER, which means logging works
  *     correctly even before log_init() is ever called.
+ *   - g_min_level is read on every log_log() call (the fast-path filter) and
+ *     is therefore kept outside the mutex as a _Atomic variable rather than
+ *     taking the lock on every call site.
  *   - Each line is composed into a stack buffer and written with a single
  *     fwrite() under the lock to minimize the critical section and avoid
  *     partial-line interleaving.
@@ -14,6 +17,7 @@
 
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -34,9 +38,10 @@ static const char *const LEVEL_NAMES[] = {
     "DEBUG", "INFO", "WARN", "ERROR", "FATAL", "NONE"
 };
 
-/* Global logger state, guarded by g_lock. */
+/* Global logger state, guarded by g_lock, except g_min_level which is read
+ * on every log_log() fast path and is therefore its own atomic variable. */
 static pthread_mutex_t g_lock      = PTHREAD_MUTEX_INITIALIZER;
-static log_level_t     g_min_level = LOG_LEVEL_INFO;
+static _Atomic log_level_t g_min_level = LOG_LEVEL_INFO;
 static FILE           *g_stream    = NULL; /* lazily resolves to stderr */
 static int             g_color_mode = -1;  /* -1 auto, 0 off, 1 on */
 
@@ -65,25 +70,20 @@ static const char *short_file(const char *path)
 
 void log_init(log_level_t level, FILE *out)
 {
+    atomic_store_explicit(&g_min_level, level, memory_order_relaxed);
     pthread_mutex_lock(&g_lock);
-    g_min_level = level;
-    g_stream    = out;
+    g_stream = out;
     pthread_mutex_unlock(&g_lock);
 }
 
 void log_set_level(log_level_t level)
 {
-    pthread_mutex_lock(&g_lock);
-    g_min_level = level;
-    pthread_mutex_unlock(&g_lock);
+    atomic_store_explicit(&g_min_level, level, memory_order_relaxed);
 }
 
 log_level_t log_get_level(void)
 {
-    pthread_mutex_lock(&g_lock);
-    log_level_t lvl = g_min_level;
-    pthread_mutex_unlock(&g_lock);
-    return lvl;
+    return atomic_load_explicit(&g_min_level, memory_order_relaxed);
 }
 
 void log_set_color_mode(int mode)
@@ -111,9 +111,11 @@ void log_log(log_level_t level, const char *file, int line,
              const char *fmt, ...)
 {
     /* Fast path: bail out before doing any work if the level is filtered.
-     * Reading g_min_level without the lock is a benign race: the worst case
-     * is a single message emitted or dropped right as the level changes. */
-    if (level < g_min_level || level >= LOG_LEVEL_NONE)
+     * g_min_level is _Atomic, so this load races safely (in the C11 sense)
+     * against log_set_level(); the worst case is a single message emitted
+     * or dropped right as the level changes. */
+    if (level < atomic_load_explicit(&g_min_level, memory_order_relaxed) ||
+        level >= LOG_LEVEL_NONE)
         return;
 
     /* Build the timestamp: "YYYY-MM-DD HH:MM:SS.mmm". */
@@ -135,8 +137,10 @@ void log_log(log_level_t level, const char *file, int line,
 
     pthread_mutex_lock(&g_lock);
 
-    /* Re-check under the lock to honor a concurrent log_set_level(). */
-    if (level >= g_min_level && level < LOG_LEVEL_NONE) {
+    /* Re-check to honor a concurrent log_set_level() that raced the fast
+     * path above; the lock still serializes the write below. */
+    if (level >= atomic_load_explicit(&g_min_level, memory_order_relaxed) &&
+        level < LOG_LEVEL_NONE) {
         FILE *stream = active_stream();
         const char *fname = short_file(file);
 
