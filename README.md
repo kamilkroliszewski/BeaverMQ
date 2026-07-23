@@ -273,6 +273,58 @@ leader; bring it back and it rejoins and catches up automatically.
 > replicated to 3 nodes is consumed independently per node), log compaction, and
 > publisher‑confirm‑after‑commit.
 
+### Supervisor mode ("let it crash")
+
+By default a crash (`SIGSEGV`, `SIGABRT`, an unhandled exception) in any part
+of the broker takes down the whole process. Supervisor mode wraps the broker
+in a small, separate outer process that does nothing but watch it, and
+respawns it immediately on a crash or a frozen event loop — no operator
+intervention needed:
+
+```bash
+./build/beavermq --supervisor              # or: BEAVERMQ_SUPERVISOR=on ./build/beavermq
+./build/beavermq --supervisor beavermq.conf
+```
+
+The supervisor never runs the broker itself — it `fork()`s and `exec()`s a
+fresh copy of the same binary as the whole worker process (everything above,
+completely unmodified), and:
+
+- **Restarts on crash**, with a rate limit (default: give up after 5 restarts
+  within 10 s, so a deterministic startup bug doesn't spin forever — the
+  supervisor then exits with a non‑zero code instead of looping silently).
+- **Detects a frozen (not crashed) event loop** via a heartbeat the worker
+  writes every couple of seconds; a missed heartbeat is treated the same as
+  a crash.
+- **Forwards `SIGTERM`/`SIGINT`** to the worker and waits (default 5 s) for a
+  graceful shutdown before falling back to `SIGKILL`.
+- Writes `supervisor.pid` and `worker.pid` under `data_dir` (see below), and
+  logs every spawn/crash/respawn/shutdown through the same logger as the
+  broker itself.
+
+| Setting                | Env var                                   | Default |
+|-------------------------|--------------------------------------------|---------|
+| Max restarts            | `BEAVERMQ_SUPERVISOR_MAX_RESTARTS`         | 5       |
+| Restart window          | `BEAVERMQ_SUPERVISOR_RESTART_WINDOW_MS`    | 10000   |
+| Graceful shutdown timeout | `BEAVERMQ_SUPERVISOR_SHUTDOWN_TIMEOUT_MS` | 5000    |
+| Heartbeat interval       | `BEAVERMQ_SUPERVISOR_HEARTBEAT_MS`         | 2000    |
+| Heartbeat timeout        | `BEAVERMQ_SUPERVISOR_HEARTBEAT_TIMEOUT_MS` | 6000    |
+| Worker processes         | `BEAVERMQ_SUPERVISOR_WORKERS`              | 1       |
+
+> **`BEAVERMQ_SUPERVISOR_WORKERS` stays at 1 unless `cluster = on`.** Each
+> worker process is a completely independent broker with its own in‑memory
+> queues/exchanges — it is *not* the same thing as the worker **threads**
+> inside one process (those already share state safely). Running more than
+> one worker **process** without clustering would silently split your queue
+> namespace across uncoordinated processes behind the same port; the
+> supervisor refuses to start in that configuration.
+
+Set `data_dir` (same config key the cluster's WAL uses) so `supervisor.pid`
+and `worker.pid` land somewhere predictable — useful for `kill -TERM $(cat
+data_dir/supervisor.pid)` style operator scripts, and for
+`tests/test_supervisor.sh`, which drives exactly that scenario end‑to‑end
+(spawn, `SIGSEGV` the worker, verify the respawn, verify graceful shutdown).
+
 ---
 
 ## The web dashboard
@@ -521,6 +573,18 @@ python3 test_dashboard.py        # static dashboard is served correctly
 python3 stress_throughput.py     # fast producer + consumer (perf-test style)
 python3 stress_connections.py --count 5000   # connection concurrency stress
 ```
+
+### Supervisor test
+
+```bash
+make && bash tests/test_supervisor.sh
+```
+
+Starts the broker under `--supervisor`, `SIGSEGV`s the worker, and verifies
+it is respawned (new pid, `/api/healthz` responding again) while the
+supervisor process itself survives — then verifies a clean exit on
+`SIGTERM`. Not wired into `make test` (that target runs compiled `tests/*.c`
+binaries only); run it as a separate step.
 
 ### Memory & race verification
 
