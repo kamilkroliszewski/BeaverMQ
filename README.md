@@ -544,16 +544,32 @@ Layouts live in [`include/protocol.h`](include/protocol.h) /
 
 ## Testing
 
-### C unit tests
+### C unit tests + end-to-end checks
 
 ```bash
 make test
 ```
 
-- `test_frame`   — framing/codec round‑trips, partial frames, bounds checks
-- `test_logger`  — leveled logging, concurrency (no torn lines)
-- `test_routing` — message refcounting, FIFO ring buffer, topic matching,
-  direct/fanout routing, and a 100k‑message 4×4 producer/consumer stress test
+Compiles and runs every `tests/*.c` binary, then `tests/test_supervisor.sh`
+(see below), and reports an honest count of what ran. If any `tests/*.c` file
+goes missing, or `test_supervisor.sh` is missing/not executable, the target
+**fails loudly** instead of reporting success having verified nothing —
+`make test` used to iterate over an empty test list and print "All tests
+passed" regardless, which is exactly the failure mode this Makefile logic
+now refuses to reproduce.
+
+- `test_frame`   — framing/codec round‑trips, partial frames, bounds checks,
+  and the two documented parse failure modes (oversized length, bad end byte)
+- `test_logger`  — level filtering, and a multi‑thread concurrency check that
+  every line from 8 threads × 300 messages arrives intact and unmangled
+- `test_routing` — message refcounting (incl. deep‑copy, not aliasing), the
+  queue's FIFO order across a ring‑buffer regrow, `queue_set_default_limits`,
+  direct/fanout/topic exchange routing (incl. binding dedup), and a
+  100k‑message 4×4 producer/consumer stress test verified by both count *and*
+  checksum (so a dropped message masked by a duplicate elsewhere can't hide)
+- `test_supervisor.sh` — starts the broker under `--supervisor`, `SIGSEGV`s
+  the worker, verifies it respawns while the supervisor survives, then
+  verifies a clean exit on `SIGTERM` (see "Supervisor mode" above)
 
 ### Python integration tests
 
@@ -573,18 +589,6 @@ python3 test_dashboard.py        # static dashboard is served correctly
 python3 stress_throughput.py     # fast producer + consumer (perf-test style)
 python3 stress_connections.py --count 5000   # connection concurrency stress
 ```
-
-### Supervisor test
-
-```bash
-make && bash tests/test_supervisor.sh
-```
-
-Starts the broker under `--supervisor`, `SIGSEGV`s the worker, and verifies
-it is respawned (new pid, `/api/healthz` responding again) while the
-supervisor process itself survives — then verifies a clean exit on
-`SIGTERM`. Not wired into `make test` (that target runs compiled `tests/*.c`
-binaries only); run it as a separate step.
 
 ### Memory & race verification
 

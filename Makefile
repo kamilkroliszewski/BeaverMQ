@@ -88,13 +88,31 @@ $(BUILD_DIR)/%: $(TEST_DIR)/%.c $(LIB_OBJS) $(VERSION_OBJ) | $(BUILD_DIR)
 	@$(CC) $(CFLAGS) $< $(LIB_OBJS) $(VERSION_OBJ) $(LDFLAGS) $(LDLIBS) -o $@
 
 # --- Convenience targets ---------------------------------------------------
-test: $(TEST_BINS)
+# Runs every compiled tests/*.c binary AND tests/test_supervisor.sh (an
+# end-to-end process-level check that can't be a plain unit test). Reports
+# an honest count of what actually ran, and - critically - FAILS (nonzero
+# exit) if there is nothing to run: an empty $(TEST_BINS) used to make this
+# target print "All tests passed" having verified precisely zero tests, the
+# same silent-lie failure mode as skipping a check entirely.
+test: $(TEST_BINS) $(BIN)
 	@echo "=== Running tests ==="
-	@fail=0; for t in $(TEST_BINS); do \
+	@if [ -z "$(strip $(TEST_BINS))" ]; then \
+		echo "=== FAIL: no test binaries found in $(TEST_DIR)/*.c - nothing was verified ==="; \
+		exit 1; \
+	fi; \
+	fail=0; ran=0; \
+	for t in $(TEST_BINS); do \
 		echo "--- $$t ---"; \
-		$$t || fail=1; \
+		if $$t; then ran=$$((ran + 1)); else fail=1; fi; \
 	done; \
-	if [ $$fail -eq 0 ]; then echo "=== All tests passed ==="; \
+	if [ -x $(TEST_DIR)/test_supervisor.sh ]; then \
+		echo "--- $(TEST_DIR)/test_supervisor.sh ---"; \
+		if bash $(TEST_DIR)/test_supervisor.sh; then ran=$$((ran + 1)); else fail=1; fi; \
+	else \
+		echo "=== FAIL: $(TEST_DIR)/test_supervisor.sh is missing or not executable ==="; \
+		fail=1; \
+	fi; \
+	if [ $$fail -eq 0 ]; then echo "=== All $$ran test(s) passed ==="; \
 	else echo "=== Some tests FAILED ==="; exit 1; fi
 
 run: $(BIN)
