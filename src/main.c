@@ -20,6 +20,7 @@
 #include "config.h"
 #include "authstore.h"
 #include "crypto.h"
+#include "supervisor.h"
 #include "version.h"
 
 #include <uv.h>
@@ -32,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -82,45 +84,6 @@ static void raise_fd_limit(void)
     }
 }
 
-/* Directory of the running executable (via /proc/self/exe). */
-static int executable_dir(char *out, size_t outsz)
-{
-    char path[4096];
-    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
-    if (n <= 0)
-        return 0;
-    path[n] = '\0';
-    char *slash = strrchr(path, '/');
-    if (!slash)
-        return 0;
-    *slash = '\0';
-    size_t len = strlen(path);
-    if (len >= outsz)
-        return 0;
-    memcpy(out, path, len + 1);
-    return 1;
-}
-
-static int file_readable(const char *p) { return access(p, R_OK) == 0; }
-
-/* Locate a beavermq.conf: explicit CLI arg, env, cwd, then next to the binary. */
-static int find_config(char *out, size_t outsz, const char *cli)
-{
-    if (cli && file_readable(cli)) { snprintf(out, outsz, "%s", cli); return 1; }
-    const char *env = getenv("BEAVERMQ_CONF");
-    if (env && file_readable(env)) { snprintf(out, outsz, "%s", env); return 1; }
-    if (file_readable("beavermq.conf")) { snprintf(out, outsz, "beavermq.conf"); return 1; }
-
-    char exedir[256];
-    if (executable_dir(exedir, sizeof(exedir))) {
-        char p[512];
-        snprintf(p, sizeof(p), "%s/beavermq.conf", exedir);
-        if (file_readable(p)) { snprintf(out, outsz, "%s", p); return 1; }
-        snprintf(p, sizeof(p), "%s/../beavermq.conf", exedir);
-        if (file_readable(p)) { snprintf(out, outsz, "%s", p); return 1; }
-    }
-    return 0;
-}
 
 static int has_dashboard(const char *dir)
 {
@@ -128,7 +91,7 @@ static int has_dashboard(const char *dir)
     int n = snprintf(probe, sizeof(probe), "%s/index.html", dir);
     if (n < 0 || (size_t)n >= sizeof(probe))
         return 0;
-    return file_readable(probe);
+    return config_file_readable(probe);
 }
 
 static int resolve_web_root(const beaver_config_t *cfg, char *out, size_t outsz)
@@ -137,7 +100,7 @@ static int resolve_web_root(const beaver_config_t *cfg, char *out, size_t outsz)
     snprintf(out, outsz, "web");
     if (has_dashboard(out)) return 1;
     char exedir[256];
-    if (executable_dir(exedir, sizeof(exedir))) {
+    if (config_executable_dir(exedir, sizeof(exedir))) {
         snprintf(out, outsz, "%s/web", exedir);
         if (has_dashboard(out)) return 1;
         snprintf(out, outsz, "%s/../web", exedir);
@@ -288,6 +251,8 @@ static int start_cluster(app_t *app)
     return -1;
 }
 
+static void stop_heartbeat_writer(void); /* defined near install_heartbeat_writer below */
+
 /* Signal handler hook (runs on worker 0): ask every worker + the management
  * thread + the cluster node to stop. */
 static void app_shutdown_all(void *ctx)
@@ -299,6 +264,11 @@ static void app_shutdown_all(void *ctx)
         http_server_request_shutdown(app->http);
     if (app->cluster)
         cluster_node_request_shutdown(app->cluster);
+    /* Not owned by any beaver_server_t, so nothing above stops it: a
+     * repeating uv_timer_t left running is itself an active handle that
+     * keeps worker 0's uv_run() from ever returning, hanging the "graceful"
+     * shutdown until the supervisor's deadline gives up and SIGKILLs us. */
+    stop_heartbeat_writer();
 }
 
 /* Path used for the token that gates the first-boot management-API bootstrap
@@ -479,7 +449,7 @@ static int cli_add_user(int argc, char **argv)
     beaver_config_t cfg;
     config_defaults(&cfg);
     char conf_path[600];
-    if (find_config(conf_path, sizeof(conf_path), NULL))
+    if (config_find_file(conf_path, sizeof(conf_path), NULL))
         config_load_file(&cfg, conf_path);
     config_apply_env(&cfg);
     if (!port)
@@ -559,6 +529,80 @@ static int cli_add_user(int argc, char **argv)
     return 0;
 }
 
+/* ---- supervisor heartbeat writer -------------------------------------------
+ * Active only when this process was fork+exec'd by the supervisor
+ * (BEAVERMQ_HEARTBEAT_FD set - see supervisor.c). Writes 1 byte every
+ * BEAVERMQ_SUPERVISOR_HEARTBEAT_MS (the SAME env var the supervisor reads, so
+ * there is one definition of the default interval) to prove this process's
+ * main loop is still alive. A complete no-op when the env var is absent -
+ * i.e. every normal, non-supervised startup, unchanged from today. */
+
+static uv_timer_t g_heartbeat_timer;
+static int        g_heartbeat_fd = -1;
+
+static void on_heartbeat_tick(uv_timer_t *timer)
+{
+    (void)timer;
+    uint8_t byte = 0;
+    ssize_t n = write(g_heartbeat_fd, &byte, 1);
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        /* The supervisor is gone, or an operator set this env var by hand
+         * without a real supervisor on the other end. Tolerate it: stop
+         * writing rather than crash the broker over a liveness signal
+         * nobody is reading. */
+        LOG_WARN("heartbeat: write failed (%s); disabling heartbeat writer",
+                strerror(errno));
+        uv_timer_stop(&g_heartbeat_timer);
+    }
+    /* A short write / EAGAIN just means the supervisor hasn't drained its end
+     * yet - harmless, we try again next tick. */
+}
+
+static void install_heartbeat_writer(uv_loop_t *loop)
+{
+    const char *fd_str = getenv("BEAVERMQ_HEARTBEAT_FD");
+    if (!fd_str || !fd_str[0])
+        return;
+    char *end = NULL;
+    long fd = strtol(fd_str, &end, 10);
+    if (end == fd_str || *end != '\0' || fd < 0 || fd > INT_MAX) {
+        LOG_WARN("heartbeat: invalid BEAVERMQ_HEARTBEAT_FD='%s'; ignoring", fd_str);
+        return;
+    }
+    g_heartbeat_fd = (int)fd;
+    if (fcntl(g_heartbeat_fd, F_SETFL, O_NONBLOCK) != 0) {
+        /* Must be non-blocking: a full pipe (supervisor stuck/gone) must
+         * never block this loop - that would make the watchdog itself the
+         * cause of the freeze it's supposed to detect. */
+        LOG_WARN("heartbeat: fcntl O_NONBLOCK failed on fd %d: %s; disabling",
+                g_heartbeat_fd, strerror(errno));
+        g_heartbeat_fd = -1;
+        return;
+    }
+
+    uint64_t interval_ms = 2000;
+    const char *interval_str = getenv("BEAVERMQ_SUPERVISOR_HEARTBEAT_MS");
+    if (interval_str && interval_str[0]) {
+        char *iend = NULL;
+        long v = strtol(interval_str, &iend, 10);
+        if (iend != interval_str && *iend == '\0' && v > 0)
+            interval_ms = (uint64_t)v;
+    }
+    uv_timer_init(loop, &g_heartbeat_timer);
+    uv_timer_start(&g_heartbeat_timer, on_heartbeat_tick, interval_ms, interval_ms);
+    LOG_INFO("heartbeat: reporting liveness to supervisor every %llums",
+            (unsigned long long)interval_ms);
+}
+
+static void stop_heartbeat_writer(void)
+{
+    if (g_heartbeat_fd < 0)
+        return; /* writer was never installed (not running under the supervisor) */
+    uv_timer_stop(&g_heartbeat_timer);
+    if (!uv_is_closing((uv_handle_t *)&g_heartbeat_timer))
+        uv_close((uv_handle_t *)&g_heartbeat_timer, NULL);
+}
+
 /* ---- main ---------------------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -571,6 +615,30 @@ int main(int argc, char **argv)
                      strcmp(argv[1], "version") == 0)) {
         printf("BeaverMQ %s (build %s)\n", BEAVER_VERSION, beaver_build_stamp);
         return 0;
+    }
+
+    /* Supervisor mode ("let it crash"): fork+exec a fresh copy of this same
+     * binary as the whole worker process (everything below, unmodified),
+     * watch it for crashes/frozen event loops, and respawn it - see
+     * supervisor.h. Checked AFTER add-user/--version (those must always work
+     * as one-shot CLI utilities regardless of BEAVERMQ_SUPERVISOR) and BEFORE
+     * the port-or-config parsing below: in this mode main() does nothing
+     * else itself - the whole broker lives only in the forked/exec'd child. */
+    int sup_flag_idx = (argc > 1 && strcmp(argv[1], "--supervisor") == 0) ? 1 : -1;
+    if (sup_flag_idx >= 0 || getenv("BEAVERMQ_SUPERVISOR")) {
+        char **child_argv = malloc((size_t)(argc + 1) * sizeof(*child_argv));
+        if (!child_argv) {
+            fprintf(stderr, "error: out of memory\n");
+            return 1;
+        }
+        int child_argc = 0;
+        for (int i = 0; i < argc; i++)
+            if (i != sup_flag_idx)
+                child_argv[child_argc++] = argv[i];
+        child_argv[child_argc] = NULL;
+        int rc = supervisor_main(child_argc, child_argv);
+        free(child_argv);
+        return rc;
     }
 
     log_init(LOG_LEVEL_INFO, stderr);
@@ -603,7 +671,7 @@ int main(int argc, char **argv)
         long p = strtol(argv[1], &end, 10);
         if (*end == '\0' && p > 0 && p < 65536) {
             cli_port = (int)p;
-        } else if (file_readable(argv[1])) {
+        } else if (config_file_readable(argv[1])) {
             cli_conf = argv[1];
         } else {
             fprintf(stderr,
@@ -618,7 +686,7 @@ int main(int argc, char **argv)
     }
 
     char conf_path[600];
-    if (find_config(conf_path, sizeof(conf_path), cli_conf))
+    if (config_find_file(conf_path, sizeof(conf_path), cli_conf))
         config_load_file(&app.config, conf_path);
     config_apply_env(&app.config);
     if (cli_port)
@@ -686,6 +754,7 @@ int main(int argc, char **argv)
     w0->server.on_shutdown_ctx = &app;
     beaver_server_install_signals(&w0->server);
     beaver_server_install_stats(&w0->server, 2000 /* ms */);
+    install_heartbeat_writer(&w0->loop);
 
     /* HTTP management server on a DEDICATED loop/thread (never starved by AMQP
      * load). It reads the shared broker + each worker's connection list. */

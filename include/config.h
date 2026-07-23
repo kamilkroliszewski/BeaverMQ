@@ -79,6 +79,23 @@ void config_apply_env(beaver_config_t *c);
  */
 void config_resolve_threads(beaver_config_t *c);
 
+/* ---- filesystem helpers shared by main.c (broker startup) and supervisor.c
+ * (config resolution without ever touching broker/dispatch/cluster) --------- */
+
+/* True if `p` is readable (0400+ and exists). */
+int config_file_readable(const char *p);
+
+/* Directory containing the running executable, via /proc/self/exe. Returns 0
+ * if unavailable (e.g. not on Linux, or /proc unmounted). */
+int config_executable_dir(char *out, size_t outsz);
+
+/*
+ * Locate a beavermq.conf: explicit `cli` arg, then BEAVERMQ_CONF env, then
+ * ./beavermq.conf, then next to the executable (and its parent dir). Returns
+ * 1 and fills `out` on success, 0 if nothing was found.
+ */
+int config_find_file(char *out, size_t outsz, const char *cli);
+
 #ifdef __cplusplus
 }
 #endif

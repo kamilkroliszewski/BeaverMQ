@@ -12,6 +12,57 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h> /* strcasecmp */
+#include <unistd.h>  /* access, readlink */
+
+int config_file_readable(const char *p)
+{
+    return access(p, R_OK) == 0;
+}
+
+int config_executable_dir(char *out, size_t outsz)
+{
+    char path[4096];
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (n <= 0)
+        return 0;
+    path[n] = '\0';
+    char *slash = strrchr(path, '/');
+    if (!slash)
+        return 0;
+    *slash = '\0';
+    size_t len = strlen(path);
+    if (len >= outsz)
+        return 0;
+    memcpy(out, path, len + 1);
+    return 1;
+}
+
+int config_find_file(char *out, size_t outsz, const char *cli)
+{
+    if (cli && config_file_readable(cli)) {
+        snprintf(out, outsz, "%s", cli);
+        return 1;
+    }
+    const char *env = getenv("BEAVERMQ_CONF");
+    if (env && config_file_readable(env)) {
+        snprintf(out, outsz, "%s", env);
+        return 1;
+    }
+    if (config_file_readable("beavermq.conf")) {
+        snprintf(out, outsz, "beavermq.conf");
+        return 1;
+    }
+
+    char exedir[256];
+    if (config_executable_dir(exedir, sizeof(exedir))) {
+        char p[512];
+        snprintf(p, sizeof(p), "%s/beavermq.conf", exedir);
+        if (config_file_readable(p)) { snprintf(out, outsz, "%s", p); return 1; }
+        snprintf(p, sizeof(p), "%s/../beavermq.conf", exedir);
+        if (config_file_readable(p)) { snprintf(out, outsz, "%s", p); return 1; }
+    }
+    return 0;
+}
 
 void config_defaults(beaver_config_t *c)
 {
