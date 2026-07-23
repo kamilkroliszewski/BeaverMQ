@@ -214,6 +214,13 @@ void beaver_conn_close(beaver_conn_t *conn);
  * for 2*`seconds`. No-op if seconds == 0. Call on the connection's loop. */
 void beaver_conn_enable_heartbeat(beaver_conn_t *conn, uint16_t seconds);
 
+/* Disarm the handshake-timeout timer (see on_new_connection) without arming
+ * heartbeats - call when Connection.TuneOk negotiates heartbeat = 0, since
+ * beaver_conn_enable_heartbeat() is a no-op in that case and would otherwise
+ * leave the handshake deadline running past a successfully completed
+ * handshake. */
+void beaver_conn_clear_handshake_timeout(beaver_conn_t *conn);
+
 /* Pause reads on a producer connection for cluster flow control (TCP
  * backpressure). A per-server timer resumes it once the cluster reports it is no
  * longer congested. Call on the connection's own loop thread. */

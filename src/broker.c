@@ -89,6 +89,12 @@ int broker_declare_queue(beaver_broker_t *b, const char *vhost,
             goto done;
         }
         created = 1;
+    } else if (queue_flags(q) != flags) {
+        /* AMQP: redeclaring an existing queue with different properties
+         * (durable/exclusive/auto-delete) must fail with PRECONDITION_FAILED,
+         * not silently return the pre-existing object as if it matched. */
+        rc = -2;
+        goto done;
     }
 
     if (out_created)
@@ -125,6 +131,11 @@ int broker_declare_exchange(beaver_broker_t *b, const char *vhost,
             goto done;
         }
         created = 1;
+    } else if (exchange_type(ex) != type || exchange_flags(ex) != flags) {
+        /* Same rule as queues: redeclaring with a different type or
+         * durable/auto-delete flags must fail, not silently succeed. */
+        rc = -2;
+        goto done;
     }
     if (out_created)
         *out_created = created;
@@ -176,9 +187,9 @@ int broker_route(beaver_broker_t *b, const char *vhost, beaver_message_t *msg)
     /* Phase 1: collect target queue references under the registry lock. */
     beaver_queue_t **targets = NULL;
     size_t ntargets = 0;
+    int resource_error = 0;
 
     pthread_rwlock_rdlock(&b->lock);
-    atomic_fetch_add_explicit(&b->messages_published, 1, memory_order_relaxed);
     if (exchange[0] == '\0') {
         /* Default exchange: route directly to the queue named routing_key. */
         broker_vkey(key, vhost, routing_key);
@@ -188,31 +199,65 @@ int broker_route(beaver_broker_t *b, const char *vhost, beaver_message_t *msg)
             if (targets) {
                 targets[0] = queue_ref(q);
                 ntargets   = 1;
+            } else {
+                /* Allocation failure here must NOT look like "no queue named
+                 * routing_key" - the queue exists, we just couldn't build the
+                 * (trivially small) target array for it. */
+                resource_error = 1;
             }
         }
     } else {
         broker_vkey(key, vhost, exchange);
         beaver_exchange_t *ex = hashmap_get(b->exchanges, key);
-        if (ex)
-            ntargets = exchange_route(ex, routing_key, &targets);
+        if (ex) {
+            int oom = 0;
+            ntargets = exchange_route(ex, routing_key, &targets, &oom);
+            resource_error = oom;
+        }
     }
     pthread_rwlock_unlock(&b->lock);
 
+    if (resource_error) {
+        free(targets);
+        return ROUTE_RESOURCE_ERROR;
+    }
+
     /* Phase 2: enqueue WITHOUT the registry lock; queue refs keep them alive.
      * Notify the route callback (dispatcher) per queue so it can push to any
-     * waiting consumers. */
+     * waiting consumers. No rollback on a partial failure (some queues already
+     * enqueued, a later one hits QUEUE_FULL/OOM): each bound queue is an
+     * independent delivery, same as a real AMQP broker's fanout semantics -
+     * but it IS reported as ROUTE_RESOURCE_ERROR so the caller knows delivery
+     * was incomplete, instead of the two cases being indistinguishable. */
     int routed = 0;
+    int enqueue_failed = 0;
     for (size_t i = 0; i < ntargets; i++) {
-        if (queue_enqueue(targets[i], msg) == 0) {
+        int rc = queue_enqueue(targets[i], msg);
+        if (rc == 0) {
             routed++;
             /* Wake any worker dispatchers with consumers on this queue (this
              * runs on the publishing thread; the waiters fire thread-safe
              * uv_async_sends to their own loops). */
             queue_wake_waiters(targets[i]);
+        } else {
+            enqueue_failed = 1;
         }
         queue_unref(targets[i]);
     }
     free(targets);
+    if (enqueue_failed) {
+        LOG_WARN("broker: %zu of %zu bound queue(s) rejected message "
+                 "(vhost=%s exchange=%s key=%s) - full/OOM",
+                 ntargets - (size_t)routed, ntargets, vhost, exchange, routing_key);
+    }
+    /* "Published" should count messages that actually reached at least one
+     * queue, not merely "a publish was attempted" - counting every attempt
+     * (including ones that route to nothing) makes the metric look healthier
+     * than the broker actually is. */
+    if (routed > 0)
+        atomic_fetch_add_explicit(&b->messages_published, 1, memory_order_relaxed);
+    if (routed == 0 && enqueue_failed)
+        return ROUTE_RESOURCE_ERROR; /* every target hit QUEUE_FULL/OOM */
     return routed;
 }
 

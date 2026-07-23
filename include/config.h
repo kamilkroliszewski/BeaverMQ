@@ -31,6 +31,11 @@ typedef struct {
     /* Resource limits (DoS protection). */
     int      max_connections;   /* max concurrent AMQP connections; 0 = unlimited */
     uint32_t max_message_size;  /* max message body bytes; 0 = built-in cap */
+    uint32_t http_max_body_bytes;   /* max HTTP request body bytes */
+    int      http_max_connections;  /* max concurrent HTTP connections; 0 = unlimited */
+    uint32_t http_request_timeout_ms; /* max time to receive one full request */
+    uint64_t queue_max_length;      /* max messages per queue; 0 = unlimited */
+    uint64_t queue_max_bytes;       /* max body bytes per queue; 0 = unlimited */
 
     /* Clustering (optional; disabled unless cluster_nodes is configured). */
     int  cluster_enabled;
@@ -42,6 +47,17 @@ typedef struct {
     char data_dir[256];         /* persist the replicated log here ("" = off) */
     int  election_timeout_ms;   /* Raft election timeout floor; 0 = built-in default */
     int  heartbeat_ms;          /* leader heartbeat interval; 0 = built-in default */
+    char cluster_secret[128];   /* shared PSK, identical on every node: without it
+                                 * any host that can reach the mesh port can
+                                 * impersonate a peer (forge HELLO/VOTE/APPEND
+                                 * frames). Required whenever clustering is on. */
+    int  cluster_durable_commit; /* 1 (default) = a leader only commits an entry
+                                 * once a MAJORITY has fsync'd it (survives a
+                                 * simultaneous power loss on a majority); 0 =
+                                 * commit on page-cache ack alone (faster, but a
+                                 * "committed" entry can be lost on power loss
+                                 * before the next fsync). cluster_sync_policy
+                                 * key: "durable" (default) or "fast". */
 } beaver_config_t;
 
 /* Populate with built-in defaults. */

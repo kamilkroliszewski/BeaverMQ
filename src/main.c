@@ -19,12 +19,14 @@
 #include "cluster.h"
 #include "config.h"
 #include "authstore.h"
+#include "crypto.h"
 #include "version.h"
 
 #include <uv.h>
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
@@ -204,21 +206,24 @@ static int cluster_listen_port(const beaver_config_t *cfg)
     return colon ? atoi(colon + 1) : 0;
 }
 
-/* Bring up the cluster control plane on its own loop/thread. Best-effort: any
- * failure logs and leaves the node running standalone (clustering disabled). */
-static void start_cluster(app_t *app)
+/* Bring up the cluster control plane on its own loop/thread. Returns 0 on
+ * success, -1 on failure. When cfg->cluster_enabled is set the caller MUST
+ * treat -1 as fatal (fail closed): silently falling back to an unreplicated
+ * standalone broker when the operator asked for clustering is worse than
+ * refusing to start. */
+static int start_cluster(app_t *app)
 {
     beaver_config_t *cfg = &app->config;
     if (cfg->node_id < 0 || cfg->node_id >= cfg->cluster_nnodes) {
         LOG_ERROR("cluster: node_id %d out of range [0,%d); clustering disabled",
                   cfg->node_id, cfg->cluster_nnodes);
-        return;
+        return -1;
     }
     int port = cluster_listen_port(cfg);
     if (port <= 0) {
         LOG_ERROR("cluster: cannot derive listen port from '%s'; disabled",
                   cfg->cluster_nodes[cfg->node_id]);
-        return;
+        return -1;
     }
 
     cluster_config_t cc;
@@ -228,6 +233,8 @@ static void start_cluster(app_t *app)
     cc.cluster_port = port;
     snprintf(cc.bind_addr, sizeof(cc.bind_addr), "%s", cfg->bind_addr);
     snprintf(cc.data_dir, sizeof(cc.data_dir), "%s", cfg->data_dir);
+    snprintf(cc.secret, sizeof(cc.secret), "%s", cfg->cluster_secret);
+    cc.durable_commit = cfg->cluster_durable_commit;
     /* Optional Raft timing overrides (0 = keep the built-in defaults). The
      * election window is [floor, 2*floor] so a single knob controls both ends. */
     if (cfg->election_timeout_ms > 0) {
@@ -242,14 +249,14 @@ static void start_cluster(app_t *app)
 
     if (uv_loop_init(&app->cluster_loop) != 0) {
         LOG_ERROR("cluster: uv_loop_init failed; clustering disabled");
-        return;
+        return -1;
     }
     app->cluster = cluster_node_new(&app->cluster_loop, &cc, app->broker,
                                     app->authstore);
     if (!app->cluster) {
         LOG_ERROR("cluster: cluster_node_new failed; clustering disabled");
         uv_loop_close(&app->cluster_loop);
-        return;
+        return -1;
     }
     int rc = cluster_node_listen(app->cluster, cfg->bind_addr, port, 64);
     if (rc != 0) {
@@ -258,7 +265,7 @@ static void start_cluster(app_t *app)
         cluster_node_free(app->cluster);
         app->cluster = NULL;
         uv_loop_close(&app->cluster_loop);
-        return;
+        return -1;
     }
     cluster_node_install_shutdown_async(app->cluster);
     cluster_node_start(app->cluster);
@@ -272,9 +279,13 @@ static void start_cluster(app_t *app)
         }
         LOG_INFO("cluster: node %d up on %s:%d (%d-node cluster)",
                  cfg->node_id, cfg->bind_addr, port, cfg->cluster_nnodes);
-    } else {
-        LOG_ERROR("cluster: failed to spawn cluster thread");
+        return 0;
     }
+    LOG_ERROR("cluster: failed to spawn cluster thread");
+    cluster_node_free(app->cluster);
+    app->cluster = NULL;
+    uv_loop_close(&app->cluster_loop);
+    return -1;
 }
 
 /* Signal handler hook (runs on worker 0): ask every worker + the management
@@ -290,12 +301,75 @@ static void app_shutdown_all(void *ctx)
         cluster_node_request_shutdown(app->cluster);
 }
 
+/* Path used for the token that gates the first-boot management-API bootstrap
+ * window (see http_server_set_bootstrap_token / generate_bootstrap_token). */
+static void bootstrap_token_path(const beaver_config_t *cfg, char *out, size_t cap)
+{
+    if (cfg->data_dir[0])
+        snprintf(out, cap, "%s/bootstrap_token", cfg->data_dir);
+    else
+        out[0] = '\0';
+}
+
+/* Generate a fresh random bootstrap token, write it to data_dir (if
+ * configured, mode 0600 - `beavermq add-user` reads it from there
+ * automatically) and log it, since that log line is the ONLY way to learn it
+ * when data_dir is unset. A TCP peer address proves nothing about the real
+ * client behind a reverse proxy, so unlike the old behavior this is NOT
+ * gated on "looks like localhost" - only on holding this token. Leaves
+ * out[0] = '\0' (bootstrap window stays closed - fail safe, not fail open)
+ * if no CSPRNG source was available. */
+static void generate_bootstrap_token(const beaver_config_t *cfg, char *out, size_t out_cap)
+{
+    out[0] = '\0';
+    uint8_t raw[24];
+    if (crypto_random_bytes(raw, sizeof raw) != 0) {
+        LOG_ERROR("bootstrap: no CSPRNG available; the management API "
+                  "bootstrap window is disabled (fix /dev/urandom, or create "
+                  "the first admin via an already-configured cluster node)");
+        return;
+    }
+    static const char *hex = "0123456789abcdef";
+    size_t n = sizeof raw;
+    if (out_cap < n * 2 + 1)
+        n = (out_cap - 1) / 2;
+    for (size_t i = 0; i < n; i++) {
+        out[i * 2]     = hex[raw[i] >> 4];
+        out[i * 2 + 1] = hex[raw[i] & 0xf];
+    }
+    out[n * 2] = '\0';
+
+    char path[300];
+    bootstrap_token_path(cfg, path, sizeof path);
+    if (path[0]) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) {
+            ssize_t wn = write(fd, out, strlen(out));
+            close(fd);
+            if (wn == (ssize_t)strlen(out)) {
+                LOG_WARN("bootstrap: no users configured - create the first "
+                        "admin with: beavermq add-user <name> <password> "
+                        "(reads the token from '%s' automatically)", path);
+                return;
+            }
+        }
+        LOG_WARN("bootstrap: could not write token to '%s'; pass it "
+                 "explicitly: beavermq add-user <name> <password> -t %s",
+                 path, out);
+        return;
+    }
+    LOG_WARN("bootstrap: no users configured and no data_dir set - create "
+             "the first admin with: beavermq add-user <name> <password> -t %s",
+             out);
+}
+
 /* ---- `beavermq add-user` CLI subcommand ----------------------------------- *
  * Creates (or updates) a user by POSTing to the local management API over a
  * plain socket, so operators can bootstrap the FIRST administrator on a fresh
- * broker without curl. While the broker has no users the API is open (the
- * bootstrap window); afterwards pass -u admin:password. In a cluster, run it
- * against any live node - the change replicates through Raft. */
+ * broker without curl. While the broker has no users, the request must carry
+ * the bootstrap token (auto-read from data_dir/bootstrap_token, or passed
+ * explicitly with -t); afterwards pass -u admin:password. In a cluster, run
+ * it against any live node - the change replicates through Raft. */
 
 static int b64_encode(const unsigned char *in, size_t n, char *out, size_t cap)
 {
@@ -380,10 +454,11 @@ static int cli_add_user(int argc, char **argv)
 {
     log_init(LOG_LEVEL_ERROR, stderr);   /* quiet: config loading logs at INFO */
     const char *user = NULL, *pass = NULL, *tags = "administrator";
-    const char *admin = NULL, *host = "127.0.0.1";
+    const char *admin = NULL, *token = NULL, *host = "127.0.0.1";
     int port = 0;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "-u") == 0 && i + 1 < argc) admin = argv[++i];
+        else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) token = argv[++i];
         else if (strcmp(argv[i], "-H") == 0 && i + 1 < argc) host = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) port = atoi(argv[++i]);
         else if (!user) user = argv[i];
@@ -393,19 +468,22 @@ static int cli_add_user(int argc, char **argv)
     if (!user || !pass) {
         fprintf(stderr,
             "usage: beavermq add-user <name> <password> [tags] [-u admin:pass] "
-            "[-H host] [-p http_port]\n"
-            "  tags: administrator (default) | management | \"\" (none)\n");
+            "[-t bootstrap-token] [-H host] [-p http_port]\n"
+            "  tags: administrator (default) | management | \"\" (none)\n"
+            "  On a fresh broker (no users yet) pass -t with the token logged\n"
+            "  at startup, or omit it: it is read automatically from\n"
+            "  data_dir/bootstrap_token if data_dir is configured.\n");
         return 2;
     }
-    if (!port) {
-        beaver_config_t cfg;
-        config_defaults(&cfg);
-        char conf_path[600];
-        if (find_config(conf_path, sizeof(conf_path), NULL))
-            config_load_file(&cfg, conf_path);
-        config_apply_env(&cfg);
+
+    beaver_config_t cfg;
+    config_defaults(&cfg);
+    char conf_path[600];
+    if (find_config(conf_path, sizeof(conf_path), NULL))
+        config_load_file(&cfg, conf_path);
+    config_apply_env(&cfg);
+    if (!port)
         port = cfg.http_port;
-    }
 
     char eu[256], ep[512], et[128];
     json_escape(user, eu, sizeof eu);
@@ -425,12 +503,30 @@ static int cli_add_user(int argc, char **argv)
             return 2;
         }
         snprintf(authhdr, sizeof authhdr, "Authorization: Basic %s\r\n", b64);
+    } else {
+        char tokbuf[80];
+        if (!token && cfg.data_dir[0]) {
+            char path[300];
+            bootstrap_token_path(&cfg, path, sizeof path);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fgets(tokbuf, sizeof tokbuf, f)) {
+                    char *nl = strpbrk(tokbuf, "\r\n");
+                    if (nl) *nl = '\0';
+                    token = tokbuf;
+                }
+                fclose(f);
+            }
+        }
+        if (token)
+            snprintf(authhdr, sizeof authhdr, "X-Bootstrap-Token: %s\r\n", token);
     }
 
     int status = cli_http_post(host, port, "/api/users", body, authhdr);
     if (status != 200) {
         if (status == 401)
-            fprintf(stderr, "error: authentication required - pass -u admin:password\n");
+            fprintf(stderr, "error: authentication required - pass -u admin:password "
+                    "or -t <bootstrap-token>\n");
         else if (status == 403)
             fprintf(stderr, "error: the -u user is not an administrator\n");
         else if (status == 503)
@@ -529,6 +625,7 @@ int main(int argc, char **argv)
         app.config.amqp_port = cli_port;
     config_resolve_threads(&app.config);
     log_set_level(app.config.log_level);
+    queue_set_default_limits(app.config.queue_max_length, app.config.queue_max_bytes);
 
     LOG_INFO("BeaverMQ %s (build %s) starting up "
              "(%d worker thread%s, AMQP :%d, HTTP :%d)",
@@ -559,9 +656,10 @@ int main(int argc, char **argv)
     }
     if (!app.config.cluster_enabled) {
         authstore_add_vhost(app.authstore, "/");
-        LOG_WARN("no users configured - AMQP logins are refused; create the "
-                 "first admin: beavermq add-user <name> <password>");
+        LOG_WARN("no users configured - AMQP logins are refused");
     }
+    char bootstrap_token[64];
+    generate_bootstrap_token(&app.config, bootstrap_token, sizeof bootstrap_token);
 
     atomic_init(&app.stats.next_conn_id, 0);
     atomic_init(&app.stats.total_conns, 0);
@@ -600,6 +698,10 @@ int main(int argc, char **argv)
     app.http = http_server_new(&app.mgmt_loop, app.broker, servers,
                                app.nworkers, &app.stats);
     if (app.http) {
+        http_server_set_limits(app.http, app.config.http_max_body_bytes,
+                               app.config.http_max_connections,
+                               app.config.http_request_timeout_ms);
+        http_server_set_bootstrap_token(app.http, bootstrap_token);
         char web_root[1024];
         if (resolve_web_root(&app.config, web_root, sizeof(web_root))) {
             http_server_set_web_root(app.http, web_root);
@@ -620,9 +722,14 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Cluster control plane on its own loop/thread (if configured). */
-    if (app.config.cluster_enabled)
-        start_cluster(&app);
+    /* Cluster control plane on its own loop/thread (if configured). Fail
+     * closed: an operator who asked for clustering must get a hard failure,
+     * not a silently unreplicated standalone broker. */
+    if (app.config.cluster_enabled && start_cluster(&app) != 0) {
+        LOG_FATAL("cluster: failed to start with cluster=on; refusing to run "
+                  "as an unreplicated standalone broker (see errors above)");
+        return EXIT_FAILURE;
+    }
 
     /* Spawn workers 1..N-1; worker 0 runs on this (main) thread. */
     for (int i = 1; i < app.nworkers; i++) {

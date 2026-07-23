@@ -8,70 +8,13 @@
  * (RabbitMQ-compatible semantics: an empty pattern denies everything).
  */
 #include "authstore.h"
+#include "crypto.h"
 
 #include <pthread.h>
 #include <regex.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <fcntl.h>
-#include <unistd.h>
-
-/* ---- SHA-256 (FIPS 180-4) ------------------------------------------------ */
-
-typedef struct { uint32_t s[8]; uint64_t len; uint8_t buf[64]; size_t n; } sha256_t;
-
-static uint32_t ror(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
-
-static void sha256_block(sha256_t *c, const uint8_t *p)
-{
-    static const uint32_t K[64] = {
-        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
-    uint32_t w[64], a,b,cc,d,e,f,g,h;
-    for (int i = 0; i < 16; i++)
-        w[i] = (uint32_t)p[i*4]<<24 | (uint32_t)p[i*4+1]<<16 | (uint32_t)p[i*4+2]<<8 | p[i*4+3];
-    for (int i = 16; i < 64; i++) {
-        uint32_t s0 = ror(w[i-15],7)^ror(w[i-15],18)^(w[i-15]>>3);
-        uint32_t s1 = ror(w[i-2],17)^ror(w[i-2],19)^(w[i-2]>>10);
-        w[i] = w[i-16]+s0+w[i-7]+s1;
-    }
-    a=c->s[0];b=c->s[1];cc=c->s[2];d=c->s[3];e=c->s[4];f=c->s[5];g=c->s[6];h=c->s[7];
-    for (int i = 0; i < 64; i++) {
-        uint32_t S1=ror(e,6)^ror(e,11)^ror(e,25), ch=(e&f)^(~e&g);
-        uint32_t t1=h+S1+ch+K[i]+w[i];
-        uint32_t S0=ror(a,2)^ror(a,13)^ror(a,22), maj=(a&b)^(a&cc)^(b&cc);
-        uint32_t t2=S0+maj;
-        h=g;g=f;f=e;e=d+t1;d=cc;cc=b;b=a;a=t1+t2;
-    }
-    c->s[0]+=a;c->s[1]+=b;c->s[2]+=cc;c->s[3]+=d;c->s[4]+=e;c->s[5]+=f;c->s[6]+=g;c->s[7]+=h;
-}
-
-static void sha256(const uint8_t *data, size_t len, uint8_t out[32])
-{
-    sha256_t c = { {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
-                    0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19}, 0, {0}, 0 };
-    c.len = len;
-    while (len >= 64) { sha256_block(&c, data); data += 64; len -= 64; }
-    uint8_t tail[128]; size_t t = 0;
-    memcpy(tail, data, len); t = len;
-    tail[t++] = 0x80;
-    size_t pad = (t <= 56) ? (56 - t) : (120 - t);
-    memset(tail + t, 0, pad); t += pad;
-    uint64_t bits = c.len * 8;
-    for (int i = 0; i < 8; i++) tail[t++] = (uint8_t)(bits >> (56 - i*8));
-    for (size_t o = 0; o < t; o += 64) sha256_block(&c, tail + o);
-    for (int i = 0; i < 8; i++) {
-        out[i*4]   = (uint8_t)(c.s[i] >> 24); out[i*4+1] = (uint8_t)(c.s[i] >> 16);
-        out[i*4+2] = (uint8_t)(c.s[i] >> 8);  out[i*4+3] = (uint8_t)c.s[i];
-    }
-}
 
 static void to_hex(const uint8_t *b, size_t n, char *out)
 {
@@ -97,33 +40,7 @@ static int from_hex(const char *s, uint8_t *out, size_t n)
     return 0;
 }
 
-/* Constant-time comparison: no early exit, so a byte-by-byte timing probe
- * learns nothing about how much of the digest matched. Returns 0 if equal. */
-static int ct_memcmp(const void *a, const void *b, size_t n)
-{
-    const uint8_t *x = a, *y = b;
-    uint8_t d = 0;
-    for (size_t i = 0; i < n; i++)
-        d |= (uint8_t)(x[i] ^ y[i]);
-    return d;
-}
-
-/* ---- HMAC-SHA256 / PBKDF2 (RFC 2104 / RFC 8018) --------------------------- */
-
-/* msglen must be <= 64 (all our uses: salt+counter = 20, or a 32-byte U). */
-static void hmac_sha256(const uint8_t *key, size_t keylen,
-                        const uint8_t *msg, size_t msglen, uint8_t out[32])
-{
-    uint8_t k[64] = {0}, buf[64 + 64], dig[32];
-    if (keylen > 64) { sha256(key, keylen, dig); memcpy(k, dig, 32); }
-    else memcpy(k, key, keylen);
-    for (int i = 0; i < 64; i++) buf[i] = (uint8_t)(k[i] ^ 0x36); /* ipad */
-    memcpy(buf + 64, msg, msglen);
-    sha256(buf, 64 + msglen, dig);
-    for (int i = 0; i < 64; i++) buf[i] = (uint8_t)(k[i] ^ 0x5c); /* opad */
-    memcpy(buf + 64, dig, 32);
-    sha256(buf, 64 + 32, out);
-}
+/* ---- PBKDF2 (RFC 8018), built on crypto_hmac_sha256 ----------------------- */
 
 /* PBKDF2-HMAC-SHA256 producing one 32-byte block (dkLen == hash length). */
 static void pbkdf2_sha256(const char *pass, const uint8_t *salt, size_t saltlen,
@@ -135,10 +52,10 @@ static void pbkdf2_sha256(const char *pass, const uint8_t *salt, size_t saltlen,
     memcpy(msg, salt, saltlen);
     msg[saltlen]     = 0; msg[saltlen + 1] = 0;
     msg[saltlen + 2] = 0; msg[saltlen + 3] = 1;    /* INT(1), big-endian */
-    hmac_sha256(pw, pwlen, msg, saltlen + 4, u);   /* U1 */
+    crypto_hmac_sha256(pw, pwlen, msg, saltlen + 4, u);   /* U1 */
     memcpy(out, u, 32);
     for (uint32_t i = 1; i < iters; i++) {
-        hmac_sha256(pw, pwlen, u, 32, u);          /* Ui = PRF(P, Ui-1) */
+        crypto_hmac_sha256(pw, pwlen, u, 32, u);          /* Ui = PRF(P, Ui-1) */
         for (int j = 0; j < 32; j++) out[j] ^= u[j];
     }
 }
@@ -151,32 +68,33 @@ static void pbkdf2_sha256(const char *pass, const uint8_t *salt, size_t saltlen,
  */
 #define AUTH_PBKDF2_ITERS 10000u
 
-static void read_salt(uint8_t *salt, size_t n)
+/* Returns 0 on success, -1 if no CSPRNG source was available. There is
+ * deliberately NO rand() fallback: a predictable salt from a non-CSPRNG PRNG
+ * defeats the whole point of salting (precomputation/rainbow-table reuse
+ * across accounts becomes feasible again) - refusing to create the password
+ * is safer than silently creating a weakly-salted one. */
+static int read_salt(uint8_t *salt, size_t n)
 {
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) {
-        ssize_t got = read(fd, salt, n);
-        close(fd);
-        if (got == (ssize_t)n)
-            return;
-    }
-    for (size_t i = 0; i < n; i++)   /* last-resort fallback */
-        salt[i] = (uint8_t)(rand() >> (i & 7));
+    return crypto_random_bytes(salt, n);
 }
 
 /* Stored form (v2): "$p2$<iters>$<hex salt[16]>$<hex pbkdf2-digest[32]>".
  * Legacy (v1) form hex(salt[4] || sha256(salt||password)) is still VERIFIED
  * (existing stores keep working) but never produced anymore. */
-void authstore_hash_password(const char *password, char *out, size_t out_cap)
+int authstore_hash_password(const char *password, char *out, size_t out_cap)
 {
-    if (out_cap < AUTHSTORE_HASH_MAX) { if (out_cap) out[0] = '\0'; return; }
+    if (out_cap < AUTHSTORE_HASH_MAX) { if (out_cap) out[0] = '\0'; return -1; }
     uint8_t salt[16], dig[32];
-    read_salt(salt, sizeof salt);
+    if (read_salt(salt, sizeof salt) != 0) {
+        out[0] = '\0';
+        return -1;
+    }
     pbkdf2_sha256(password, salt, sizeof salt, AUTH_PBKDF2_ITERS, dig);
     char sh[33], dh[65];
     to_hex(salt, sizeof salt, sh);
     to_hex(dig, sizeof dig, dh);
     snprintf(out, out_cap, "$p2$%u$%s$%s", AUTH_PBKDF2_ITERS, sh, dh);
+    return 0;
 }
 
 static int hash_matches(const char *stored, const char *password)
@@ -184,7 +102,13 @@ static int hash_matches(const char *stored, const char *password)
     if (strncmp(stored, "$p2$", 4) == 0) {
         char *end = NULL;
         unsigned long iters = strtoul(stored + 4, &end, 10);
-        if (!end || *end != '$' || iters == 0 || iters > 10000000ul)
+        /* Cap well above our own default (10000) but far below the old
+         * 10,000,000 ceiling: this server never produces a hash above
+         * AUTH_PBKDF2_ITERS, so a stored record claiming anywhere near the
+         * old ceiling can only be a corrupted or maliciously crafted entry -
+         * and running ~1000x the normal PBKDF2 work on the event loop per
+         * login attempt against it is itself a CPU-exhaustion DoS. */
+        if (!end || *end != '$' || iters == 0 || iters > 10u * AUTH_PBKDF2_ITERS)
             return 0;
         const char *sh = end + 1;                 /* salt hex, then '$', digest */
         if (strlen(sh) != 32 + 1 + 64 || sh[32] != '$')
@@ -194,7 +118,7 @@ static int hash_matches(const char *stored, const char *password)
             from_hex(sh + 33, want, sizeof want) != 0)
             return 0;
         pbkdf2_sha256(password, salt, sizeof salt, (uint32_t)iters, dig);
-        return ct_memcmp(dig, want, sizeof dig) == 0;
+        return crypto_ct_memcmp(dig, want, sizeof dig) == 0;
     }
 
     /* Legacy v1: hex( salt[4] || sha256(salt || password) ) = 72 hex chars. */
@@ -204,8 +128,8 @@ static int hash_matches(const char *stored, const char *password)
     uint8_t *buf = malloc(4 + pl);
     if (!buf) return 0;
     memcpy(buf, blob, 4); memcpy(buf + 4, password, pl);
-    uint8_t dig[32]; sha256(buf, 4 + pl, dig); free(buf);
-    return ct_memcmp(dig, blob + 4, 32) == 0;
+    uint8_t dig[32]; crypto_sha256(buf, 4 + pl, dig); free(buf);
+    return crypto_ct_memcmp(dig, blob + 4, 32) == 0;
 }
 
 /* ---- store --------------------------------------------------------------- */

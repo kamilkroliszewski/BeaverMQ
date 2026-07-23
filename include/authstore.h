@@ -64,8 +64,11 @@ int authstore_check(authstore_t *s, const char *user, const char *vhost,
 
 /* Produce a storable password hash (PBKDF2-HMAC-SHA256, salted, versioned
  * "$p2$..." format). out_cap must be >= AUTHSTORE_HASH_MAX. Legacy single-round
- * salted-SHA-256 hashes are still accepted by authstore_verify(). */
-void authstore_hash_password(const char *password, char *out, size_t out_cap);
+ * salted-SHA-256 hashes are still accepted by authstore_verify(). Returns 0 on
+ * success, -1 if a cryptographically secure salt could not be obtained (out
+ * is left empty) - the caller MUST treat that as a hard failure, not create
+ * the user with a weakly-salted hash. */
+int authstore_hash_password(const char *password, char *out, size_t out_cap);
 
 /* ---- enumeration (management API; callback under the read lock) ----------- */
 typedef void (*authstore_vhost_fn)(const char *vhost, void *ctx);

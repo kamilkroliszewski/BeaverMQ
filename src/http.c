@@ -17,6 +17,7 @@
 #include "protocol.h"
 #include "cluster.h"
 #include "authstore.h"
+#include "crypto.h"
 #include "logger.h"
 #include "version.h"
 
@@ -33,6 +34,9 @@
 
 #define HTTP_MAX_HEADER (64u * 1024u)        /* reject huge request heads     */
 #define HTTP_MAX_STATIC (8u * 1024u * 1024u) /* max static file size to serve */
+#define HTTP_DEFAULT_MAX_BODY_BYTES     (16u * 1024u * 1024u)
+#define HTTP_DEFAULT_MAX_CONNECTIONS    512
+#define HTTP_DEFAULT_REQUEST_TIMEOUT_MS 30000u
 
 typedef struct http_conn http_conn_t;
 
@@ -46,10 +50,26 @@ struct beaver_http_server {
     time_t            start_time;
     char              web_root[512];
     http_conn_t      *conns;      /* intrusive list of live HTTP connections */
+    int               n_conns;    /* length of `conns` (single-threaded loop,
+                                   * so a plain counter needs no atomics) */
     uv_async_t        shutdown_async;
     int               shutdown_installed;
     int               listening;
     int               shutting_down;
+
+    /* DoS limits (see http_server_set_limits); permissive defaults so a
+     * caller that forgets to configure them still gets SOME protection. */
+    uint32_t          max_body_bytes;
+    int               max_connections;
+    uint32_t          request_timeout_ms;
+
+    /* Bootstrap window token (see http_server_set_bootstrap_token): while the
+     * authstore has no users, a request must present this exact token (via
+     * the X-Bootstrap-Token header) instead of being trusted purely for
+     * appearing to originate from loopback - a loopback PEER ADDRESS proves
+     * nothing about the real client behind a local reverse proxy. "" (unset)
+     * means the bootstrap window is simply closed (no way in at all). */
+    char              bootstrap_token[80];
 };
 
 struct http_conn {
@@ -60,6 +80,14 @@ struct http_conn {
     size_t                inbuf_cap;
     int                   closing;
     int                   responded;
+    uv_timer_t            timeout_timer; /* slowloris guard: one absolute
+                                         * deadline for the whole request,
+                                         * not reset per-read - a client
+                                         * trickling one byte at a time to
+                                         * keep resetting a rolling timer
+                                         * would otherwise still starve us */
+    int                   n_handles;        /* live handles (tcp [+ timer]) */
+    int                   n_handles_closed;
     http_conn_t          *prev, *next;
 };
 
@@ -73,9 +101,10 @@ typedef struct {
 static void on_http_connection(uv_stream_t *server_stream, int status);
 static void http_alloc(uv_handle_t *h, size_t suggested, uv_buf_t *buf);
 static void on_http_read(uv_stream_t *s, ssize_t nread, const uv_buf_t *buf);
-static void on_http_close(uv_handle_t *handle);
+static void on_http_handle_closed(uv_handle_t *handle);
 static void http_conn_close(http_conn_t *c);
 static void handle_request(http_conn_t *c);
+static void on_http_conn_timeout(uv_timer_t *t);
 
 /* ---- connection list ----------------------------------------------------- */
 
@@ -86,6 +115,7 @@ static void conn_list_push(beaver_http_server_t *s, http_conn_t *c)
     if (s->conns)
         s->conns->prev = c;
     s->conns = c;
+    s->n_conns++;
 }
 
 static void conn_list_remove(beaver_http_server_t *s, http_conn_t *c)
@@ -97,6 +127,7 @@ static void conn_list_remove(beaver_http_server_t *s, http_conn_t *c)
     if (c->next)
         c->next->prev = c->prev;
     c->prev = c->next = NULL;
+    s->n_conns--;
 }
 
 /* ========================================================================= */
@@ -450,37 +481,41 @@ static size_t b64_decode(const char *in, size_t inlen, char *out, size_t outcap)
     return o;
 }
 
-/* Is this HTTP connection's peer the loopback interface? Used to confine the
- * first-boot bootstrap window (no users -> open access) to localhost, so a
- * remote attacker can never race the operator to create the first admin. */
-static int http_peer_is_loopback(http_conn_t *c)
+/* Does this request carry a matching "X-Bootstrap-Token: <token>" header?
+ * Used to confine the first-boot bootstrap window (no users -> open access)
+ * to whoever holds the token (see http_server_set_bootstrap_token) - NOT to
+ * whoever appears to connect from loopback: a TCP peer address only tells you
+ * about the socket THIS process accepted, which is always the reverse
+ * proxy's address if one sits in front of the management API, regardless of
+ * where the real client is. The token is not vulnerable to that confusion. */
+static int http_has_bootstrap_token(http_conn_t *c, const char *head, size_t head_len)
 {
-    struct sockaddr_storage ss;
-    int len = (int)sizeof(ss);
-    if (uv_tcp_getpeername(&c->handle, (struct sockaddr *)&ss, &len) != 0)
-        return 0;
-    if (ss.ss_family == AF_INET) {
-        uint32_t a = ntohl(((struct sockaddr_in *)&ss)->sin_addr.s_addr);
-        return (a >> 24) == 127;             /* 127.0.0.0/8 */
-    }
-    if (ss.ss_family == AF_INET6) {
-        const struct in6_addr *a6 = &((struct sockaddr_in6 *)&ss)->sin6_addr;
-        if (IN6_IS_ADDR_LOOPBACK(a6))
-            return 1;
-        if (IN6_IS_ADDR_V4MAPPED(a6))        /* ::ffff:127.x.x.x */
-            return a6->s6_addr[12] == 127;
+    if (c->server->bootstrap_token[0] == '\0')
+        return 0; /* no token configured: bootstrap window is simply closed */
+    for (const char *p = head; p + 18 < head + head_len; p++) {
+        if ((p == head || p[-1] == '\n') &&
+            strncasecmp(p, "X-Bootstrap-Token:", 18) == 0) {
+            p += 18;
+            while (*p == ' ') p++;
+            const char *e = p;
+            while (e < head + head_len && *e != '\r' && *e != '\n') e++;
+            size_t vlen = (size_t)(e - p);
+            size_t tlen = strlen(c->server->bootstrap_token);
+            if (vlen != tlen)
+                return 0;
+            return crypto_ct_memcmp(p, c->server->bootstrap_token, tlen) == 0;
+        }
     }
     return 0;
 }
 
 /* Authenticate the request against the authstore via HTTP Basic auth.
- * Returns: 3 = bootstrap window (loopback, no users yet), 2 = administrator,
- * 1 = valid non-admin user, 0 = no/bad credentials. The authenticated
- * username is copied into user_out ("" in the bootstrap window).
- * While the store has NO users (first boot), LOOPBACK requests are allowed
- * so the local operator can create the initial admin; remote requests are
- * refused even then. The moment a user exists, all management access requires
- * credentials. */
+ * Returns: 3 = bootstrap window (valid X-Bootstrap-Token, no users yet),
+ * 2 = administrator, 1 = valid non-admin user, 0 = no/bad credentials. The
+ * authenticated username is copied into user_out ("" in the bootstrap
+ * window). While the store has NO users (first boot), only a request
+ * carrying the bootstrap token can create the initial admin; the moment a
+ * user exists, all management access requires real credentials. */
 static int mgmt_authenticate(http_conn_t *c, const char *head, size_t head_len,
                              char *user_out, size_t user_cap)
 {
@@ -488,9 +523,9 @@ static int mgmt_authenticate(http_conn_t *c, const char *head, size_t head_len,
         user_out[0] = '\0';
     authstore_t *as = c->server->nservers > 0
                       ? (authstore_t *)c->server->servers[0]->authstore : NULL;
-    if (!as) return http_peer_is_loopback(c) ? 3 : 0;
+    if (!as) return http_has_bootstrap_token(c, head, head_len) ? 3 : 0;
     if (authstore_is_open(as))              /* bootstrap window */
-        return http_peer_is_loopback(c) ? 3 : 0;
+        return http_has_bootstrap_token(c, head, head_len) ? 3 : 0;
 
     /* Find "Authorization: Basic <b64>" among the request headers. */
     for (const char *p = head; p + 21 < head + head_len; p++) {
@@ -799,8 +834,9 @@ static int handle_mgmt(http_conn_t *c, const char *method, const char *path,
         uint32_t tags = parse_tags(j ? jstr(j,"tags","") : "");
         int rc = -1;
         if (mgmt_name_ok(name) && pass[0]) {
-            char hash[AUTHSTORE_HASH_MAX]; authstore_hash_password(pass, hash, sizeof hash);
-            rc = cfg_apply(h, CFG_ADD_USER, name, hash, "", "", "", tags);
+            char hash[AUTHSTORE_HASH_MAX];
+            if (authstore_hash_password(pass, hash, sizeof hash) == 0)
+                rc = cfg_apply(h, CFG_ADD_USER, name, hash, "", "", "", tags);
         }
         if (j) json_decref(j);
         respond_cfg_result(c, rc, "missing 'name'/'password'");
@@ -1002,13 +1038,14 @@ static void http_alloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buf)
     buf->len  = buf->base ? suggested : 0;
 }
 
-/* Once the header block is in, a request is ready only when its body (if any,
- * per Content-Length) is also fully buffered - so POST/PUT handlers see it all. */
-static int http_request_ready(http_conn_t *c)
+/* Find the end of the header block, or NULL if not seen yet. */
+static char *http_header_end(http_conn_t *c)
 {
-    char *he = memmem(c->inbuf, c->inbuf_len, "\r\n\r\n", 4);
-    if (!he) return 0;
-    size_t head_len = (size_t)(he - c->inbuf) + 4;
+    return memmem(c->inbuf, c->inbuf_len, "\r\n\r\n", 4);
+}
+
+static size_t http_content_length(http_conn_t *c, const char *he)
+{
     size_t clen = 0;
     for (char *p = c->inbuf; p + 15 < he; p++) {
         if ((p == c->inbuf || p[-1] == '\n') &&
@@ -1017,7 +1054,14 @@ static int http_request_ready(http_conn_t *c)
             break;
         }
     }
-    return c->inbuf_len >= head_len + clen;
+    return clen;
+}
+
+static void on_http_conn_timeout(uv_timer_t *t)
+{
+    http_conn_t *c = t->data;
+    LOG_DEBUG("http: request timed out, closing connection");
+    http_conn_close(c);
 }
 
 static void on_http_read(uv_stream_t *stream, ssize_t nread,
@@ -1028,11 +1072,33 @@ static void on_http_read(uv_stream_t *stream, ssize_t nread,
     if (nread > 0) {
         if (!inbuf_append(c, buf->base, (size_t)nread)) {
             http_respond_error(c, 500, "Internal Server Error", "out of memory");
-        } else if (http_request_ready(c)) {
-            handle_request(c); /* full request (head + body) received */
-        } else if (c->inbuf_len > HTTP_MAX_HEADER) {
+            free(buf->base);
+            return;
+        }
+        char *he = http_header_end(c);
+        /* Check the HEADER portion specifically (not the whole buffer, which
+         * may already include a large-but-legitimate body) on EVERY read,
+         * not only once the request looks otherwise incomplete - a complete
+         * request whose headers exceed the limit but arrive in a single read
+         * used to skip this check entirely (it only ran in the "not ready
+         * yet" branch). */
+        size_t header_len = he ? (size_t)(he - c->inbuf) + 4 : c->inbuf_len;
+        if (header_len > HTTP_MAX_HEADER) {
             http_respond_error(c, 431, "Request Header Fields Too Large",
                                "header too large");
+            free(buf->base);
+            return;
+        }
+        if (he) {
+            size_t clen = http_content_length(c, he);
+            if (clen > c->server->max_body_bytes) {
+                http_respond_error(c, 413, "Payload Too Large",
+                                   "request body too large");
+                free(buf->base);
+                return;
+            }
+            if (c->inbuf_len >= header_len + clen)
+                handle_request(c); /* full request (head + body) received */
         }
     } else if (nread < 0) {
         if (nread != UV_EOF)
@@ -1043,9 +1109,11 @@ static void on_http_read(uv_stream_t *stream, ssize_t nread,
     free(buf->base);
 }
 
-static void on_http_close(uv_handle_t *handle)
+static void on_http_handle_closed(uv_handle_t *handle)
 {
     http_conn_t *c = handle->data;
+    if (++c->n_handles_closed < c->n_handles)
+        return;
     free(c->inbuf);
     free(c);
 }
@@ -1056,7 +1124,9 @@ static void http_conn_close(http_conn_t *c)
         return;
     c->closing = 1;
     conn_list_remove(c->server, c);
-    uv_close((uv_handle_t *)&c->handle, on_http_close);
+    if (c->n_handles > 1 && !uv_is_closing((uv_handle_t *)&c->timeout_timer))
+        uv_close((uv_handle_t *)&c->timeout_timer, on_http_handle_closed);
+    uv_close((uv_handle_t *)&c->handle, on_http_handle_closed);
 }
 
 static void on_http_connection(uv_stream_t *server_stream, int status)
@@ -1078,10 +1148,28 @@ static void on_http_connection(uv_stream_t *server_stream, int status)
     }
     c->handle.data = c;
     c->server      = s;
+    c->n_handles   = 1;
 
     if (uv_accept(server_stream, (uv_stream_t *)&c->handle) != 0) {
-        uv_close((uv_handle_t *)&c->handle, on_http_close);
+        uv_close((uv_handle_t *)&c->handle, on_http_handle_closed);
         return;
+    }
+
+    /* Connection cap (DoS guard): accept (to drain the backlog), then refuse -
+     * `c` is already heap-allocated at this point, so closing it is just the
+     * normal error-path close, no separate stack-local handle needed. */
+    if (s->max_connections > 0 && s->n_conns >= s->max_connections) {
+        LOG_WARN("http: refusing connection, at max_connections (%d)",
+                 s->max_connections);
+        uv_close((uv_handle_t *)&c->handle, on_http_handle_closed);
+        return;
+    }
+
+    if (uv_timer_init(s->loop, &c->timeout_timer) == 0) {
+        c->timeout_timer.data = c;
+        c->n_handles = 2;
+        uv_timer_start(&c->timeout_timer, on_http_conn_timeout,
+                       s->request_timeout_ms, 0);
     }
     conn_list_push(s, c);
     uv_read_start((uv_stream_t *)&c->handle, http_alloc, on_http_read);
@@ -1105,6 +1193,9 @@ beaver_http_server_t *http_server_new(uv_loop_t *loop, beaver_broker_t *broker,
     h->stats      = stats;
     h->start_time = time(NULL);
     snprintf(h->web_root, sizeof(h->web_root), "%s", "web");
+    h->max_body_bytes    = HTTP_DEFAULT_MAX_BODY_BYTES;
+    h->max_connections   = HTTP_DEFAULT_MAX_CONNECTIONS;
+    h->request_timeout_ms = HTTP_DEFAULT_REQUEST_TIMEOUT_MS;
     return h;
 }
 
@@ -1112,6 +1203,25 @@ void http_server_set_web_root(beaver_http_server_t *h, const char *path)
 {
     if (h && path && path[0])
         snprintf(h->web_root, sizeof(h->web_root), "%s", path);
+}
+
+void http_server_set_limits(beaver_http_server_t *h, uint32_t max_body_bytes,
+                            int max_connections, uint32_t request_timeout_ms)
+{
+    if (!h)
+        return;
+    if (max_body_bytes)
+        h->max_body_bytes = max_body_bytes;
+    h->max_connections = max_connections;
+    if (request_timeout_ms)
+        h->request_timeout_ms = request_timeout_ms;
+}
+
+void http_server_set_bootstrap_token(beaver_http_server_t *h, const char *token)
+{
+    if (!h)
+        return;
+    snprintf(h->bootstrap_token, sizeof(h->bootstrap_token), "%s", token ? token : "");
 }
 
 int http_server_listen(beaver_http_server_t *h, const char *ip, int port,
