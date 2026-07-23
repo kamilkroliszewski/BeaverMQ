@@ -77,6 +77,7 @@ void exchange_free(beaver_exchange_t *ex)
 
 const char     *exchange_name(const beaver_exchange_t *ex) { return ex->name; }
 exchange_type_t exchange_type(const beaver_exchange_t *ex) { return ex->type; }
+uint8_t exchange_flags(const beaver_exchange_t *ex) { return ex->flags; }
 size_t exchange_binding_count(const beaver_exchange_t *ex) { return ex->n_bindings; }
 const char *exchange_vhost(const beaver_exchange_t *ex)
 {
@@ -217,17 +218,22 @@ static int binding_matches(const beaver_exchange_t *ex, const binding_t *b,
 }
 
 size_t exchange_route(const beaver_exchange_t *ex, const char *routing_key,
-                      beaver_queue_t ***out)
+                      beaver_queue_t ***out, int *out_oom)
 {
     *out = NULL;
+    if (out_oom)
+        *out_oom = 0;
     if (ex->n_bindings == 0)
         return 0;
     if (!routing_key)
         routing_key = "";
 
     beaver_queue_t **targets = malloc(ex->n_bindings * sizeof(beaver_queue_t *));
-    if (!targets)
+    if (!targets) {
+        if (out_oom)
+            *out_oom = 1;
         return 0;
+    }
 
     size_t n = 0;
     for (size_t i = 0; i < ex->n_bindings; i++) {

@@ -31,6 +31,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* protocol.c is otherwise libuv-agnostic; this one exception (a short poll
+ * timer) is what lets a deferred cluster-commit response happen without
+ * blocking the connection's event loop - see await_cluster_commit below. */
+#include <uv.h>
+
 /* Sanity cap for a single message body when max_message_size is unset
  * (prevents a hostile body-size field from triggering a huge allocation). */
 #define AMQP_MAX_BODY_SIZE (128u * 1024u * 1024u)
@@ -38,10 +43,23 @@
 #define AMQP_CHANNEL_MAX 2047u        /* advertised in Connection.Tune */
 #define AMQP_HEARTBEAT_SECONDS 60u    /* suggested in Connection.Tune */
 
+/* A Basic.Get delivery with no_ack=false, awaiting Basic.Ack/Reject/Nack.
+ * Basic.Get has no consumer_t (it's a direct dequeue, not push delivery), so
+ * without this the broker had nothing to settle against: it always behaved
+ * as no_ack even when the client asked for manual ack, and a client that
+ * crashed before acking lost the message with no way to recover it. */
+typedef struct {
+    uint64_t          tag;
+    beaver_message_t *msg;   /* ref held until acked/rejected/requeued */
+    beaver_queue_t   *queue; /* ref held for the same reason */
+} get_unacked_t;
+
 /* One open channel: its id plus per-channel state (Basic.Qos prefetch). */
 typedef struct {
     uint16_t id;
     uint16_t prefetch;   /* Basic.Qos prefetch-count; 0 = unlimited */
+    get_unacked_t *get_unacked;
+    size_t         n_get_unacked, cap_get_unacked;
 } proto_chan_t;
 
 struct beaver_proto {
@@ -87,6 +105,9 @@ struct beaver_proto {
     char           vhost[128];
     char           user[128];        /* authenticated username (perm checks) */
     uint32_t       user_tags;        /* authstore tag bits (admin/management) */
+
+    struct pending_cluster_op *pending_ops; /* in-flight deferred cluster-commit
+                                             * responses (see await_cluster_commit) */
 };
 
 /* ---- forward declarations ------------------------------------------------ */
@@ -95,6 +116,12 @@ static void proto_fatal(beaver_proto_t *p, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
                              size_t body_len);
+static void send_method(beaver_proto_t *p, uint16_t channel,
+                        uint16_t class_id, uint16_t method_id,
+                        const bmqp_buf_t *args);
+static void send_channel_close(beaver_proto_t *p, uint16_t channel,
+                               uint16_t code, const char *text,
+                               uint16_t class_id, uint16_t method_id);
 
 /* ========================================================================= */
 /* small helpers                                                              */
@@ -202,20 +229,234 @@ static int channel_add(beaver_proto_t *p, uint16_t ch)
         p->channels     = na;
         p->cap_channels = nc;
     }
-    p->channels[p->n_channels].id       = ch;
-    p->channels[p->n_channels].prefetch = 0;
+    p->channels[p->n_channels].id             = ch;
+    p->channels[p->n_channels].prefetch       = 0;
+    p->channels[p->n_channels].get_unacked     = NULL;
+    p->channels[p->n_channels].n_get_unacked   = 0;
+    p->channels[p->n_channels].cap_get_unacked = 0;
     p->n_channels++;
     return 1;
+}
+
+/* Requeue every still-outstanding Basic.Get manual-ack delivery on `pc` (the
+ * channel is going away - a client that crashed/closed before acking must
+ * not lose the message). */
+static void chan_release_get_unacked(proto_chan_t *pc)
+{
+    for (size_t i = 0; i < pc->n_get_unacked; i++) {
+        get_unacked_t *g = &pc->get_unacked[i];
+        queue_enqueue(g->queue, g->msg);
+        message_unref(g->msg);
+        queue_unref(g->queue);
+    }
+    free(pc->get_unacked);
+    pc->get_unacked = NULL;
+    pc->n_get_unacked = pc->cap_get_unacked = 0;
 }
 
 static void channel_remove(beaver_proto_t *p, uint16_t ch)
 {
     for (size_t i = 0; i < p->n_channels; i++) {
         if (p->channels[i].id == ch) {
+            chan_release_get_unacked(&p->channels[i]);
             p->channels[i] = p->channels[--p->n_channels];
             return;
         }
     }
+}
+
+/* Track a Basic.Get delivery (no_ack=false) awaiting Basic.Ack/Reject/Nack.
+ * Takes ownership of both refs (released on settle or channel/conn teardown). */
+static int chan_get_unacked_add(proto_chan_t *pc, uint64_t tag,
+                                beaver_message_t *msg, beaver_queue_t *queue)
+{
+    if (pc->n_get_unacked == pc->cap_get_unacked) {
+        size_t nc = pc->cap_get_unacked ? pc->cap_get_unacked * 2 : 8;
+        get_unacked_t *na = realloc(pc->get_unacked, nc * sizeof(*na));
+        if (!na)
+            return 0;
+        pc->get_unacked     = na;
+        pc->cap_get_unacked = nc;
+    }
+    pc->get_unacked[pc->n_get_unacked].tag   = tag;
+    pc->get_unacked[pc->n_get_unacked].msg   = msg;
+    pc->get_unacked[pc->n_get_unacked].queue = queue;
+    pc->n_get_unacked++;
+    return 1;
+}
+
+/* Settle entries matching delivery_tag (multiple: everything <= tag, or ALL
+ * if delivery_tag == 0, matching dispatch.c's settle_unacked semantics).
+ * Returns the number settled. */
+static size_t chan_get_unacked_settle(proto_chan_t *pc, uint64_t delivery_tag,
+                                      int multiple, int requeue)
+{
+    size_t settled = 0;
+    for (size_t i = 0; i < pc->n_get_unacked; ) {
+        uint64_t t = pc->get_unacked[i].tag;
+        int match = multiple ? (delivery_tag == 0 || t <= delivery_tag)
+                             : (t == delivery_tag);
+        if (!match) {
+            i++;
+            continue;
+        }
+        get_unacked_t g = pc->get_unacked[i];
+        if (requeue)
+            queue_enqueue(g.queue, g.msg);
+        else
+            queue_consume_on_ack(g.queue, g.msg->cluster_id);
+        message_unref(g.msg);
+        queue_unref(g.queue);
+        pc->get_unacked[i] = pc->get_unacked[--pc->n_get_unacked];
+        settled++;
+        if (!multiple)
+            break;
+    }
+    return settled;
+}
+
+/* ---- deferred cluster-commit responses ------------------------------------
+ * A durable Queue/Exchange.Declare or Queue.Bind must not tell the client it
+ * succeeded until the op actually COMMITS on the cluster - sending the *-Ok
+ * right after creating the local object (the old behavior) let a client see
+ * success even with no leader/quorum, or when the propose call itself failed
+ * (OOM). AMQP method handling runs synchronously within one event-loop tick,
+ * so we cannot block here; instead a short interval timer polls
+ * cluster_proposal_status() and only then sends the (deferred) response. */
+#define CLUSTER_WAIT_POLL_MS    5
+#define CLUSTER_WAIT_TIMEOUT_MS 5000
+
+typedef enum {
+    PENDING_EXCHANGE_DECLARE_OK,
+    PENDING_QUEUE_DECLARE_OK,
+    PENDING_QUEUE_BIND_OK,
+} pending_kind_t;
+
+typedef struct pending_cluster_op {
+    struct pending_cluster_op *next;
+    beaver_proto_t      *p;         /* NULL once cancelled (conn/channel gone) */
+    struct cluster_node *cluster;
+    uint64_t             seq;
+    uint16_t             channel;
+    uint16_t             class_id, method_id; /* for the failure channel-exception */
+    pending_kind_t       kind;
+    char                 qname[256];  /* PENDING_QUEUE_DECLARE_OK only */
+    uint32_t             depth;
+    uint64_t             deadline_ms;
+    uv_timer_t           timer;
+} pending_cluster_op_t;
+
+static void pending_op_closed_cb(uv_handle_t *h)
+{
+    free(h->data);
+}
+
+/* Detach op from its connection's list without touching the timer handle. */
+static void detach_pending_op(pending_cluster_op_t *op)
+{
+    if (!op->p)
+        return;
+    pending_cluster_op_t **link = &op->p->pending_ops;
+    while (*link && *link != op)
+        link = &(*link)->next;
+    if (*link)
+        *link = op->next;
+    op->p = NULL;
+}
+
+/* Cancel every pending op on `p` (channel_filter < 0) or just on one channel
+ * (Channel.Close). Cancelled ops never touch `p` again (see the timer cb). */
+static void cancel_pending_ops(beaver_proto_t *p, int channel_filter)
+{
+    pending_cluster_op_t **link = &p->pending_ops;
+    while (*link) {
+        pending_cluster_op_t *op = *link;
+        if (channel_filter < 0 || op->channel == (uint16_t)channel_filter) {
+            *link = op->next;
+            op->p = NULL;
+            op->next = NULL;
+            uv_close((uv_handle_t *)&op->timer, pending_op_closed_cb);
+        } else {
+            link = &op->next;
+        }
+    }
+}
+
+static void pending_op_timer_cb(uv_timer_t *t)
+{
+    pending_cluster_op_t *op = t->data;
+    if (!op->p) {
+        uv_close((uv_handle_t *)t, pending_op_closed_cb);
+        return;
+    }
+    cluster_proposal_status_t st = cluster_proposal_status(op->cluster, op->seq);
+    if (st == CL_PROPOSAL_PENDING) {
+        if (uv_now(t->loop) < op->deadline_ms)
+            return; /* keep polling */
+        st = CL_PROPOSAL_REJECTED; /* timed out */
+    }
+    beaver_proto_t *p = op->p;
+    uint16_t channel = op->channel;
+    detach_pending_op(op);
+    if (st == CL_PROPOSAL_COMMITTED) {
+        switch (op->kind) {
+        case PENDING_EXCHANGE_DECLARE_OK:
+            send_method(p, channel, BMQP_CLASS_EXCHANGE,
+                       BMQP_EXCHANGE_DECLARE_OK, NULL);
+            break;
+        case PENDING_QUEUE_DECLARE_OK: {
+            bmqp_buf_t a;
+            bmqp_buf_init(&a);
+            bmqp_buf_put_shortstr_n(&a, op->qname, strlen(op->qname));
+            bmqp_buf_put_u32(&a, op->depth); /* message-count */
+            bmqp_buf_put_u32(&a, 0);         /* consumer-count */
+            send_method(p, channel, BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE_OK, &a);
+            bmqp_buf_free(&a);
+            break;
+        }
+        case PENDING_QUEUE_BIND_OK:
+            send_method(p, channel, BMQP_CLASS_QUEUE, BMQP_QUEUE_BIND_OK, NULL);
+            break;
+        }
+    } else {
+        send_channel_close(p, channel, 541,
+                           "INTERNAL_ERROR - cluster commit failed or timed out",
+                           op->class_id, op->method_id);
+    }
+    uv_close((uv_handle_t *)&op->timer, pending_op_closed_cb);
+}
+
+/* Register a poll for `seq`'s outcome; qname/depth are only used for
+ * PENDING_QUEUE_DECLARE_OK (pass qname=NULL, depth=0 otherwise). */
+static void await_cluster_commit(beaver_proto_t *p, uint16_t channel, uint64_t seq,
+                                 uint16_t class_id, uint16_t method_id,
+                                 pending_kind_t kind, const char *qname, uint32_t depth)
+{
+    pending_cluster_op_t *op = calloc(1, sizeof(*op));
+    if (!op) {
+        send_channel_close(p, channel, 541,
+                           "INTERNAL_ERROR - out of memory awaiting cluster commit",
+                           class_id, method_id);
+        return;
+    }
+    op->p         = p;
+    op->cluster   = p->conn->server->cluster;
+    op->seq       = seq;
+    op->channel   = channel;
+    op->class_id  = class_id;
+    op->method_id = method_id;
+    op->kind      = kind;
+    if (qname)
+        snprintf(op->qname, sizeof(op->qname), "%s", qname);
+    op->depth = depth;
+    uv_loop_t *loop = p->conn->handle.loop;
+    op->deadline_ms = uv_now(loop) + CLUSTER_WAIT_TIMEOUT_MS;
+    uv_timer_init(loop, &op->timer);
+    op->timer.data = op;
+    op->next = p->pending_ops;
+    p->pending_ops = op;
+    uv_timer_start(&op->timer, pending_op_timer_cb,
+                   CLUSTER_WAIT_POLL_MS, CLUSTER_WAIT_POLL_MS);
 }
 
 /* ---- teardown helpers ---------------------------------------------------- */
@@ -552,9 +793,12 @@ static void handle_connection(beaver_proto_t *p, uint16_t channel,
             p->frame_max = AMQP_DEFAULT_FRAME_MAX;
         p->conn->frame_max = p->frame_max;
         /* The TuneOk heartbeat is the negotiated value; 0 disables. Arm the
-         * sender/dead-peer timer accordingly. */
+         * sender/dead-peer timer accordingly - either way, the handshake
+         * completed, so the handshake-timeout deadline must not still fire. */
         if (p->heartbeat)
             beaver_conn_enable_heartbeat(p->conn, p->heartbeat);
+        else
+            beaver_conn_clear_handshake_timeout(p->conn);
         LOG_INFO("conn #%" PRIu64 ": Connection.TuneOk "
                  "(channel_max=%u frame_max=%u heartbeat=%u)",
                  p->conn->id, p->channel_max, p->frame_max, p->heartbeat);
@@ -667,6 +911,8 @@ static void handle_channel(beaver_proto_t *p, uint16_t channel,
         bmqp_read_shortstr(r, &n);
         bmqp_read_u16(r);
         bmqp_read_u16(r);
+        cancel_pending_ops(p, channel);
+        dispatcher_remove_channel(p->conn->server->dispatcher, p->conn, channel);
         channel_remove(p, channel);
         LOG_INFO("conn #%" PRIu64 ": Channel.Close ch=%u (code=%u)",
                  p->conn->id, channel, code);
@@ -718,13 +964,30 @@ static void handle_exchange(beaver_proto_t *p, uint16_t channel,
             return;
 
         exchange_type_t xtype;
-        if (exchange_type_from_name(etype, &xtype) != 0)
-            LOG_WARN("conn #%" PRIu64 ": unsupported exchange type '%s', "
-                     "treating as direct", p->conn->id, etype);
+        if (exchange_type_from_name(etype, &xtype) != 0) {
+            /* An unknown exchange type must be a channel exception, not a
+             * silent direct-exchange substitution - the client believed it
+             * declared (e.g.) a headers exchange and would route messages
+             * accordingly, while the broker quietly created a direct one. */
+            char text[300];
+            snprintf(text, sizeof text,
+                     "COMMAND_INVALID - unknown exchange type '%s'", etype);
+            send_channel_close(p, channel, 503, text,
+                               BMQP_CLASS_EXCHANGE, BMQP_EXCHANGE_DECLARE);
+            return;
+        }
 
         int created = 0;
-        if (broker_declare_exchange(p->conn->server->broker, p->vhost, ename,
-                                    xtype, bits & 0x0E, &created) != 0) {
+        int drc = broker_declare_exchange(p->conn->server->broker, p->vhost,
+                                          ename, xtype, bits & 0x0E, &created);
+        if (drc == -2) {
+            send_channel_close(p, channel, 406,
+                               "PRECONDITION_FAILED - exchange already "
+                               "declared with different type/flags",
+                               BMQP_CLASS_EXCHANGE, BMQP_EXCHANGE_DECLARE);
+            return;
+        }
+        if (drc != 0) {
             proto_fatal(p, "failed to declare exchange '%s'", ename);
             return;
         }
@@ -732,11 +995,27 @@ static void handle_exchange(beaver_proto_t *p, uint16_t channel,
                  p->conn->id, channel, ename, exchange_type_name(xtype),
                  created ? "created" : "exists");
         /* Replicate only DURABLE topology: durable objects are clustered (HA +
-         * survive restart); transient ones stay node-local and fast. */
-        if (p->conn->server->cluster && (bits & BMQP_FLAG_DURABLE))
-            cluster_replicate_declare_exchange(p->conn->server->cluster,
-                                               p->vhost, ename,
-                                               (int)xtype, bits & 0x0E);
+         * survive restart); transient ones stay node-local and fast. Do NOT
+         * send Declare-Ok until this actually COMMITS - the client must never
+         * see success when there was no leader/quorum or the propose itself
+         * failed (see await_cluster_commit). */
+        if (p->conn->server->cluster && (bits & BMQP_FLAG_DURABLE)) {
+            uint64_t seq = cluster_replicate_declare_exchange(
+                p->conn->server->cluster, p->vhost, ename, (int)xtype, bits & 0x0E);
+            if (no_wait)
+                break;
+            if (seq == 0) {
+                send_channel_close(p, channel, 541,
+                                   "INTERNAL_ERROR - failed to replicate "
+                                   "Exchange.Declare", BMQP_CLASS_EXCHANGE,
+                                   BMQP_EXCHANGE_DECLARE);
+                break;
+            }
+            await_cluster_commit(p, channel, seq, BMQP_CLASS_EXCHANGE,
+                                 BMQP_EXCHANGE_DECLARE,
+                                 PENDING_EXCHANGE_DECLARE_OK, NULL, 0);
+            break;
+        }
         if (!no_wait)
             send_method(p, channel, BMQP_CLASS_EXCHANGE,
                         BMQP_EXCHANGE_DECLARE_OK, NULL);
@@ -788,17 +1067,39 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         uint32_t depth = 0;
         int created = 0;
         /* passive/durable/exclusive/auto-delete bits map 1:1 to our flags. */
-        if (broker_declare_queue(p->conn->server->broker, p->vhost, qname,
-                                 bits & 0x0E, &depth, &created) != 0) {
+        int drc = broker_declare_queue(p->conn->server->broker, p->vhost, qname,
+                                       bits & 0x0E, &depth, &created);
+        if (drc == -2) {
+            send_channel_close(p, channel, 406,
+                               "PRECONDITION_FAILED - queue already declared "
+                               "with different flags",
+                               BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE);
+            return;
+        }
+        if (drc != 0) {
             proto_fatal(p, "failed to declare queue '%s'", qname);
             return;
         }
         LOG_INFO("conn #%" PRIu64 " ch=%u: Queue.Declare '%s' (%s, depth=%u)",
                  p->conn->id, channel, qname,
                  created ? "created" : "exists", depth);
-        if (p->conn->server->cluster && (bits & BMQP_FLAG_DURABLE))
-            cluster_replicate_declare_queue(p->conn->server->cluster, p->vhost, qname,
-                                            bits & 0x0E);
+        if (p->conn->server->cluster && (bits & BMQP_FLAG_DURABLE)) {
+            uint64_t seq = cluster_replicate_declare_queue(
+                p->conn->server->cluster, p->vhost, qname, bits & 0x0E);
+            if (no_wait)
+                break;
+            if (seq == 0) {
+                send_channel_close(p, channel, 541,
+                                   "INTERNAL_ERROR - failed to replicate "
+                                   "Queue.Declare", BMQP_CLASS_QUEUE,
+                                   BMQP_QUEUE_DECLARE);
+                break;
+            }
+            await_cluster_commit(p, channel, seq, BMQP_CLASS_QUEUE,
+                                 BMQP_QUEUE_DECLARE, PENDING_QUEUE_DECLARE_OK,
+                                 qname, depth);
+            break;
+        }
 
         if (!no_wait) {
             bmqp_buf_t a;
@@ -852,11 +1153,25 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         if (p->conn->server->cluster) {
             beaver_queue_t *bq = broker_get_queue(p->conn->server->broker,
                                                   p->vhost, qname);
-            if (bq) {
-                if (queue_flags(bq) & BMQP_FLAG_DURABLE)
-                    cluster_replicate_bind(p->conn->server->cluster, p->vhost,
-                                           qname, ename, key);
+            int durable_q = bq && (queue_flags(bq) & BMQP_FLAG_DURABLE);
+            uint64_t seq = 0;
+            if (durable_q)
+                seq = cluster_replicate_bind(p->conn->server->cluster, p->vhost,
+                                             qname, ename, key);
+            if (bq)
                 queue_unref(bq);
+            if (durable_q && !(no_wait & 0x01)) {
+                if (seq == 0) {
+                    send_channel_close(p, channel, 541,
+                                       "INTERNAL_ERROR - failed to replicate "
+                                       "Queue.Bind", BMQP_CLASS_QUEUE,
+                                       BMQP_QUEUE_BIND);
+                } else {
+                    await_cluster_commit(p, channel, seq, BMQP_CLASS_QUEUE,
+                                         BMQP_QUEUE_BIND, PENDING_QUEUE_BIND_OK,
+                                         NULL, 0);
+                }
+                break;
             }
         }
         if (!(no_wait & 0x01))
@@ -997,7 +1312,7 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
         bmqp_read_u16(r);                       /* reserved-1 */
         size_t qn;
         const char *q = bmqp_read_shortstr(r, &qn);
-        bmqp_read_u8(r);                        /* no-ack bit (we auto-ack) */
+        uint8_t no_ack = bmqp_read_u8(r) & 0x01;
         if (r->error) {
             proto_fatal(p, "malformed Basic.Get");
             return;
@@ -1029,9 +1344,10 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
         }
         /* Basic.GetOk: delivery-tag, redelivered, exchange, routing-key,
          * message-count; followed by content header + body. */
+        uint64_t tag = ++p->consumer_seq;
         bmqp_buf_t a;
         bmqp_buf_init(&a);
-        bmqp_buf_put_u64(&a, ++p->consumer_seq);  /* delivery-tag */
+        bmqp_buf_put_u64(&a, tag);                 /* delivery-tag */
         bmqp_buf_put_u8(&a, 0);                    /* redelivered */
         bmqp_buf_put_shortstr(&a, msg->exchange);
         bmqp_buf_put_shortstr(&a, msg->routing_key);
@@ -1041,11 +1357,30 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
         protocol_send_content(p->conn, channel, BMQP_CLASS_BASIC, msg->body,
                               msg->body_len, msg->props, msg->props_len,
                               p->conn->frame_max);
-        /* Pull auto-acks: advance + replicate the consume watermark so replica
-         * copies on the other nodes drain and the log can compact past it. */
-        dispatcher_note_pull(p->conn->server->dispatcher, queue, msg->cluster_id);
-        message_unref(msg);
-        queue_unref(queue);
+        if (no_ack) {
+            /* Pull auto-acks: advance + replicate the consume watermark so
+             * replica copies on the other nodes drain and the log can
+             * compact past it. */
+            dispatcher_note_pull(p->conn->server->dispatcher, queue, msg->cluster_id);
+            message_unref(msg);
+            queue_unref(queue);
+        } else {
+            /* Manual ack: keep both refs until Basic.Ack/Reject/Nack (or the
+             * channel/connection closes, which requeues it) settles it -
+             * msg/queue are NOT unref'd here; chan_get_unacked_settle or
+             * chan_release_get_unacked does that later. */
+            proto_chan_t *pc = channel_find(p, channel);
+            if (!pc || !chan_get_unacked_add(pc, tag, msg, queue)) {
+                /* OOM tracking the delivery: it's already on the wire, so we
+                 * cannot un-send it - fail closed by tearing down the
+                 * connection rather than silently losing manual-ack
+                 * bookkeeping for a message the client thinks it must ack. */
+                message_unref(msg);
+                queue_unref(queue);
+                proto_fatal(p, "out of memory tracking Basic.Get delivery");
+                return;
+            }
+        }
         break;
     }
     case BMQP_BASIC_ACK: {
@@ -1055,8 +1390,15 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
             proto_fatal(p, "malformed Basic.Ack");
             return;
         }
-        dispatcher_ack(p->conn->server->dispatcher, p->conn, channel,
-                       delivery_tag, multiple);
+        /* Basic.Get and Basic.Consume deliveries use separate delivery-tag
+         * counters, so a "multiple" ack spanning both sources must settle
+         * both; for a single tag, only try the dispatcher if it wasn't a
+         * tracked Basic.Get delivery (avoids a spurious "unknown tag" log). */
+        proto_chan_t *pc = channel_find(p, channel);
+        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, multiple, 0) : 0;
+        if (multiple || got == 0)
+            dispatcher_ack(p->conn->server->dispatcher, p->conn, channel,
+                          delivery_tag, multiple);
         LOG_DEBUG("conn #%" PRIu64 " ch=%u: Basic.Ack delivery_tag=%" PRIu64
                   " multiple=%u", p->conn->id, channel, delivery_tag, multiple);
         break;
@@ -1069,8 +1411,11 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
             proto_fatal(p, "malformed Basic.Reject");
             return;
         }
-        dispatcher_nack(p->conn->server->dispatcher, p->conn, channel,
-                        delivery_tag, 0 /* multiple */, requeue);
+        proto_chan_t *pc = channel_find(p, channel);
+        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, 0, requeue) : 0;
+        if (got == 0)
+            dispatcher_nack(p->conn->server->dispatcher, p->conn, channel,
+                           delivery_tag, 0 /* multiple */, requeue);
         LOG_DEBUG("conn #%" PRIu64 " ch=%u: Basic.Reject delivery_tag=%" PRIu64
                   " requeue=%u", p->conn->id, channel, delivery_tag, requeue);
         break;
@@ -1084,8 +1429,13 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
             proto_fatal(p, "malformed Basic.Nack");
             return;
         }
-        dispatcher_nack(p->conn->server->dispatcher, p->conn, channel,
-                        delivery_tag, bits & 0x01, (bits & 0x02) != 0);
+        int multiple = (bits & 0x01) != 0;
+        int requeue2 = (bits & 0x02) != 0;
+        proto_chan_t *pc = channel_find(p, channel);
+        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, multiple, requeue2) : 0;
+        if (multiple || got == 0)
+            dispatcher_nack(p->conn->server->dispatcher, p->conn, channel,
+                           delivery_tag, multiple, requeue2);
         LOG_DEBUG("conn #%" PRIu64 " ch=%u: Basic.Nack delivery_tag=%" PRIu64
                   " bits=0x%x", p->conn->id, channel, delivery_tag, bits);
         break;
@@ -1356,6 +1706,9 @@ void protocol_conn_free(beaver_proto_t *p)
 {
     if (!p)
         return;
+    cancel_pending_ops(p, -1);
+    for (size_t i = 0; i < p->n_channels; i++)
+        chan_release_get_unacked(&p->channels[i]);
     free(p->inbuf);
     free(p->channels);
     free(p->pub_body);
@@ -1408,6 +1761,17 @@ void protocol_on_data(beaver_proto_t *p, const uint8_t *data, size_t len)
         if (n < 0) {
             proto_fatal(p, "framing error (bad length or missing 0x%02X end)",
                         BMQP_FRAME_END);
+            return;
+        }
+        /* bmqp_frame_parse() only enforces the global BMQP_MAX_FRAME_PAYLOAD
+         * cap - not the per-connection frame_max WE negotiated with this
+         * client in Connection.Tune/TuneOk (0 before that negotiation
+         * completes, hence the guard). A client that agreed to a smaller
+         * frame_max but then sends a larger frame anyway is violating the
+         * negotiated contract, not just sending a large-but-legal frame. */
+        if (p->frame_max > 0 && hdr.payload_len > p->frame_max) {
+            proto_fatal(p, "frame of %u bytes exceeds negotiated frame_max=%u",
+                       hdr.payload_len, p->frame_max);
             return;
         }
         dispatch_frame(p, &hdr, payload);

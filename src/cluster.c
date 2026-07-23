@@ -23,6 +23,7 @@
 #include "broker.h"
 #include "message.h"
 #include "authstore.h"
+#include "crypto.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -64,6 +65,11 @@ static uint64_t get_be64(const uint8_t *p)
 /* Raft timer callbacks (defined later; referenced by the state-machine helpers). */
 static void election_timer_cb(uv_timer_t *timer);
 static void heartbeat_timer_cb(uv_timer_t *timer);
+static void update_health(cluster_node_t *n);
+static void arm_election_timer(cluster_node_t *n);
+static void storage_write_failed(cluster_node_t *n, const char *what);
+static void drop_peer_link(cluster_peer_t *peer);
+static cluster_peer_t *find_peer(cluster_node_t *n, int node_id);
 
 /* ---- CRC-32 (IEEE 802.3, poly 0xEDB88820) -------------------------------- */
 
@@ -151,6 +157,7 @@ void cluster_config_defaults(cluster_config_t *c)
     c->election_min_ms = 1000;
     c->election_max_ms = 2000;
     c->heartbeat_ms    = 200;
+    c->durable_commit  = 1;
 }
 
 /* ---- small utilities ----------------------------------------------------- */
@@ -250,10 +257,54 @@ static int cl_send(uv_stream_t *link, uint8_t type, uint8_t flags,
     return rc;
 }
 
+/* HELLO/HELLO_ACK payload: node_id(4) + nonce(8) + HMAC-SHA256(secret,
+ * frame_type(1) || node_id(4) || nonce(8))(32) = 44 bytes.
+ *
+ * Without cluster_secret, any host that can reach cluster_port could send a
+ * HELLO claiming to be any node_id (see find_peer()/on_inbound_read below,
+ * which used to trust that claim outright) and inject VOTE/APPEND/FORWARD
+ * frames as that peer. The HMAC proves the sender holds the shared secret;
+ * it does NOT provide replay protection or transport encryption (that needs
+ * TLS/mTLS, deliberately out of scope here) - it only closes the
+ * impersonation gap. */
+#define CL_HELLO_LEN (4u + 8u + 32u)
+
+static void hello_payload_build(cluster_node_t *n, uint8_t type,
+                                uint8_t out[CL_HELLO_LEN])
+{
+    put_be32(out, (uint32_t)n->self_id);
+    put_be64(out + 4, xorshift64(&n->rng_state));
+    uint8_t msg[1 + 4 + 8];
+    msg[0] = type;
+    memcpy(msg + 1, out, 4 + 8);
+    crypto_hmac_sha256((const uint8_t *)n->secret, strlen(n->secret),
+                       msg, sizeof(msg), out + 12);
+}
+
+/* Validates length + HMAC; on success writes the claimed node_id to
+ * *out_node_id. Returns 0 on success, -1 otherwise (bad length or HMAC -
+ * caller must drop the connection without any further processing). */
+static int hello_payload_verify(cluster_node_t *n, uint8_t type,
+                                const uint8_t *payload, uint32_t len,
+                                int *out_node_id)
+{
+    if (len != CL_HELLO_LEN)
+        return -1;
+    uint8_t msg[1 + 4 + 8], want[32];
+    msg[0] = type;
+    memcpy(msg + 1, payload, 4 + 8);
+    crypto_hmac_sha256((const uint8_t *)n->secret, strlen(n->secret),
+                       msg, sizeof(msg), want);
+    if (crypto_ct_memcmp(want, payload + 12, 32) != 0)
+        return -1;
+    *out_node_id = (int)get_be32(payload);
+    return 0;
+}
+
 static void send_hello(cluster_node_t *n, uv_stream_t *link, uint8_t type)
 {
-    uint8_t body[4];
-    put_be32(body, (uint32_t)n->self_id);
+    uint8_t body[CL_HELLO_LEN];
+    hello_payload_build(n, type, body);
     cl_send(link, type, 0, (uint32_t)atomic_load(&n->current_term), body, sizeof(body));
 }
 
@@ -341,8 +392,10 @@ static void persist_meta(cluster_node_t *n)
     put_be32(b + 4, 1);
     put_be64(b + 8, atomic_load(&n->current_term));
     put_be32(b + 16, (uint32_t)n->voted_for);
-    if (pwrite(ps->meta_fd, b, CL_META_SIZE, 0) == (ssize_t)CL_META_SIZE)
-        fsync(ps->meta_fd);
+    if (pwrite(ps->meta_fd, b, CL_META_SIZE, 0) == (ssize_t)CL_META_SIZE &&
+        fsync(ps->meta_fd) == 0)
+        return;
+    storage_write_failed(n, "persist_meta (term/vote)");
 }
 
 /* Pre-allocate the log file in big chunks so the kernel never pauses our loop to
@@ -367,6 +420,9 @@ static void persist_write_flush(cluster_node_t *n)
     if (lseek(ps->log_fd, (off_t)ps->write_pos, SEEK_SET) >= 0 &&
         write_all(ps->log_fd, ps->wbuf, ps->wbuf_len) == 0) {
         ps->write_pos += ps->wbuf_len;
+    } else {
+        /* Nothing was durably written - do not pretend otherwise. */
+        storage_write_failed(n, "log write");
     }
     ps->wbuf_len = 0;
 }
@@ -404,8 +460,13 @@ static void persist_sync(cluster_node_t *n)
     cl_persist_t *ps = n->persist;
     if (!ps || ps->log_fd < 0) return;
     persist_write_flush(n);
+    if (atomic_load(&n->storage_failed))
+        return; /* a write/fsync just failed: never advance durable_index */
     if (ps->dirty) {
-        fsync(ps->log_fd);
+        if (fsync(ps->log_fd) != 0) {
+            storage_write_failed(n, "log fsync");
+            return;
+        }
         ps->dirty = 0;
     }
     /* Everything written is now on stable storage: advance the durable index
@@ -562,7 +623,13 @@ static int snapshot_write(cluster_node_t *n, uint64_t base_index,
         broker_foreach_queue(n->broker, collect_queue_cb, &qs);
         for (size_t i = 0; ok && i < qs.n; i++) {
             size_t nm = 0;
-            beaver_message_t **ms = queue_snapshot_refs(qs.q[i], base_index, &nm);
+            int oom = 0;
+            beaver_message_t **ms = queue_snapshot_refs(qs.q[i], base_index, &nm, &oom);
+            if (oom) {
+                LOG_ERROR("cluster: OOM snapshotting queue '%s' to disk; "
+                         "on-disk snapshot may be missing messages",
+                         queue_name(qs.q[i]));
+            }
             for (size_t j = 0; ok && j < nm; j++) {
                 size_t rl = snap_record_size(qs.q[i], ms[j]);
                 uint8_t *rb = malloc(rl);
@@ -885,8 +952,103 @@ typedef struct cl_proposal {
     struct cl_proposal *next;
     uint32_t op_type;
     uint32_t len;
+    uint64_t seq;      /* assigned once at submission (propose_internal); the
+                        * dedup/ack key when forwarded, and the lookup key for
+                        * cluster_proposal_status() polling. */
     uint8_t  data[];
 } cl_proposal_t;
+
+/* Leader-side: FIFO of committed-pending (log_index, origin_node_id, seq)
+ * tuples, drained by resolve_fwd_acks() as commit_index advances. origin ==
+ * self_id means a locally-submitted proposal (mark_proposal_status directly,
+ * no wire ack needed); otherwise it came from a CL_FRAME_FORWARD and needs a
+ * CL_FRAME_FORWARD_ACK sent back to that peer. */
+typedef struct cl_fwd_ack {
+    struct cl_fwd_ack *next;
+    uint64_t log_index;
+    int      origin_node_id;
+    uint64_t seq;
+} cl_fwd_ack_t;
+
+static void forward_batch_to_leader(cluster_node_t *n, cl_proposal_t *list);
+
+static void mark_proposal_status(cluster_node_t *n, uint64_t seq, int status)
+{
+    if (seq == 0)
+        return;
+    size_t idx = (size_t)(seq % CL_STATUS_TABLE_SIZE);
+    /* Write val before seq (the "publish" signal): cluster_proposal_status()
+     * reads seq first, then val, and only trusts val if seq matches - so val
+     * must already be visible by the time a reader can observe the matching
+     * seq. Both sides use default (seq_cst) atomics, which is enough to make
+     * this safe without extra fences. */
+    atomic_store(&n->propose_status_val[idx], status);
+    atomic_store(&n->propose_status_seq[idx], seq);
+}
+
+static void push_fwd_ack_pending(cluster_node_t *n, uint64_t log_index,
+                                 int origin_node_id, uint64_t seq)
+{
+    if (seq == 0)
+        return; /* untracked proposal (plain cluster_propose): nothing to ack */
+    cl_fwd_ack_t *a = malloc(sizeof(*a));
+    if (!a)
+        return; /* best-effort bookkeeping: the origin's own retry/timeout
+                  * path still recovers if this allocation fails - we must not
+                  * fail the commit itself over an ack-tracking allocation. */
+    a->next = NULL;
+    a->log_index = log_index;
+    a->origin_node_id = origin_node_id;
+    a->seq = seq;
+    if (n->fwd_ack_pending_tail)
+        n->fwd_ack_pending_tail->next = a;
+    else
+        n->fwd_ack_pending_head = a;
+    n->fwd_ack_pending_tail = a;
+}
+
+/* Drain fwd_ack_pending entries whose log_index is now committed. Local
+ * (self-originated) entries resolve the status table directly; forwarded
+ * ones are coalesced into at most one CL_FRAME_FORWARD_ACK per origin peer
+ * per call (this runs once per advance_commit, itself already batched -
+ * amortizing acks the same way leader_flush amortizes fsync/replication). */
+static void resolve_fwd_acks(cluster_node_t *n)
+{
+    if (!n->fwd_ack_pending_head)
+        return;
+    uint64_t commit = atomic_load(&n->log.commit_index);
+    uint64_t bump[CLUSTER_MAX_NODES] = {0}; /* 0 = no update this pass (seq is 1-based) */
+    while (n->fwd_ack_pending_head && n->fwd_ack_pending_head->log_index <= commit) {
+        cl_fwd_ack_t *a = n->fwd_ack_pending_head;
+        n->fwd_ack_pending_head = a->next;
+        if (!n->fwd_ack_pending_head)
+            n->fwd_ack_pending_tail = NULL;
+        if (a->origin_node_id == n->self_id) {
+            mark_proposal_status(n, a->seq, CL_PROPOSAL_COMMITTED);
+        } else if (a->origin_node_id >= 0 && a->origin_node_id < CLUSTER_MAX_NODES &&
+                  a->seq > bump[a->origin_node_id]) {
+            bump[a->origin_node_id] = a->seq;
+        }
+        free(a);
+    }
+    for (int id = 0; id < CLUSTER_MAX_NODES; id++) {
+        if (bump[id] == 0)
+            continue;
+        if (bump[id] > n->committed_fwd_seq[id])
+            n->committed_fwd_seq[id] = bump[id];
+        /* If the peer isn't connected right now, nothing is lost: it keeps
+         * everything <= this seq in its own fwd_pending list and resends the
+         * whole thing on reconnect; the dedup check in CL_FRAME_FORWARD skips
+         * whatever we already committed. */
+        cluster_peer_t *peer = find_peer(n, id);
+        if (peer && atomic_load(&peer->link_state) == CL_LINK_UP) {
+            uint8_t body[8];
+            put_be64(body, n->committed_fwd_seq[id]);
+            cl_send(peer->link, CL_FRAME_FORWARD_ACK, 0,
+                   (uint32_t)atomic_load(&n->current_term), body, sizeof(body));
+        }
+    }
+}
 
 static int log_ensure_cap(cluster_log_t *log, uint64_t need)
 {
@@ -1178,12 +1340,25 @@ static void advance_commit(cluster_node_t *n)
     /* The commit index is the highest log index replicated on a majority: gather
      * {self last_index, each peer match_index}, sort descending, and take the
      * quorum-th value. Computed directly (O(nodes^2), nodes<=5) - NOT by scanning
-     * the log backwards, which would be O(backlog) per call (quadratic overall). */
+     * the log backwards, which would be O(backlog) per call (quadratic overall).
+     *
+     * durable_commit (default) uses durable_index (fsync'd) instead of
+     * match_index (page-cache-acked only): a "committed" entry must then
+     * survive a simultaneous power loss on a majority, matching what the
+     * README promises. The trade-off is commit latency now includes an
+     * fsync round-trip on a majority instead of just the network RTT;
+     * cluster_sync_policy = fast restores the old (faster, weaker) behavior. */
     uint64_t v[CLUSTER_MAX_NODES];
     int m = 0;
-    v[m++] = atomic_load(&n->log.last_index); /* self has every appended entry */
-    for (int i = 0; i < n->npeers; i++)
-        v[m++] = n->peers[i].match_index;
+    if (n->durable_commit) {
+        v[m++] = atomic_load(&n->storage_failed) ? 0 : n->log.durable_index;
+        for (int i = 0; i < n->npeers; i++)
+            v[m++] = n->peers[i].durable_index;
+    } else {
+        v[m++] = atomic_load(&n->log.last_index); /* self has every appended entry */
+        for (int i = 0; i < n->npeers; i++)
+            v[m++] = n->peers[i].match_index;
+    }
     for (int i = 0; i < m; i++)
         for (int j = i + 1; j < m; j++)
             if (v[j] > v[i]) { uint64_t t = v[i]; v[i] = v[j]; v[j] = t; }
@@ -1194,6 +1369,7 @@ static void advance_commit(cluster_node_t *n)
         log_term_at(&n->log, N) == atomic_load(&n->current_term)) {
         atomic_store(&n->log.commit_index, N);
         apply_committed(n);
+        resolve_fwd_acks(n);
     }
     /* Drop RAM bodies that are durable on every node (leader-driven). Bounded by
      * the fsync'd index, not the page-cache ack, so a crashed peer can still be
@@ -1271,8 +1447,13 @@ static void snap_pump(cluster_node_t *n, cluster_peer_t *p)
             beaver_queue_t **qs = p->snap.queues;
             beaver_queue_t *q = qs[p->snap.qi];
             size_t nm = 0;
-            p->snap.msgs  = queue_snapshot_refs(q, p->snap.base, &nm);
+            int oom = 0;
+            p->snap.msgs  = queue_snapshot_refs(q, p->snap.base, &nm, &oom);
             p->snap.nmsgs = nm;
+            if (oom)
+                LOG_ERROR("cluster: OOM snapshotting queue '%s' for peer %d; "
+                         "state transfer may be missing messages",
+                         queue_name(q), p->node_id);
             if (nm == 0) {                 /* empty queue: move to the next one */
                 queue_unref(q);
                 p->snap.qi++;
@@ -1371,6 +1552,16 @@ static void peer_on_link_up(cluster_node_t *n, cluster_peer_t *p)
     p->inflight      = 0;
     snap_reset(p);          /* a broken transfer restarts from scratch */
     pump_peer(n, p);
+
+    /* If this peer is (now) our leader, immediately retransmit anything still
+     * awaiting a commit ack instead of waiting for the periodic safety-net
+     * sweep - covers both a plain reconnect and a fresh election electing
+     * this peer while we had proposals in flight to the old one. */
+    if (n->fwd_pending_head && atomic_load(&n->leader_id) == p->node_id) {
+        cl_proposal_t *list = n->fwd_pending_head;
+        n->fwd_pending_head = n->fwd_pending_tail = NULL;
+        forward_batch_to_leader(n, list);
+    }
 }
 
 /* Leader: append one op to the log WITHOUT syncing/replicating yet (batched). */
@@ -1436,12 +1627,39 @@ static void update_health(cluster_node_t *n)
         healthy = 1;
     else
         healthy = 0;
+    /* A node that can no longer durably persist its log must never be
+     * reported healthy, even if it still has quorum reachability: it cannot
+     * honestly promise the durability guarantees the rest of the cluster
+     * (and clients) rely on. */
+    if (atomic_load(&n->storage_failed))
+        healthy = 0;
     atomic_store(&n->health, healthy ? CL_HEALTH_OK : CL_HEALTH_ISOLATED);
 }
 
 static void arm_election_timer(cluster_node_t *n)
 {
     uv_timer_start(&n->election_timer, election_timer_cb, election_timeout_ms(n), 0);
+}
+
+/* A local write/fsync just failed: this node can no longer promise the
+ * durability the rest of the cluster and its clients rely on. Mark it
+ * unhealthy (update_health() folds storage_failed into the health gate,
+ * which already blocks Basic.Publish) and, if we are the leader, step down
+ * immediately so a healthy node can be elected instead of us continuing to
+ * ack AppendEntries/commit on top of storage we know is broken. */
+static void storage_write_failed(cluster_node_t *n, const char *what)
+{
+    int was_failed = atomic_exchange(&n->storage_failed, 1);
+    if (!was_failed)
+        LOG_ERROR("cluster: node %d: %s failed - storage is no longer "
+                  "durable; node marked unhealthy", n->self_id, what);
+    if (atomic_load(&n->role) == CL_ROLE_LEADER) {
+        uv_timer_stop(&n->heartbeat_timer);
+        atomic_store(&n->role, CL_ROLE_FOLLOWER);
+        atomic_store(&n->leader_id, -1);
+        arm_election_timer(n);
+    }
+    update_health(n);
 }
 
 /* Broadcast a vote request to every connected peer. `prevote` selects PreVote
@@ -1698,6 +1916,13 @@ static void become_candidate(cluster_node_t *n)
     update_health(n);
     LOG_INFO("cluster: node %d starting election (term %" PRIu64 ")",
              n->self_id, atomic_load(&n->current_term));
+    /* Quorum may already be satisfied by our own vote alone (nnodes == 1) -
+     * no peer response will ever arrive to trigger the check in the
+     * VOTE_RESP handler, so check it here too. */
+    if (n->votes_granted >= n->quorum) {
+        become_leader(n);
+        return;
+    }
     send_vote_request(n, 0);
     arm_election_timer(n);
 }
@@ -1711,6 +1936,13 @@ static void start_prevote(cluster_node_t *n)
     n->prevotes_granted = 1; /* self */
     atomic_store(&n->leader_id, -1);
     update_health(n);
+    /* Same as become_candidate(): with nnodes == 1 our own pre-vote already
+     * satisfies quorum and no peer will ever respond to trigger the check in
+     * the PREVOTE_RESP handler. */
+    if (n->prevotes_granted >= n->quorum) {
+        become_candidate(n);
+        return;
+    }
     send_vote_request(n, 1);
     arm_election_timer(n);
 }
@@ -1721,20 +1953,41 @@ static void cl_dispatch(cluster_node_t *n, cluster_peer_t *peer,
                         const cluster_frame_hdr_t *h, const uint8_t *payload)
 {
     switch (h->type) {
-    case CL_FRAME_HELLO:
-        /* Inbound side already attached the peer (see inbound HELLO handling). */
+    case CL_FRAME_HELLO: {
+        /* Inbound side already attached the peer (see inbound HELLO handling)
+         * for the FIRST HELLO on a fresh accept; this handles a HELLO seen on
+         * an already-bound link. Re-verify: the peer slot being right doesn't
+         * prove this frame's claimed identity/HMAC are. */
+        int claimed_id = -1;
+        if (hello_payload_verify(n, CL_FRAME_HELLO, payload, h->length,
+                                 &claimed_id) != 0 || claimed_id != peer->node_id) {
+            LOG_WARN("cluster: peer %d sent an invalid HELLO; dropping link",
+                     peer->node_id);
+            drop_peer_link(peer);
+            break;
+        }
         send_hello(n, peer->link, CL_FRAME_HELLO_ACK);
         atomic_store(&peer->link_state, CL_LINK_UP);
         update_health(n);
         peer_on_link_up(n, peer);
         LOG_INFO("cluster: peer %d link UP (inbound)", peer->node_id);
         break;
-    case CL_FRAME_HELLO_ACK:
+    }
+    case CL_FRAME_HELLO_ACK: {
+        int claimed_id = -1;
+        if (hello_payload_verify(n, CL_FRAME_HELLO_ACK, payload, h->length,
+                                 &claimed_id) != 0 || claimed_id != peer->node_id) {
+            LOG_WARN("cluster: peer %d sent an invalid HELLO_ACK; dropping link",
+                     peer->node_id);
+            drop_peer_link(peer);
+            break;
+        }
         atomic_store(&peer->link_state, CL_LINK_UP);
         update_health(n);
         peer_on_link_up(n, peer);
         LOG_INFO("cluster: peer %d link UP (outbound)", peer->node_id);
         break;
+    }
 
     /* ---- Raft control plane ---- */
     case CL_FRAME_PREVOTE: {
@@ -1858,6 +2111,12 @@ static void cl_dispatch(cluster_node_t *n, cluster_peer_t *peer,
         /* Push the appended batch to the page cache (1 write); fsync is async.
          * We ack on write-to-page-cache, not fsync. */
         persist_write_flush(n);
+        if (atomic_load(&n->storage_failed)) {
+            /* The write just failed: never report success for entries we did
+             * not actually persist, so the leader excludes us from progress. */
+            send_append_resp(n, peer, 0, atomic_load(&n->log.last_index));
+            break;
+        }
         uint64_t last = atomic_load(&n->log.last_index);
         uint64_t newc = leader_commit < last ? leader_commit : last;
         if (newc > atomic_load(&n->log.commit_index)) {
@@ -1907,20 +2166,59 @@ static void cl_dispatch(cluster_node_t *n, cluster_peer_t *peer,
          * (see on_peer_read -> leader_flush). If we are NOT the leader anymore
          * (leadership changed while the frame was in flight), re-propose each op
          * through our own inbox so it chases the current leader - dropping the
-         * batch here would silently lose acknowledged client publishes. */
+         * batch here would silently lose acknowledged client publishes.
+         * `seq` dedups a retransmitted batch (the sender keeps forwarding
+         * anything not yet ACKed - see forward_batch_to_leader): skip any op
+         * we already committed from this origin rather than re-appending it. */
         if (h->length >= 4) {
             int is_leader = atomic_load(&n->role) == CL_ROLE_LEADER;
+            int origin = peer->node_id;
+            uint64_t already = (origin >= 0 && origin < CLUSTER_MAX_NODES)
+                              ? n->committed_fwd_seq[origin] : 0;
             const uint8_t *q = payload, *qend = payload + h->length;
             uint32_t count = get_be32(q); q += 4;
-            for (uint32_t i = 0; i < count && qend - q >= 8; i++) {
+            for (uint32_t i = 0; i < count && qend - q >= 16; i++) {
                 uint32_t op  = get_be32(q); q += 4;
                 uint32_t len = get_be32(q); q += 4;
+                uint64_t seq = get_be64(q); q += 8;
                 if ((uint64_t)(qend - q) < len) break;
-                if (is_leader)
+                if (seq != 0 && seq <= already) {
+                    q += len;
+                    continue; /* already committed; the peer just hasn't seen the ack yet */
+                }
+                if (is_leader) {
+                    uint64_t before = atomic_load(&n->log.last_index);
                     leader_append(n, op, q, len);
-                else
+                    if (atomic_load(&n->log.last_index) > before)
+                        push_fwd_ack_pending(n, atomic_load(&n->log.last_index),
+                                            origin, seq);
+                } else {
                     cluster_propose(n, (cluster_op_t)op, q, len);
+                }
                 q += len;
+            }
+        }
+        break;
+
+    case CL_FRAME_FORWARD_ACK:
+        /* Leader confirms cumulative commit progress for OUR forwarded batches:
+         * drop everything <= this seq from fwd_pending (and resolve their
+         * status-table entries) - this is what actually frees a forwarded
+         * proposal, never a successful cl_send() alone (see fwd_pending). */
+        if (h->length >= 8) {
+            uint64_t acked = get_be64(payload);
+            cl_proposal_t *p = n->fwd_pending_head, *prev = NULL;
+            while (p) {
+                cl_proposal_t *next = p->next;
+                if (p->seq <= acked) {
+                    mark_proposal_status(n, p->seq, CL_PROPOSAL_COMMITTED);
+                    if (prev) prev->next = next; else n->fwd_pending_head = next;
+                    if (p == n->fwd_pending_tail) n->fwd_pending_tail = prev;
+                    free(p);
+                } else {
+                    prev = p;
+                }
+                p = next;
             }
         }
         break;
@@ -2323,7 +2621,24 @@ static void on_inbound_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *
     if (in->rbuf_len < CLUSTER_HDR_SIZE + h.length)
         return;  /* wait for full HELLO */
 
-    int peer_id = (int)get_be32((const uint8_t *)in->rbuf + CLUSTER_HDR_SIZE);
+    const uint8_t *hello_payload = (const uint8_t *)in->rbuf + CLUSTER_HDR_SIZE;
+    if (cluster_crc32(hello_payload, h.length) != h.crc32) {
+        LOG_WARN("cluster: rejecting inbound HELLO with bad CRC");
+        uv_close((uv_handle_t *)stream, on_inbound_closed);
+        return;
+    }
+    /* hello_payload_verify() checks the payload length itself before reading
+     * anything out of it (a HELLO shorter than CL_HELLO_LEN used to be read
+     * as a bare 4-byte node_id with no length check at all - an out-of-bounds
+     * read for any HELLO under 4 bytes), and rejects the connection unless
+     * the sender can prove it holds cluster_secret. */
+    int peer_id = -1;
+    if (hello_payload_verify(n, CL_FRAME_HELLO, hello_payload, h.length,
+                             &peer_id) != 0) {
+        LOG_WARN("cluster: rejecting inbound HELLO: bad length or HMAC");
+        uv_close((uv_handle_t *)stream, on_inbound_closed);
+        return;
+    }
     cluster_peer_t *peer = find_peer(n, peer_id);
     if (!peer || peer->outbound) {  /* outbound peers we dial ourselves */
         LOG_WARN("cluster: rejecting inbound HELLO from id %d", peer_id);
@@ -2432,6 +2747,25 @@ static void fsync_timer_cb(uv_timer_t *timer)
 {
     cluster_node_t *n = timer->data;
     persist_sync(n);
+    /* Our own durable_index may have just advanced past what quorum already
+     * had from peers (durable_commit mode): re-check without waiting for the
+     * next AppendEntries/heartbeat round-trip to notice. */
+    if (n->durable_commit && atomic_load(&n->role) == CL_ROLE_LEADER)
+        advance_commit(n);
+    /* Safety net for fwd_pending entries stuck without an ack (~every 3 s):
+     * the common case (leader reconnect) already retransmits immediately via
+     * peer_on_link_up, so this mainly covers the rare multi-hop relay case
+     * (a node forwards to a peer that itself isn't leader either and has to
+     * re-wrap the op under a new seq - see drain_inbox/CL_FRAME_FORWARD) where
+     * no direct ack path exists back to the original sender. */
+    if (++n->fwd_pending_tick >= 120) {
+        n->fwd_pending_tick = 0;
+        if (n->fwd_pending_head) {
+            cl_proposal_t *list = n->fwd_pending_head;
+            n->fwd_pending_head = n->fwd_pending_tail = NULL;
+            forward_batch_to_leader(n, list);
+        }
+    }
     /* Periodic log compaction sweep (~every 2 s, off the hot path): drop the
      * committed + applied + replicated + consumed prefix. The leader knows the
      * replicated-everywhere index directly; a follower uses the value the leader
@@ -2493,10 +2827,36 @@ static void requeue_proposals(cluster_node_t *n, cl_proposal_t *head)
     pthread_mutex_unlock(&n->propose_lock);
 }
 
-/* Follower: forward the batch to the leader in capped frames. Anything that
+/* Append a batch onto fwd_pending (order preserved): sent to the leader but
+ * not yet confirmed committed. */
+static void fwd_pending_append(cluster_node_t *n, cl_proposal_t *head,
+                               cl_proposal_t *tail_hint /* last node, or NULL to scan */)
+{
+    if (!head)
+        return;
+    cl_proposal_t *tail = tail_hint;
+    if (!tail) {
+        tail = head;
+        while (tail->next) tail = tail->next;
+    }
+    if (n->fwd_pending_tail)
+        n->fwd_pending_tail->next = head;
+    else
+        n->fwd_pending_head = head;
+    n->fwd_pending_tail = tail;
+}
+
+/* Follower: forward a batch to the leader in capped frames. Anything that
  * cannot be sent right now (no reachable leader, alloc/write failure) is
- * requeued and retried on fwd_retry_timer - proposals are NEVER dropped.
- * Frame payload: count(u32) then per op: op_type(u32) len(u32) bytes. */
+ * requeued and retried on fwd_retry_timer. A batch that WAS sent is moved to
+ * fwd_pending, NOT freed: a successful cl_send()/uv_write() only proves the
+ * bytes were queued on our local socket, never that the leader received or
+ * committed them - freeing here (the original bug) silently loses the
+ * proposal if the connection dies before actual delivery/commit. Entries
+ * leave fwd_pending only via a CL_FRAME_FORWARD_ACK (see cl_dispatch) or a
+ * generous timeout retransmit (fwd_retry_timer, covers the rare multi-hop
+ * relay case where an intermediate non-leader node can't propagate acks).
+ * Frame payload: count(u32) then per op: op_type(u32) len(u32) seq(u64) bytes. */
 static void forward_batch_to_leader(cluster_node_t *n, cl_proposal_t *list)
 {
     while (list) {
@@ -2510,8 +2870,8 @@ static void forward_batch_to_leader(cluster_node_t *n, cl_proposal_t *list)
         uint32_t count = 0;
         cl_proposal_t *end = list;            /* first proposal NOT in the slice */
         while (end && count < CL_FWD_MAX_OPS &&
-               (count == 0 || bytes + 8 + end->len <= CL_FWD_MAX_BYTES)) {
-            bytes += 8 + end->len;
+               (count == 0 || bytes + 16 + end->len <= CL_FWD_MAX_BYTES)) {
+            bytes += 16 + end->len;
             count++;
             end = end->next;
         }
@@ -2524,6 +2884,7 @@ static void forward_batch_to_leader(cluster_node_t *n, cl_proposal_t *list)
         for (cl_proposal_t *p = list; p != end; p = p->next) {
             put_be32(w, p->op_type); w += 4;
             put_be32(w, p->len);     w += 4;
+            put_be64(w, p->seq);     w += 8;
             if (p->len) { memcpy(w, p->data, p->len); w += p->len; }
         }
         int rc = cl_send(lp->link, CL_FRAME_FORWARD, 0,
@@ -2533,13 +2894,15 @@ static void forward_batch_to_leader(cluster_node_t *n, cl_proposal_t *list)
         if (rc != 0)
             break;                            /* link failed mid-drain: retry */
 
-        /* The slice is on the wire: release it. */
-        while (list != end) {
-            cl_proposal_t *next = list->next;
+        /* On the wire: move to fwd_pending (see comment above - NOT freed). */
+        cl_proposal_t *slice_head = list, *slice_tail = NULL;
+        for (cl_proposal_t *p = list; p != end; p = p->next) {
             atomic_fetch_sub(&n->inbox_depth, 1);
-            free(list);
-            list = next;
+            slice_tail = p;
         }
+        list = end;
+        slice_tail->next = NULL;
+        fwd_pending_append(n, slice_head, slice_tail);
     }
 
     if (list) {
@@ -2567,7 +2930,21 @@ static void drain_inbox(cluster_node_t *n)
     }
     while (list) {
         cl_proposal_t *next = list->next;
-        leader_append(n, list->op_type, list->data, list->len);
+        if (atomic_load(&n->role) == CL_ROLE_LEADER) {
+            uint64_t before = atomic_load(&n->log.last_index);
+            leader_append(n, list->op_type, list->data, list->len);
+            if (atomic_load(&n->log.last_index) > before)
+                push_fwd_ack_pending(n, atomic_load(&n->log.last_index),
+                                    n->self_id, list->seq);
+        } else {
+            /* Lost leadership mid-batch: re-submit through our own inbox so
+             * it chases whoever is now leader, instead of silently dropping
+             * it. The original seq's status entry stays PENDING until the
+             * caller's poll times out (a retryable error, never a false
+             * success) - losing leadership mid-batch is rare enough that
+             * re-wrapping under a fresh seq here is an acceptable trade-off. */
+            cluster_propose(n, (cluster_op_t)list->op_type, list->data, list->len);
+        }
         atomic_fetch_sub(&n->inbox_depth, 1);
         free(list);
         list = next;
@@ -2594,6 +2971,16 @@ cluster_node_t *cluster_node_new(uv_loop_t *loop, const cluster_config_t *cfg,
 {
     if (!loop || !cfg || cfg->nnodes < 1 || cfg->nnodes > CLUSTER_MAX_NODES)
         return NULL;
+    if (cfg->secret[0] == '\0') {
+        /* Refuse to start rather than run an unauthenticated mesh: any host
+         * that can reach cluster_port could otherwise impersonate a peer
+         * (forge HELLO/VOTE/APPEND frames). The caller (start_cluster) is
+         * expected to fail the whole process closed on a NULL return when
+         * cluster_enabled is set. */
+        LOG_ERROR("cluster: cluster_secret is not configured; refusing to "
+                  "start an unauthenticated mesh listener");
+        return NULL;
+    }
     cluster_node_t *n = calloc(1, sizeof(*n));
     if (!n)
         return NULL;
@@ -2604,6 +2991,8 @@ cluster_node_t *cluster_node_new(uv_loop_t *loop, const cluster_config_t *cfg,
     n->self_id = cfg->self_id;
     n->nnodes  = cfg->nnodes;
     n->quorum  = cfg->nnodes / 2 + 1;
+    n->durable_commit = cfg->durable_commit;
+    snprintf(n->secret, sizeof(n->secret), "%s", cfg->secret);
     if (cfg->self_id >= 0 && cfg->self_id < CLUSTER_MAX_NODES)
         snprintf(n->self_addr, sizeof(n->self_addr), "%s",
                  cfg->node_addr[cfg->self_id]);
@@ -2617,6 +3006,7 @@ cluster_node_t *cluster_node_new(uv_loop_t *loop, const cluster_config_t *cfg,
     atomic_init(&n->role, CL_ROLE_FOLLOWER);
     atomic_init(&n->leader_id, -1);
     atomic_init(&n->health, CL_HEALTH_ISOLATED);  /* until links come up */
+    atomic_init(&n->storage_failed, 0);
     atomic_init(&n->log.last_index, 0);
     atomic_init(&n->log.commit_index, 0);
     atomic_init(&n->inbox_depth, 0);
@@ -2829,6 +3219,7 @@ void cluster_get_status(const cluster_node_t *n, cluster_status_t *out)
     out->last_index   = atomic_load(&n->log.last_index);
     out->role         = (cluster_role_t)atomic_load(&n->role);
     out->health       = (cluster_health_t)atomic_load(&n->health);
+    out->storage_failed = atomic_load(&n->storage_failed);
 
     int is_leader = out->role == CL_ROLE_LEADER;
     /* Per-node replication progress is the LEADER's knowledge. The leader has it
@@ -2869,11 +3260,11 @@ void cluster_get_status(const cluster_node_t *n, cluster_status_t *out)
     out->nmembers = m;
 }
 
-int cluster_propose(cluster_node_t *n, cluster_op_t op_type,
-                    const void *data, size_t len)
+static uint64_t propose_internal(cluster_node_t *n, cluster_op_t op_type,
+                                 const void *data, size_t len)
 {
     if (!n)
-        return -1;
+        return 0;
     /* Always accept and buffer: proposals are never dropped. If no leader is
      * reachable right now (election in progress), the batch waits in the inbox
      * and fwd_retry_timer re-forwards once one appears; meanwhile the depth
@@ -2882,10 +3273,11 @@ int cluster_propose(cluster_node_t *n, cluster_op_t op_type,
         atomic_store(&n->fwd_congested, 1);
     cl_proposal_t *pr = malloc(sizeof(*pr) + len);
     if (!pr)
-        return -1;
+        return 0;
     pr->next = NULL;
     pr->op_type = (uint32_t)op_type;
     pr->len = (uint32_t)len;
+    pr->seq = atomic_fetch_add(&n->propose_seq_next, 1) + 1; /* 1-based; 0 = none */
     if (len)
         memcpy(pr->data, data, len);
     pthread_mutex_lock(&n->propose_lock);
@@ -2897,50 +3289,77 @@ int cluster_propose(cluster_node_t *n, cluster_op_t op_type,
     pthread_mutex_unlock(&n->propose_lock);
     atomic_fetch_add(&n->inbox_depth, 1);
     uv_async_send(&n->propose_async);
-    return 0;
+    return pr->seq;
 }
 
-int cluster_replicate_declare_queue(cluster_node_t *n, const char *vhost,
-                                    const char *name, uint8_t flags)
+int cluster_propose(cluster_node_t *n, cluster_op_t op_type,
+                    const void *data, size_t len)
+{
+    return propose_internal(n, op_type, data, len) ? 0 : -1;
+}
+
+uint64_t cluster_propose_tracked(cluster_node_t *n, cluster_op_t op_type,
+                                 const void *data, size_t len)
+{
+    return propose_internal(n, op_type, data, len);
+}
+
+cluster_proposal_status_t cluster_proposal_status(cluster_node_t *n, uint64_t seq)
+{
+    if (!n || seq == 0)
+        return CL_PROPOSAL_REJECTED;
+    size_t idx = (size_t)(seq % CL_STATUS_TABLE_SIZE);
+    /* Read seq first, then val (see mark_proposal_status for why this order,
+     * paired with val-before-seq on the write side, is race-safe). */
+    uint64_t got = atomic_load(&n->propose_status_seq[idx]);
+    int val = atomic_load(&n->propose_status_val[idx]);
+    if (got != seq)
+        return CL_PROPOSAL_PENDING;
+    return (cluster_proposal_status_t)val;
+}
+
+uint64_t cluster_replicate_declare_queue(cluster_node_t *n, const char *vhost,
+                                         const char *name, uint8_t flags)
 {
     if (strlen(vhost) > 250 || strlen(name) > 250)
-        return -1;
+        return 0;
     uint8_t buf[1 + 2 * (2 + 251)];
     uint8_t *p = buf;
     wr8(&p, flags);
     wr_str(&p, vhost);
     wr_str(&p, name);
-    return cluster_propose(n, CL_OP_DECLARE_QUEUE, buf, (size_t)(p - buf));
+    return cluster_propose_tracked(n, CL_OP_DECLARE_QUEUE, buf, (size_t)(p - buf));
 }
 
-int cluster_replicate_declare_exchange(cluster_node_t *n, const char *vhost,
-                                       const char *name, int type, uint8_t flags)
+uint64_t cluster_replicate_declare_exchange(cluster_node_t *n, const char *vhost,
+                                            const char *name, int type,
+                                            uint8_t flags)
 {
     if (strlen(vhost) > 250 || strlen(name) > 250)
-        return -1;
+        return 0;
     uint8_t buf[1 + 1 + 2 * (2 + 251)];
     uint8_t *p = buf;
     wr8(&p, (uint8_t)type);
     wr8(&p, flags);
     wr_str(&p, vhost);
     wr_str(&p, name);
-    return cluster_propose(n, CL_OP_DECLARE_EXCH, buf, (size_t)(p - buf));
+    return cluster_propose_tracked(n, CL_OP_DECLARE_EXCH, buf, (size_t)(p - buf));
 }
 
-int cluster_replicate_bind(cluster_node_t *n, const char *vhost,
-                           const char *queue, const char *exchange,
-                           const char *routing_key)
+uint64_t cluster_replicate_bind(cluster_node_t *n, const char *vhost,
+                                const char *queue, const char *exchange,
+                                const char *routing_key)
 {
     if (strlen(vhost) > 250 || strlen(queue) > 250 || strlen(exchange) > 250 ||
         strlen(routing_key) > 250)
-        return -1;
+        return 0;
     uint8_t buf[4 * (2 + 251)];
     uint8_t *p = buf;
     wr_str(&p, vhost);
     wr_str(&p, queue);
     wr_str(&p, exchange);
     wr_str(&p, routing_key);
-    return cluster_propose(n, CL_OP_BIND, buf, (size_t)(p - buf));
+    return cluster_propose_tracked(n, CL_OP_BIND, buf, (size_t)(p - buf));
 }
 
 int cluster_replicate_publish(cluster_node_t *n, const char *vhost,

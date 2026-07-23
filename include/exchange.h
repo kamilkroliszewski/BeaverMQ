@@ -43,6 +43,7 @@ void exchange_free(beaver_exchange_t *ex);
 
 const char     *exchange_name(const beaver_exchange_t *ex);
 exchange_type_t exchange_type(const beaver_exchange_t *ex);
+uint8_t         exchange_flags(const beaver_exchange_t *ex);
 size_t          exchange_binding_count(const beaver_exchange_t *ex);
 /* Owning virtual host. Set once by the broker at declare time. */
 const char     *exchange_vhost(const beaver_exchange_t *ex);
@@ -60,9 +61,13 @@ int exchange_bind(beaver_exchange_t *ex, const char *routing_key,
  * returns the count and stores a malloc'd array of queue pointers in *out
  * (each queue_ref'd; the caller must queue_unref each and free the array).
  * Returns 0 with *out = NULL when nothing matches. Duplicates are removed.
+ * If out_oom is non-NULL, it is set to 1 when the 0 return was actually an
+ * allocation failure rather than a genuine no-match - distinguishing the two
+ * matters because they call for different responses (retry/backpressure vs.
+ * "this routing key has no destination"). Pass NULL to ignore the distinction.
  */
 size_t exchange_route(const beaver_exchange_t *ex, const char *routing_key,
-                      beaver_queue_t ***out);
+                      beaver_queue_t ***out, int *out_oom);
 
 /* True if `pattern` (with '*'/'#') matches the dot-separated `key`. Exposed
  * for unit testing. */

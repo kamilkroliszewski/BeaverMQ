@@ -17,6 +17,19 @@
 
 #define QUEUE_INITIAL_CAP 16
 
+/* Global default limits (0 = unlimited), set once at startup via
+ * queue_set_default_limits(). An authenticated publisher can otherwise grow
+ * a single queue without bound even while each individual message respects
+ * max_message_size - these are the missing per-queue/aggregate caps. */
+static uint64_t g_queue_max_length = 0;
+static uint64_t g_queue_max_bytes  = 0;
+
+void queue_set_default_limits(uint64_t max_length, uint64_t max_bytes)
+{
+    g_queue_max_length = max_length;
+    g_queue_max_bytes  = max_bytes;
+}
+
 struct beaver_queue {
     char              *name;
     char              *vhost;   /* owning virtual host ("" until set) */
@@ -31,6 +44,7 @@ struct beaver_queue {
 
     uint64_t           total_enqueued;
     uint64_t           total_dequeued;
+    uint64_t           total_bytes;   /* sum of body_len currently queued */
 
     /* Cluster consume-tracking (guarded by `lock`). The replicated consume
      * watermark = the cluster_id below which everything is consumed: the oldest
@@ -138,6 +152,11 @@ static int queue_grow(beaver_queue_t *q)
 int queue_enqueue(beaver_queue_t *q, beaver_message_t *msg)
 {
     pthread_mutex_lock(&q->lock);
+    if ((g_queue_max_length && q->count >= g_queue_max_length) ||
+        (g_queue_max_bytes && q->total_bytes + msg->body_len > g_queue_max_bytes)) {
+        pthread_mutex_unlock(&q->lock);
+        return QUEUE_FULL;
+    }
     if (q->count == q->cap) {
         if (queue_grow(q) != 0) {
             pthread_mutex_unlock(&q->lock);
@@ -148,6 +167,7 @@ int queue_enqueue(beaver_queue_t *q, beaver_message_t *msg)
     q->tail = (q->tail + 1) % q->cap;
     q->count++;
     q->total_enqueued++;
+    q->total_bytes += msg->body_len;
     pthread_mutex_unlock(&q->lock);
     return 0;
 }
@@ -162,6 +182,7 @@ beaver_message_t *queue_dequeue(beaver_queue_t *q)
         q->head = (q->head + 1) % q->cap;
         q->count--;
         q->total_dequeued++;
+        q->total_bytes -= msg->body_len;
     }
     pthread_mutex_unlock(&q->lock);
     return msg; /* reference transferred to caller */
@@ -174,16 +195,20 @@ void queue_consume_on_deliver(beaver_queue_t *q, uint64_t cid, int no_ack)
     if (cid == 0)
         return; /* non-replicated message: irrelevant to the watermark */
     pthread_mutex_lock(&q->lock);
-    if (cid > q->deliver_hi)
-        q->deliver_hi = cid;
-    if (!no_ack) {
+    if (no_ack) {
+        /* Nothing to track - always safe to advance. */
+        if (cid > q->deliver_hi)
+            q->deliver_hi = cid;
+    } else {
         /* Keep `unacked` sorted ascending so unacked[0] is the oldest. Insert at
          * the right spot (O(1) for in-order delivery, the common case) and skip
          * duplicates (re-delivery of a requeued message). */
         size_t i = q->n_unacked;
         while (i > 0 && q->unacked[i - 1] > cid)
             i--;
-        if (!(i > 0 && q->unacked[i - 1] == cid)) { /* not already tracked */
+        int already_tracked = i > 0 && q->unacked[i - 1] == cid;
+        int recorded = already_tracked;
+        if (!already_tracked) {
             if (q->n_unacked == q->cap_unacked) {
                 size_t nc = q->cap_unacked ? q->cap_unacked * 2 : 16;
                 uint64_t *nu = realloc(q->unacked, nc * sizeof(*nu));
@@ -194,8 +219,18 @@ void queue_consume_on_deliver(beaver_queue_t *q, uint64_t cid, int no_ack)
                         (q->n_unacked - i) * sizeof(*q->unacked));
                 q->unacked[i] = cid;
                 q->n_unacked++;
+                recorded = 1;
             }
         }
+        /* Only advance deliver_hi (which the watermark falls back to once
+         * n_unacked reaches 0) when this cid actually made it into `unacked`,
+         * or was already there. The old code advanced it unconditionally,
+         * so a failed realloc left deliver_hi past a cid that is NOT in
+         * `unacked` - queue_consume_watermark() could then report a
+         * watermark past a still-outstanding delivery, letting replicas
+         * compact/drop a message the primary hasn't actually settled yet. */
+        if (recorded && cid > q->deliver_hi)
+            q->deliver_hi = cid;
     }
     pthread_mutex_unlock(&q->lock);
 }
@@ -225,10 +260,14 @@ uint64_t queue_consume_watermark(beaver_queue_t *q)
 }
 
 beaver_message_t **queue_snapshot_refs(beaver_queue_t *q, uint64_t max_cid,
-                                       size_t *out_n)
+                                       size_t *out_n, int *out_oom)
 {
+    if (out_oom)
+        *out_oom = 0;
     pthread_mutex_lock(&q->lock);
     beaver_message_t **arr = q->count ? malloc(q->count * sizeof(*arr)) : NULL;
+    if (!arr && q->count && out_oom)
+        *out_oom = 1; /* distinguish "nothing to snapshot" from "OOM" */
     size_t n = 0;
     if (arr) {
         for (size_t i = 0; i < q->count; i++) {
@@ -324,11 +363,17 @@ size_t queue_purge(beaver_queue_t *q)
     pthread_mutex_lock(&q->lock);
     size_t purged = q->count;
     while (q->count > 0) {
-        message_unref(q->slots[q->head]);
+        beaver_message_t *msg = q->slots[q->head];
+        q->total_bytes -= msg->body_len;
+        message_unref(msg);
         q->slots[q->head] = NULL;
         q->head = (q->head + 1) % q->cap;
         q->count--;
     }
+    /* Keep total_dequeued consistent with a real dequeue - purge used to skip
+     * this, leaving management stats undercounting how many messages actually
+     * left the queue. */
+    q->total_dequeued += purged;
     pthread_mutex_unlock(&q->lock);
     return purged;
 }

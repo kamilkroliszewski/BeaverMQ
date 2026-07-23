@@ -39,7 +39,19 @@ uint8_t     queue_flags(const beaver_queue_t *q);
 const char *queue_vhost(const beaver_queue_t *q);
 void        queue_set_vhost(beaver_queue_t *q, const char *vhost);
 
-/* Enqueue a message (adds an internal reference). Returns 0, or -1 on OOM. */
+/* Global default per-queue limits (0 = unlimited), applied to EVERY queue by
+ * queue_enqueue(). Without these an authenticated publisher can grow a single
+ * queue's memory use without bound even though each individual message
+ * respects max_message_size. Set once at startup. */
+void queue_set_default_limits(uint64_t max_length, uint64_t max_bytes);
+
+/* Returned by queue_enqueue() when a configured limit (see
+ * queue_set_default_limits) would be exceeded - distinct from -1 (OOM) so
+ * callers can tell "queue is full" apart from "allocation failed". */
+#define QUEUE_FULL (-2)
+
+/* Enqueue a message (adds an internal reference). Returns 0 on success, -1 on
+ * OOM, or QUEUE_FULL if a configured length/byte limit would be exceeded. */
 int queue_enqueue(beaver_queue_t *q, beaver_message_t *msg);
 
 /* Dequeue the oldest message, transferring its reference to the caller.
@@ -83,9 +95,13 @@ size_t   queue_drain_consumed(beaver_queue_t *q, uint64_t watermark);
 /* Snapshot the queue's READY messages whose cluster_id is in (0, max_cid]:
  * returns a malloc'd array of message refs (caller message_unref's each and
  * frees the array) and the count. One lock hold; used by the cluster's state
- * transfer to re-seed a wiped node. */
+ * transfer to re-seed a wiped node. NULL + *out_n == 0 means "nothing
+ * matched" UNLESS out_oom is non-NULL and comes back 1, meaning the initial
+ * allocation failed (OOM) - a real snapshot may be missing data, distinct
+ * from a genuinely empty/non-matching queue. Pass out_oom = NULL to ignore
+ * the distinction. */
 beaver_message_t **queue_snapshot_refs(beaver_queue_t *q, uint64_t max_cid,
-                                       size_t *out_n);
+                                       size_t *out_n, int *out_oom);
 
 /* ---- waiters (cross-thread delivery wakeup) ------------------------------ *
  * A waiter is a worker dispatcher interested in this queue. When a message is

@@ -112,6 +112,10 @@ typedef enum {
     CL_FRAME_ROUTE_HINT   = 20,
     CL_FRAME_SNAP_END     = 21,
     CL_FRAME_SNAP_ACK     = 22,
+    /* leader -> follower: cumulative ack for CL_FRAME_FORWARD batches. Payload
+     * is the highest per-origin `seq` (see cluster_propose_tracked) committed
+     * so far; the follower can then stop retransmitting anything <= it. */
+    CL_FRAME_FORWARD_ACK  = 23,
 } cluster_frame_type_t;
 
 /* In-memory view of the header. Never memcpy'd onto the wire (endianness):
@@ -288,6 +292,15 @@ typedef struct {
     uint32_t election_min_ms;               /* randomized election timeout window */
     uint32_t election_max_ms;
     uint32_t heartbeat_ms;                  /* leader heartbeat interval */
+    char     secret[128];                   /* shared PSK, identical on every
+                                             * node; HMACs the HELLO handshake
+                                             * so an attacker on the mesh
+                                             * network cannot impersonate a
+                                             * peer. Required (cluster_node_new
+                                             * refuses to start without it). */
+    int      durable_commit;                /* 1 (default) = commit needs a
+                                             * durable (fsync'd) majority, not
+                                             * just a page-cache-acked one */
 } cluster_config_t;
 
 void cluster_config_defaults(cluster_config_t *c);
@@ -302,6 +315,8 @@ typedef struct cluster_node {
     int  npeers;
     int  quorum;                /* nnodes/2 + 1 */
     char self_addr[72];         /* this node's own "ip:port" mesh endpoint */
+    char secret[128];           /* shared PSK; HMACs the HELLO handshake */
+    int  durable_commit;        /* 1 = commit needs a durable majority */
     cluster_peer_t peers[CLUSTER_MAX_PEERS];
 
     /* Raft state - single-writer (cluster loop). Term/role/leader are atomic so
@@ -350,10 +365,41 @@ typedef struct cluster_node {
     struct cl_proposal  *propose_head;
     struct cl_proposal  *propose_tail;
 
+    /* Every proposal (from ANY node's role) is assigned a `seq` from this
+     * counter at submission time (cluster_propose_tracked). It is used both
+     * as the dedup/ack key when forwarding to the leader (below) and as the
+     * lookup key into propose_status_* for cluster_proposal_status() polling. */
+    _Atomic uint64_t propose_seq_next;
+#define CL_STATUS_TABLE_SIZE 4096
+    _Atomic uint64_t propose_status_seq[CL_STATUS_TABLE_SIZE];
+    _Atomic int      propose_status_val[CL_STATUS_TABLE_SIZE];
+
+    /* Follower: proposals already sent to the leader in a CL_FRAME_FORWARD but
+     * not yet confirmed committed (a successful cl_send()/uv_write() only
+     * proves the bytes were queued locally, never that the leader received or
+     * applied them - see forward_batch_to_leader). Retransmitted whole on
+     * reconnect/new-leader and periodically until acked; never freed until a
+     * CL_FRAME_FORWARD_ACK (or, as a last-resort safety net for the rare
+     * multi-hop-relay case, a timeout) confirms them. */
+    struct cl_proposal  *fwd_pending_head;
+    struct cl_proposal  *fwd_pending_tail;
+    unsigned             fwd_pending_tick; /* throttles the stale-resend sweep */
+
+    /* Leader: per-origin-node highest `seq` already committed (dedup for
+     * retransmitted CL_FRAME_FORWARD batches) and the FIFO of committed-index
+     * -> (origin, seq) waiting for its CL_FRAME_FORWARD_ACK to be sent. */
+    uint64_t             committed_fwd_seq[CLUSTER_MAX_NODES];
+    struct cl_fwd_ack   *fwd_ack_pending_head;
+    struct cl_fwd_ack   *fwd_ack_pending_tail;
+
     uv_async_t  shutdown_async;      /* any thread -> cluster: request stop */
     int         shutdown_async_installed;
 
     _Atomic int health;              /* cluster_health_t (data-plane gate) */
+    _Atomic int storage_failed;      /* 1 once fsync()/write() has failed: the
+                                      * node can no longer promise durability
+                                      * and must be treated as unhealthy and,
+                                      * if leader, step down. */
 
     beaver_broker_t *broker;         /* shared, thread-safe; apply target */
     struct authstore *authstore;     /* shared access-control table (apply target) */
@@ -423,17 +469,40 @@ int              cluster_should_throttle(const cluster_node_t *n);
 int cluster_propose(cluster_node_t *n, cluster_op_t op_type,
                     const void *data, size_t len);
 
-/* Topology replication convenience wrappers (encode the op, then propose). Each
- * returns 0 if accepted for replication (we are the healthy leader), negative
- * otherwise. The committed op is applied to the broker on EVERY node. */
-int cluster_replicate_declare_queue(cluster_node_t *n, const char *vhost,
-                                    const char *name,
-                                    uint8_t flags);
-int cluster_replicate_declare_exchange(cluster_node_t *n, const char *vhost,
-                                       const char *name, int type, uint8_t flags);
-int cluster_replicate_bind(cluster_node_t *n, const char *vhost,
-                           const char *queue, const char *exchange,
-                           const char *routing_key);
+/*
+ * Like cluster_propose(), but returns a nonzero `seq` the caller can poll with
+ * cluster_proposal_status() to learn when the op actually COMMITS (not merely
+ * "accepted into the local inbox"). Returns 0 on outright failure (OOM) -
+ * callers must treat that as an immediate error, not "still pending".
+ */
+uint64_t cluster_propose_tracked(cluster_node_t *n, cluster_op_t op_type,
+                                 const void *data, size_t len);
+
+typedef enum {
+    CL_PROPOSAL_PENDING   = 0,
+    CL_PROPOSAL_COMMITTED = 1,
+    CL_PROPOSAL_REJECTED  = 2,
+} cluster_proposal_status_t;
+
+/* Poll the outcome of a `seq` returned by cluster_propose_tracked(). Safe from
+ * any thread. A caller should poll with a bounded timeout: entries are not
+ * kept forever (a fixed-size table; a very stale, already-resolved seq that
+ * was overwritten by newer traffic reads back as PENDING, not an error). */
+cluster_proposal_status_t cluster_proposal_status(cluster_node_t *n, uint64_t seq);
+
+/* Topology replication convenience wrappers (encode the op, then propose).
+ * Each returns a nonzero `seq` to poll with cluster_proposal_status(), or 0 on
+ * outright failure (OOM). The committed op is applied to the broker on EVERY
+ * node. */
+uint64_t cluster_replicate_declare_queue(cluster_node_t *n, const char *vhost,
+                                         const char *name,
+                                         uint8_t flags);
+uint64_t cluster_replicate_declare_exchange(cluster_node_t *n, const char *vhost,
+                                            const char *name, int type,
+                                            uint8_t flags);
+uint64_t cluster_replicate_bind(cluster_node_t *n, const char *vhost,
+                                const char *queue, const char *exchange,
+                                const char *routing_key);
 
 /* Replicate a published message through the cluster: appended to the Raft log
  * (forwarded to the leader if we are a follower), committed on a majority, then
@@ -487,6 +556,7 @@ typedef struct {
     cluster_role_t   role;
     cluster_health_t health;
     cluster_state_t  state;         /* admin-facing: healthy/syncing/degraded/... */
+    int              storage_failed; /* 1 if a local fsync()/write() has failed */
     int              nmembers;
     cluster_member_t members[CLUSTER_MAX_NODES];
 } cluster_status_t;

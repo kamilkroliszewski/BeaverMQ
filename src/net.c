@@ -235,6 +235,29 @@ void beaver_conn_enable_heartbeat(beaver_conn_t *conn, uint16_t seconds)
                    conn->hb_interval_ms / 2, conn->hb_interval_ms / 2);
 }
 
+void beaver_conn_clear_handshake_timeout(beaver_conn_t *conn)
+{
+    if (conn->n_handles < 2 || conn->closing)
+        return;
+    uv_timer_stop(&conn->hb_timer);
+}
+
+/* No protocol header / SASL StartOk / TuneOk within this window: the slot is
+ * reclaimed instead of being tied up indefinitely (a client that never
+ * completes the handshake used to hold a connection - and, once past
+ * max_connections, a slot other clients need - forever). */
+#define AMQP_HANDSHAKE_TIMEOUT_MS 10000u
+
+static void on_handshake_timeout(uv_timer_t *timer)
+{
+    beaver_conn_t *conn = timer->data;
+    if (conn->closing)
+        return;
+    LOG_WARN("conn #%" PRIu64 " (%s): handshake not completed within %u ms; "
+             "closing", conn->id, conn->peer, AMQP_HANDSHAKE_TIMEOUT_MS);
+    beaver_conn_close(conn);
+}
+
 /* ---- write path ---------------------------------------------------------- */
 
 static void on_write(uv_write_t *req, int status)
@@ -388,10 +411,15 @@ static void on_new_connection(uv_stream_t *server_stream, int status)
     conn->n_handles   = 1;
     conn->id = atomic_fetch_add_explicit(&server->stats->next_conn_id, 1,
                                          memory_order_relaxed) + 1;
-    /* Heartbeat timer (armed later, once TuneOk negotiates an interval). */
+    /* Same timer serves two purposes at different times: a one-shot handshake
+     * deadline now, superseded by the negotiated heartbeat once
+     * Connection.TuneOk arrives (beaver_conn_enable_heartbeat / _clear_
+     * _handshake_timeout - see protocol.c's TuneOk handler). */
     if (uv_timer_init(server->loop, &conn->hb_timer) == 0) {
         conn->hb_timer.data = conn;
         conn->n_handles = 2;
+        uv_timer_start(&conn->hb_timer, on_handshake_timeout,
+                       AMQP_HANDSHAKE_TIMEOUT_MS, 0);
     }
     conn->last_recv_ms = uv_now(server->loop);
 
@@ -403,10 +431,18 @@ static void on_new_connection(uv_stream_t *server_stream, int status)
 
     fill_peername(conn);
 
-    /* Connection cap (DoS guard): accept (to drain the backlog), then refuse. */
-    if (server->max_connections > 0 &&
-        atomic_load_explicit(&server->stats->active_conns,
-                             memory_order_relaxed) >= server->max_connections) {
+    /* Connection cap (DoS guard): accept (to drain the backlog), then refuse.
+     * Claim a slot with ONE atomic increment first, then check whether that
+     * put us over the limit - a separate load-then-branch-then-increment
+     * (the original code) leaves a window between the check and the
+     * increment where every worker thread (each running this independently
+     * under SO_REUSEPORT) can pass the check before any of them increments,
+     * letting the aggregate active_conns exceed max_connections. */
+    uint64_t active = atomic_fetch_add_explicit(&server->stats->active_conns, 1,
+                                                memory_order_relaxed) + 1;
+    if (server->max_connections > 0 && active > (uint64_t)server->max_connections) {
+        atomic_fetch_sub_explicit(&server->stats->active_conns, 1,
+                                  memory_order_relaxed);
         LOG_WARN("conn #%" PRIu64 " (%s): refused - max_connections (%d) reached",
                  conn->id, conn->peer, server->max_connections);
         conn_close_handles(conn);
@@ -418,13 +454,13 @@ static void on_new_connection(uv_stream_t *server_stream, int status)
     conn->proto = protocol_conn_new(conn);
     if (!conn->proto) {
         LOG_ERROR("conn #%" PRIu64 ": OOM allocating protocol state", conn->id);
+        atomic_fetch_sub_explicit(&server->stats->active_conns, 1,
+                                  memory_order_relaxed);
         conn_close_handles(conn);
         return;
     }
 
     conn_list_push(server, conn);
-    atomic_fetch_add_explicit(&server->stats->active_conns, 1,
-                              memory_order_relaxed);
     uint64_t total = atomic_fetch_add_explicit(&server->stats->total_conns, 1,
                                                memory_order_relaxed) + 1;
 

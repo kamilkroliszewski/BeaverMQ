@@ -49,14 +49,19 @@ void broker_free(beaver_broker_t *b);
 
 /*
  * Declare a queue (idempotent). Returns 0 on success; -1 on allocation
- * failure. If non-NULL, *out_depth receives the queue's current depth and
- * *out_created is set to 1 when the queue was newly created (0 if it existed).
+ * failure; -2 if the queue already exists with DIFFERENT flags (AMQP
+ * PRECONDITION_FAILED - the caller must raise a channel exception, not
+ * treat this as success). If non-NULL, *out_depth receives the queue's
+ * current depth and *out_created is set to 1 when newly created (0 if it
+ * already existed with matching flags).
  */
 int broker_declare_queue(beaver_broker_t *b, const char *vhost,
                          const char *name, uint8_t flags,
                          uint32_t *out_depth, int *out_created);
 
-/* Declare an exchange (idempotent). Returns 0 / -1; *out_created as above. */
+/* Declare an exchange (idempotent). Returns 0 / -1 / -2 (existing exchange
+ * with a different type or flags - PRECONDITION_FAILED); *out_created as
+ * above. */
 int broker_declare_exchange(beaver_broker_t *b, const char *vhost,
                             const char *name, exchange_type_t type,
                             uint8_t flags, int *out_created);
@@ -73,9 +78,30 @@ int broker_bind(beaver_broker_t *b, const char *vhost, const char *queue,
                 const char *exchange, const char *routing_key);
 
 /*
+ * broker_route()/broker_publish() return the number of queues a message was
+ * enqueued into (>= 0: ROUTE_OK if > 0, ROUTE_UNROUTABLE if exactly 0 - no
+ * matching exchange/binding/queue), or -1 (ROUTE_RESOURCE_ERROR) if an
+ * allocation failed while COMPUTING the target set (collecting bindings) -
+ * this is NEVER the same condition as "no matching queues": conflating the
+ * two used to make an OOM look identical to an ordinary unroutable message.
+ * A resource error partway through a FANOUT delivery (some queues already
+ * enqueued, a later one fails) is not rolled back - matching real AMQP
+ * broker semantics where each bound queue is delivered to independently -
+ * and is reported as the count that DID succeed (already-real deliveries
+ * can't be un-reported as failed); the incomplete delivery is logged rather
+ * than encoded in the return value, since a single int cannot carry both "N
+ * succeeded" and "and some failed". Only a FULLY failed fanout (every
+ * target hit an error) returns ROUTE_RESOURCE_ERROR.
+ */
+typedef enum {
+    ROUTE_UNROUTABLE     =  0,  /* the actual return value when this applies */
+    ROUTE_RESOURCE_ERROR = -1,  /* likewise - any count > 0 means ROUTE_OK */
+} route_result_t;
+
+/*
  * Route and store a message within `vhost`. Exchange "" (empty) is the default
- * exchange and delivers straight to the queue named by routing_key. Returns the
- * number of queues the message was enqueued into (0 if unroutable), -1 on OOM.
+ * exchange and delivers straight to the queue named by routing_key. See
+ * route_result_t above for how to interpret the return value.
  */
 int broker_publish(beaver_broker_t *b, const char *vhost, const char *exchange,
                    const char *routing_key, const void *body, size_t body_len);
@@ -83,8 +109,9 @@ int broker_publish(beaver_broker_t *b, const char *vhost, const char *exchange,
 /*
  * Route an already-constructed message (using its own exchange/routing_key)
  * within `vhost`. Assigns the message id, enqueues it into every matching
- * queue, and fires the route callback per queue. Does NOT take ownership of the
- * caller's reference. Returns the number of queues it was enqueued into, or -1.
+ * queue, and fires the route callback per queue. Does NOT take ownership of
+ * the caller's reference. See route_result_t above for how to interpret the
+ * return value.
  */
 int broker_route(beaver_broker_t *b, const char *vhost, beaver_message_t *msg);
 

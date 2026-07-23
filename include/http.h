@@ -13,6 +13,7 @@
 #define BEAVERMQ_HTTP_H
 
 #include <uv.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,6 +39,21 @@ beaver_http_server_t *http_server_new(uv_loop_t *loop, beaver_broker_t *broker,
 
 /* Set the directory served for static assets (default "web"). */
 void http_server_set_web_root(beaver_http_server_t *h, const char *path);
+
+/* DoS limits: max request body bytes (Content-Length above this is rejected
+ * with 413 before any buffer growth), max concurrent connections (0 =
+ * unlimited), and the max time allowed to receive one full request (headers +
+ * body) before the connection is dropped (slowloris guard). Call before
+ * http_server_listen(); defaults are permissive (see http.c) until set. */
+void http_server_set_limits(beaver_http_server_t *h, uint32_t max_body_bytes,
+                            int max_connections, uint32_t request_timeout_ms);
+
+/* Set the token that gates the first-boot bootstrap window (see
+ * http_server_set_bootstrap_token in http.c): while the authstore has no
+ * users, a request must present this exact value via the X-Bootstrap-Token
+ * header to get bootstrap-level access. Pass "" (or never call this) to
+ * leave the bootstrap window closed entirely. */
+void http_server_set_bootstrap_token(beaver_http_server_t *h, const char *token);
 
 /* Bind and start listening. Returns 0 or a negative libuv error code. */
 int http_server_listen(beaver_http_server_t *h, const char *ip, int port,

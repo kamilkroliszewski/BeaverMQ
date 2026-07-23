@@ -301,6 +301,23 @@ static void dispatcher_queue_waiter(void *ctx, beaver_queue_t *q)
 /* delivery                                                                   */
 /* ========================================================================= */
 
+/* Ensure room for one more unacked entry WITHOUT storing anything yet - call
+ * BEFORE dequeuing/sending so an OOM here can skip the consumer (backpressure)
+ * instead of leaving an already-sent message with nowhere to record it (see
+ * service_group). Once reserved, consumer_add_unacked() below cannot fail. */
+static int consumer_reserve_unacked(consumer_t *c)
+{
+    if (c->n_unacked < c->cap_unacked)
+        return 0;
+    size_t nc = c->cap_unacked ? c->cap_unacked * 2 : 4;
+    unacked_t *nu = realloc(c->unacked, nc * sizeof(*nu));
+    if (!nu)
+        return -1;
+    c->unacked     = nu;
+    c->cap_unacked = nc;
+    return 0;
+}
+
 static int consumer_add_unacked(consumer_t *c, uint64_t tag,
                                 beaver_message_t *msg)
 {
@@ -434,6 +451,14 @@ static void service_group(beaver_dispatcher_t *d, group_t *g)
              * ack path re-notifies this queue to resume). */
             if (!cand->no_ack && cand->prefetch &&
                 cand->n_unacked >= cand->prefetch)
+                continue;
+            /* Reserve the unacked slot BEFORE dequeuing/sending: once bytes
+             * are on the wire we cannot un-send them, so an OOM here must
+             * skip this consumer (try another / retry later) rather than
+             * deliver a message the broker then has no unacked record for
+             * (the old bug - silent loss under OOM, since ack/reject/
+             * disconnect-requeue could never find it again). */
+            if (!cand->no_ack && consumer_reserve_unacked(cand) != 0)
                 continue;
             c = cand;
             break;
@@ -709,6 +734,29 @@ void dispatcher_remove_connection(beaver_dispatcher_t *d, beaver_conn_t *conn)
         consumer_t *next = c->next;
         if (c->conn == conn) {
             LOG_INFO("removing consumer '%s' (connection closed); requeuing "
+                     "%zu unacked", c->tag, c->n_unacked);
+            consumer_destroy(d, c, 1 /* requeue unacked */);
+        }
+        c = next;
+    }
+}
+
+/* Same cleanup as dispatcher_remove_connection, scoped to one channel -
+ * Channel.Close used to only drop protocol.c's own bookkeeping
+ * (channel_remove) and leave any consumers registered via Basic.Consume on
+ * that channel fully live in the dispatcher (still receiving deliveries,
+ * unacked messages never requeued, queue waiter registration never dropped)
+ * until the whole connection closed. */
+void dispatcher_remove_channel(beaver_dispatcher_t *d, beaver_conn_t *conn,
+                               uint16_t channel)
+{
+    if (!d)
+        return;
+    consumer_t *c = d->consumers;
+    while (c) {
+        consumer_t *next = c->next;
+        if (c->conn == conn && c->channel == channel) {
+            LOG_INFO("removing consumer '%s' (channel closed); requeuing "
                      "%zu unacked", c->tag, c->n_unacked);
             consumer_destroy(d, c, 1 /* requeue unacked */);
         }

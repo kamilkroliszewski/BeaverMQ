@@ -99,6 +99,13 @@ void dispatcher_resume_conn(beaver_dispatcher_t *d, beaver_conn_t *conn);
  * messages. Called when a connection closes. */
 void dispatcher_remove_connection(beaver_dispatcher_t *d, beaver_conn_t *conn);
 
+/* Same, scoped to one channel - call on Channel.Close so a consumer
+ * registered via Basic.Consume on that channel (and its unacked messages,
+ * and its queue waiter registration) doesn't stay live until the whole
+ * connection eventually closes. */
+void dispatcher_remove_channel(beaver_dispatcher_t *d, beaver_conn_t *conn,
+                               uint16_t channel);
+
 #ifdef __cplusplus
 }
 #endif
