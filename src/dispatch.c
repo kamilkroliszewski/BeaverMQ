@@ -191,9 +191,13 @@ static void consumer_destroy(beaver_dispatcher_t *d, consumer_t *c, int requeue)
     queue_consumers_dec(c->queue); /* management metric */
 
     for (size_t i = 0; i < c->n_unacked; i++) {
-        if (requeue)
-            queue_enqueue(c->queue, c->unacked[i].msg); /* stays in unacked set */
-        else
+        if (requeue) {
+            /* stays in the cluster unacked set; internal requeue ignores the
+             * publisher length/byte caps so a full queue cannot drop it. */
+            if (queue_requeue_internal(c->queue, c->unacked[i].msg) != 0)
+                LOG_ERROR("OOM requeuing unacked message on consumer teardown "
+                          "(queue=%s): message dropped", queue_name(c->queue));
+        } else
             /* dropped, not requeued: let the watermark pass it so replicas
              * drop their copies too (consumed-and-gone everywhere). */
             queue_consume_on_ack(c->queue, c->unacked[i].msg->cluster_id);
@@ -471,7 +475,12 @@ static void service_group(beaver_dispatcher_t *d, group_t *g)
             break;
 
         if (deliver(d, c, msg) != 0) {
-            queue_enqueue(g->queue, msg); /* put it back; peer went away */
+            /* put it back; peer went away. Internal requeue bypasses the
+             * publisher caps - the message just left this same queue, so a
+             * limit check here could spuriously drop it. */
+            if (queue_requeue_internal(g->queue, msg) != 0)
+                LOG_ERROR("OOM returning message to queue=%s after failed "
+                          "delivery: message dropped", queue_name(g->queue));
             message_unref(msg);
             break;
         }
@@ -643,8 +652,12 @@ static size_t settle_unacked(beaver_dispatcher_t *d, beaver_conn_t *conn,
             beaver_message_t *msg = c->unacked[i].msg;
             if (requeue) {
                 /* Back on the queue (at the tail); the message stays in the
-                 * cluster unacked set so the consume watermark cannot pass it. */
-                queue_enqueue(c->queue, msg);
+                 * cluster unacked set so the consume watermark cannot pass it.
+                 * Internal requeue ignores the publisher caps so a nack onto a
+                 * full queue cannot silently drop the message. */
+                if (queue_requeue_internal(c->queue, msg) != 0)
+                    LOG_ERROR("OOM requeuing nacked message on queue=%s: "
+                              "message dropped", queue_name(c->queue));
             } else {
                 /* Consumed-and-gone: let the watermark pass it so replicas
                  * drop their copies too. */

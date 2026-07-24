@@ -31,6 +31,14 @@ typedef enum {
 #define AUTH_TAG_ADMINISTRATOR 1u   /* may manage users/vhosts/perms */
 #define AUTH_TAG_MANAGEMENT    2u   /* may view the management API   */
 
+/* Maximum stored lengths (including the NUL terminator) for names and regex
+ * patterns. Inputs at or beyond these are REJECTED rather than silently
+ * truncated - a truncated user/vhost could collide with another principal, and
+ * a truncated regex would enforce a different policy than the caller sent (and
+ * diverge between the API, the Raft payload and each node's local state). */
+#define AUTHSTORE_NAME_MAX  128
+#define AUTHSTORE_REGEX_MAX 256
+
 authstore_t *authstore_new(void);
 void         authstore_free(authstore_t *s);
 

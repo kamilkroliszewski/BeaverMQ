@@ -172,6 +172,30 @@ int queue_enqueue(beaver_queue_t *q, beaver_message_t *msg)
     return 0;
 }
 
+int queue_requeue_internal(beaver_queue_t *q, beaver_message_t *msg)
+{
+    pthread_mutex_lock(&q->lock);
+    /* Deliberately bypass the publisher-facing length/byte limits: this message
+     * was already accepted into the queue once and is only returning after a
+     * nack/reject/disconnect. Enforcing QUEUE_FULL here would let a full queue
+     * silently drop an in-flight message (the caller unrefs its last reference
+     * right after), violating the "requeue-on-disconnect never loses a message"
+     * guarantee. Only a genuine OOM growing the ring buffer can fail. */
+    if (q->count == q->cap) {
+        if (queue_grow(q) != 0) {
+            pthread_mutex_unlock(&q->lock);
+            return -1; /* OOM: caller must NOT drop its reference on -1 */
+        }
+    }
+    q->slots[q->tail] = message_ref(msg);
+    q->tail = (q->tail + 1) % q->cap;
+    q->count++;
+    q->total_enqueued++;
+    q->total_bytes += msg->body_len;
+    pthread_mutex_unlock(&q->lock);
+    return 0;
+}
+
 beaver_message_t *queue_dequeue(beaver_queue_t *q)
 {
     pthread_mutex_lock(&q->lock);
@@ -327,6 +351,12 @@ size_t queue_drain_consumed(beaver_queue_t *q, uint64_t watermark)
         q->head = (q->head + 1) % q->cap;
         q->count--;
         q->total_dequeued++;
+        /* Keep the byte accounting in step with the message actually leaving the
+         * queue - the normal dequeue/purge paths do this, but the replicated
+         * drain used to skip it, so a replica could keep counting drained bytes
+         * against queue_max_bytes and spuriously reject later enqueues as
+         * QUEUE_FULL even with an empty queue. */
+        q->total_bytes -= m->body_len;
         message_unref(m);
         drained++;
     }

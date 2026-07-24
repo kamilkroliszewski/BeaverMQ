@@ -134,14 +134,21 @@ static int hash_matches(const char *stored, const char *password)
 
 /* ---- store --------------------------------------------------------------- */
 
-typedef struct { char name[128]; } vhost_t;
-typedef struct { char name[128]; char hash[AUTHSTORE_HASH_MAX]; uint32_t tags; } user_t;
+typedef struct { char name[AUTHSTORE_NAME_MAX]; } vhost_t;
+typedef struct { char name[AUTHSTORE_NAME_MAX]; char hash[AUTHSTORE_HASH_MAX]; uint32_t tags; } user_t;
 typedef struct {
-    char user[128], vhost[128];
-    char conf[256], wr[256], rd[256];
+    char user[AUTHSTORE_NAME_MAX], vhost[AUTHSTORE_NAME_MAX];
+    char conf[AUTHSTORE_REGEX_MAX], wr[AUTHSTORE_REGEX_MAX], rd[AUTHSTORE_REGEX_MAX];
     regex_t rc, rw, rr;
     int compiled;          /* regexes built (must regfree before overwrite/del) */
 } perm_t;
+
+/* Reject over-long inputs instead of letting snprintf() truncate them (see
+ * AUTHSTORE_NAME_MAX). `n` includes the NUL terminator. */
+static int too_long(const char *s, size_t n)
+{
+    return s && strlen(s) >= n;
+}
 
 struct authstore {
     pthread_rwlock_t lock;
@@ -209,6 +216,7 @@ static void drop_perms_matching(authstore_t *s, const char *u, const char *v)
 
 int authstore_add_vhost(authstore_t *s, const char *vhost)
 {
+    if (too_long(vhost, AUTHSTORE_NAME_MAX)) return -1;
     pthread_rwlock_wrlock(&s->lock);
     int rc = 0;
     if (find_vhost(s, vhost) == (size_t)-1) {
@@ -232,6 +240,8 @@ int authstore_del_vhost(authstore_t *s, const char *vhost)
 int authstore_add_user(authstore_t *s, const char *user,
                        const char *pass_hash, uint32_t tags)
 {
+    if (too_long(user, AUTHSTORE_NAME_MAX) ||
+        too_long(pass_hash, AUTHSTORE_HASH_MAX)) return -1;
     pthread_rwlock_wrlock(&s->lock);
     size_t i = find_user(s, user);
     if (i == (size_t)-1) { GROW(s->users, s->nu, s->cu); i = s->nu++; }
@@ -254,6 +264,12 @@ int authstore_del_user(authstore_t *s, const char *user)
 int authstore_set_perm(authstore_t *s, const char *user, const char *vhost,
                        const char *configure, const char *write, const char *read)
 {
+    /* Reject over-long inputs up front so no row is created from truncated
+     * names/patterns (which would diverge from the caller's intent). */
+    if (too_long(user, AUTHSTORE_NAME_MAX) || too_long(vhost, AUTHSTORE_NAME_MAX) ||
+        too_long(configure, AUTHSTORE_REGEX_MAX) || too_long(write, AUTHSTORE_REGEX_MAX) ||
+        too_long(read, AUTHSTORE_REGEX_MAX))
+        return -1;
     pthread_rwlock_wrlock(&s->lock);
     size_t i = find_perm(s, user, vhost);
     if (i == (size_t)-1) { GROW(s->perms, s->np, s->cp); i = s->np++;
@@ -265,11 +281,19 @@ int authstore_set_perm(authstore_t *s, const char *user, const char *vhost,
     snprintf(p->conf, sizeof p->conf, "%s", configure);
     snprintf(p->wr,   sizeof p->wr,   "%s", write);
     snprintf(p->rd,   sizeof p->rd,   "%s", read);
-    /* Compile non-empty patterns; an empty pattern stays "deny" (no regex). */
-    int ok = 1;
-    if (p->conf[0] && regcomp(&p->rc, p->conf, REG_EXTENDED | REG_NOSUB)) ok = 0;
-    if (ok && p->wr[0] && regcomp(&p->rw, p->wr, REG_EXTENDED | REG_NOSUB)) ok = 0;
-    if (ok && p->rd[0] && regcomp(&p->rr, p->rd, REG_EXTENDED | REG_NOSUB)) ok = 0;
+    /* Compile non-empty patterns; an empty pattern stays "deny" (no regex).
+     * Track which regexes actually compiled so that, if a later one fails, the
+     * earlier successful compiles are freed instead of leaking (they would
+     * otherwise never be regfree'd, since p->compiled stays 0). */
+    int ok = 1, rc_ok = 0, rw_ok = 0, rr_ok = 0;
+    if (p->conf[0]) { if (regcomp(&p->rc, p->conf, REG_EXTENDED | REG_NOSUB)) ok = 0; else rc_ok = 1; }
+    if (ok && p->wr[0]) { if (regcomp(&p->rw, p->wr, REG_EXTENDED | REG_NOSUB)) ok = 0; else rw_ok = 1; }
+    if (ok && p->rd[0]) { if (regcomp(&p->rr, p->rd, REG_EXTENDED | REG_NOSUB)) ok = 0; else rr_ok = 1; }
+    if (!ok) {
+        if (rc_ok) regfree(&p->rc);
+        if (rw_ok) regfree(&p->rw);
+        if (rr_ok) regfree(&p->rr);
+    }
     p->compiled = ok;  /* if a pattern was malformed, treat the row as deny-all */
     pthread_rwlock_unlock(&s->lock);
     return ok ? 0 : -1;

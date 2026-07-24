@@ -66,11 +66,11 @@ void supervisor_config_from_env(supervisor_config_t *cfg, const char *data_dir_h
     cfg->heartbeat_timeout_ms = env_u64("BEAVERMQ_SUPERVISOR_HEARTBEAT_TIMEOUT_MS",
                                         6000, 200, 600000);
     cfg->nworkers = env_int("BEAVERMQ_SUPERVISOR_WORKERS", 1, 1, 64);
-    if (cfg->nworkers > 1 && !cluster_enabled_hint)
-        LOG_WARN("supervisor: BEAVERMQ_SUPERVISOR_WORKERS=%d requested without "
-                "cluster=on - each worker process is an independent, "
-                "uncoordinated broker with its OWN in-memory queues; this "
-                "will be rejected at startup unless clustering is enabled",
+    (void)cluster_enabled_hint;
+    if (cfg->nworkers != 1)
+        LOG_WARN("supervisor: BEAVERMQ_SUPERVISOR_WORKERS=%d requested - multiple "
+                "worker processes are unsupported (they share one node_id, "
+                "data_dir, WAL and port set) and will be rejected at startup",
                 cfg->nworkers);
     if (data_dir_hint)
         snprintf(cfg->data_dir, sizeof(cfg->data_dir), "%s", data_dir_hint);
@@ -520,11 +520,20 @@ int supervisor_main(int argc, char **argv)
     memset(&sup, 0, sizeof(sup));
     supervisor_config_from_env(&sup.cfg, bcfg.data_dir, bcfg.cluster_enabled);
 
-    if (sup.cfg.nworkers > 1 && !bcfg.cluster_enabled) {
-        LOG_FATAL("supervisor: BEAVERMQ_SUPERVISOR_WORKERS=%d requires cluster=on - "
-                 "independent worker processes without clustering would each run "
-                 "their own uncoordinated in-memory queues/exchanges under the "
-                 "same port; refusing to start", sup.cfg.nworkers);
+    if (sup.cfg.nworkers != 1) {
+        /* Multiple worker PROCESSES are unsupported, even with cluster=on. The
+         * supervisor gives every child an identical command line and
+         * environment: same node_id, same data_dir, same cluster-N.log/.meta/
+         * .snap WAL files, same AMQP/HTTP/cluster ports, same peer set. They do
+         * not become distinct Raft nodes - they collide on the WAL and ports
+         * and can corrupt persisted data. Until per-process orchestration
+         * (unique node_id/data_dir/ports) exists, run multiple worker THREADS
+         * inside a single process instead (BEAVERMQ workers), not multiple
+         * supervisor processes. */
+        LOG_FATAL("supervisor: BEAVERMQ_SUPERVISOR_WORKERS=%d is unsupported - "
+                 "multiple worker processes would share one node_id, data_dir, "
+                 "WAL and port set and can corrupt persisted data; refusing to "
+                 "start. Use a single supervised process.", sup.cfg.nworkers);
         return 1;
     }
 

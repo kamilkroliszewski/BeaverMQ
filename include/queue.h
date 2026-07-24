@@ -54,6 +54,14 @@ void queue_set_default_limits(uint64_t max_length, uint64_t max_bytes);
  * OOM, or QUEUE_FULL if a configured length/byte limit would be exceeded. */
 int queue_enqueue(beaver_queue_t *q, beaver_message_t *msg);
 
+/* Return a previously-accepted message to the queue after a nack/reject/
+ * disconnect. Adds an internal reference like queue_enqueue(), but DELIBERATELY
+ * ignores the publisher-facing length/byte limits so a full queue can never
+ * silently drop an in-flight message being requeued. Returns 0 on success or
+ * -1 only on a genuine OOM growing the ring buffer; on -1 the caller must keep
+ * its own reference (do NOT unref) since the message is not on the queue. */
+int queue_requeue_internal(beaver_queue_t *q, beaver_message_t *msg);
+
 /* Dequeue the oldest message, transferring its reference to the caller.
  * Returns NULL if the queue is empty. */
 beaver_message_t *queue_dequeue(beaver_queue_t *q);
