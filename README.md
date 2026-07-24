@@ -606,6 +606,11 @@ now refuses to reproduce.
 - `test_cluster.sh` — brings up a local 3‑node cluster, verifies a leader is
   elected, kills it, and verifies the surviving majority elects a new leader at
   a higher term (run directly: `bash tests/test_cluster.sh`)
+- `test_fault_storage.sh` — storage-layer fault injection: an `LD_PRELOAD` shim
+  (`tests/faultlib.c`) fails `fsync`/`write`/`rename` **only** on the cluster
+  WAL/snapshot files and asserts the node marks itself storage‑failed (the P0
+  fail‑stop) rather than trusting broken storage; a control run proves no false
+  positives (`make fault-test`)
 
 ### Integration tests (live broker)
 
@@ -629,12 +634,13 @@ make test-asan     # every unit test rebuilt + run under ASan + UBSan
 make tsan && ./build/beavermq   # ThreadSanitizer build; drive it with a client
 make fuzz && ./build/fuzz_frame -max_total_time=60   # libFuzzer (clang)
 make integration   # live AMQP + management API tests
+make fault-test    # storage-layer fault injection (WAL/snapshot fail-stop)
 bash tests/test_cluster.sh      # 3-node Raft election + failover
 ```
 
 All of these run in CI (`.github/workflows/ci.yml`): release unit tests,
-ASan/UBSan, Valgrind, the supervisor and cluster process tests, the integration
-suite, and a 60‑second libFuzzer run.
+ASan/UBSan, Valgrind, the supervisor / cluster / storage-fault process tests,
+the integration suite, and a 60‑second libFuzzer run.
 
 ---
 
