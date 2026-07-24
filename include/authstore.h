@@ -59,8 +59,22 @@ int authstore_is_open(authstore_t *s);
 int authstore_vhost_exists(authstore_t *s, const char *vhost);
 /* 1 if `user` has any permission entry for `vhost` (i.e. may use it at all). */
 int authstore_can_access_vhost(authstore_t *s, const char *user, const char *vhost);
-/* 1 if `user` exists and `password` matches its stored hash. */
+/* 1 if `user` exists and `password` matches its stored hash. Runs the full
+ * (expensive) PBKDF2 under the read lock - convenient, but blocks the caller;
+ * for the event-loop paths prefer the split below (look up on the loop, verify
+ * off it). */
 int authstore_verify(authstore_t *s, const char *user, const char *password);
+
+/* Split verification for off-event-loop hashing:
+ *   1. authstore_lookup_hash() runs ON the loop: copies `user`'s stored hash
+ *      into `out` (a short critical section, no PBKDF2). Returns 1 if the user
+ *      exists and the hash fit, 0 otherwise. `out` must be >= AUTHSTORE_HASH_MAX.
+ *   2. authstore_password_matches() runs OFF the loop (a worker thread): it is
+ *      pure and reentrant - it touches no store state and takes no lock, only
+ *      the two strings passed - so the costly PBKDF2 never blocks the loop.
+ * Returns 1 on a match, 0 otherwise. */
+int authstore_lookup_hash(authstore_t *s, const char *user, char *out, size_t cap);
+int authstore_password_matches(const char *stored_hash, const char *password);
 uint32_t authstore_user_tags(authstore_t *s, const char *user);
 /* 1 if `user` is allowed `kind` access to `object` in `vhost`. */
 int authstore_check(authstore_t *s, const char *user, const char *vhost,

@@ -40,7 +40,9 @@ MAIN_OBJ  := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(MAIN_SRC))
 
 BIN       := $(BUILD_DIR)/beavermq
 
-TEST_SRCS := $(wildcard $(TEST_DIR)/*.c)
+# faultlib.c is an LD_PRELOAD shim (no main; built separately by the fault
+# test), not a standalone unit-test binary - keep it out of the test list.
+TEST_SRCS := $(filter-out $(TEST_DIR)/faultlib.c,$(wildcard $(TEST_DIR)/*.c))
 TEST_BINS := $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/%,$(TEST_SRCS))
 
 # All generated dependency files (from -MMD).
@@ -124,6 +126,13 @@ run: $(BIN)
 .PHONY: integration
 integration: $(BIN)
 	@bash $(TEST_DIR)/integration/run.sh
+
+# Storage-layer fault injection: fail fsync/write/rename ONLY on the cluster
+# WAL/snapshot files (via an LD_PRELOAD shim) and assert the node marks itself
+# storage_failed instead of trusting broken storage (audit P0 fail-stop).
+.PHONY: fault-test
+fault-test: $(BIN)
+	@bash $(TEST_DIR)/test_fault_storage.sh
 
 debug: OPT := -O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer
 debug: LDFLAGS += -fsanitize=address,undefined

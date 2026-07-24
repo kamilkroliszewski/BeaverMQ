@@ -64,6 +64,8 @@ jobs:
         run: bash tests/test_supervisor.sh
       - name: Cluster leader election + failover
         run: bash tests/test_cluster.sh
+      - name: Storage fault injection (WAL/snapshot fail-stop)
+        run: make fault-test
 
   integration:
     name: AMQP + management integration

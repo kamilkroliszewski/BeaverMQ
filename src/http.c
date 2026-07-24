@@ -89,6 +89,7 @@ struct http_conn {
                                          * would otherwise still starve us */
     int                   n_handles;        /* live handles (tcp [+ timer]) */
     int                   n_handles_closed;
+    struct http_auth_work *pending_auth;    /* in-flight off-loop Basic-auth hash */
     http_conn_t          *prev, *next;
 };
 
@@ -530,75 +531,156 @@ static void http_peer_ip(http_conn_t *c, char *out, size_t cap)
         uv_ip6_name((struct sockaddr_in6 *)&ss, out, cap);
 }
 
-/* Authenticate the request against the authstore via HTTP Basic auth.
- * Returns: 3 = bootstrap window (valid X-Bootstrap-Token, no users yet),
- * 3 = bootstrap window, 2 = administrator, 1 = management (read-only),
- * 0 = no/bad credentials, -1 = authenticated but lacks any management tag
- * (caller answers 403, not 401), -2 = rate limited (caller answers 429 and no
- * password hash was computed). The authenticated username is copied into
- * user_out ("" in the bootstrap window). While the store has NO users (first
- * boot), only a request carrying the bootstrap token can create the initial
- * admin; the moment a user exists, all management access requires real
- * credentials AND the administrator or management tag - a plain authenticated
- * user with neither tag gets no access to the management API. */
-static int mgmt_authenticate(http_conn_t *c, const char *head, size_t head_len,
-                             char *user_out, size_t user_cap)
+/* Map a user's tags to a management auth level: 2 = administrator, 1 = read-only
+ * management, -1 = authenticated but no management tag (caller answers 403). */
+static int mgmt_level_from_tags(uint32_t tags)
 {
-    if (user_cap)
-        user_out[0] = '\0';
+    if (tags & AUTH_TAG_ADMINISTRATOR) return 2;
+    if (tags & AUTH_TAG_MANAGEMENT)    return 1;
+    return -1;
+}
+
+/* Forward decls: the routing continuation (run once the auth level is known),
+ * and the error responder (defined further down). */
+static void http_dispatch_level(http_conn_t *c, const char *method,
+                                const char *path, int auth_level,
+                                const char *auth_user);
+static void http_respond_error(http_conn_t *c, int status, const char *text,
+                               const char *message);
+
+/* Off-loop HTTP Basic password verification (mirrors protocol.c's SASL path):
+ * the expensive PBKDF2 runs on a libuv worker thread so it never blocks the
+ * HTTP event loop. The work object outlives a connection teardown that happens
+ * mid-hash - on_http_handle_closed nulls ->c so the completion callback (which
+ * always fires) just cleans up. Auth levels: 3 = bootstrap window, 2 = admin,
+ * 1 = read-only management, 0 = no/bad credentials (401), -1 = authenticated
+ * but no management tag (403), -2 = rate limited (429, no hash computed). */
+typedef struct http_auth_work {
+    uv_work_t    req;      /* MUST be first */
+    http_conn_t *c;        /* NULL once the connection is gone */
+    char         user[128];
+    char         ip[64];
+    char         pass[256];
+    char         stored[AUTHSTORE_HASH_MAX];
+    uint64_t     now_ms;
+    int          user_exists;
+    int          result;   /* set off-loop by http_auth_work_cb */
+    char         method[8];
+    char         path[256];
+} http_auth_work_t;
+
+static void http_auth_work_cb(uv_work_t *req)
+{
+    http_auth_work_t *w = (http_auth_work_t *)req;
+    w->result = w->user_exists && authstore_password_matches(w->stored, w->pass);
+    memset(w->pass, 0, sizeof w->pass); /* don't linger the plaintext in the heap */
+}
+
+static void http_auth_after_cb(uv_work_t *req, int status)
+{
+    http_auth_work_t *w = (http_auth_work_t *)req;
+    authlimit_hash_end(); /* release the slot held across the hash */
+
+    http_conn_t *c = w->c;
+    if (!c || status == UV_ECANCELED) { free(w); return; } /* connection gone */
+    c->pending_auth = NULL;
+
+    int level;
+    char user[128] = "";
+    if (!w->result) {
+        authlimit_record_failure(w->ip, w->now_ms);
+        level = 0; /* -> 401 */
+    } else {
+        authlimit_record_success(w->ip);
+        authstore_t *as = c->server->nservers > 0
+                          ? (authstore_t *)c->server->servers[0]->authstore : NULL;
+        level = mgmt_level_from_tags(as ? authstore_user_tags(as, w->user) : 0);
+        snprintf(user, sizeof user, "%s", w->user);
+    }
+    http_dispatch_level(c, w->method, w->path, level, user);
+    free(w);
+}
+
+/* Begin authenticating a fully-received request. Everything that does NOT need
+ * the expensive hash (bootstrap window, missing/garbled credentials, the
+ * rate-limit) is resolved on the loop and dispatched immediately; a real Basic
+ * credential has its stored hash looked up here, then PBKDF2 runs OFF the loop
+ * and http_auth_after_cb dispatches the result. */
+static void mgmt_auth_start(http_conn_t *c, const char *method, const char *path,
+                            const char *head, size_t head_len)
+{
     authstore_t *as = c->server->nservers > 0
                       ? (authstore_t *)c->server->servers[0]->authstore : NULL;
-    if (!as) return http_has_bootstrap_token(c, head, head_len) ? 3 : 0;
-    if (authstore_is_open(as))              /* bootstrap window */
-        return http_has_bootstrap_token(c, head, head_len) ? 3 : 0;
+    if (!as || authstore_is_open(as)) {   /* bootstrap window (or no store) */
+        int lvl = http_has_bootstrap_token(c, head, head_len) ? 3 : 0;
+        http_dispatch_level(c, method, path, lvl, "");
+        return;
+    }
 
     /* Find "Authorization: Basic <b64>" among the request headers. */
+    const char *auth = NULL;
     for (const char *p = head; p + 21 < head + head_len; p++) {
         if ((p == head || p[-1] == '\n') &&
-            strncasecmp(p, "Authorization:", 14) == 0) {
-            p += 14;
-            while (*p == ' ') p++;
-            if (strncasecmp(p, "Basic", 5) != 0) return 0;
-            p += 5;
-            while (*p == ' ') p++;
-            const char *e = p;
-            while (e < head + head_len && *e != '\r' && *e != '\n') e++;
-            char plain[300];
-            if (!b64_decode(p, (size_t)(e - p), plain, sizeof plain)) return 0;
-            char *colon = strchr(plain, ':');
-            if (!colon) return 0;
-            *colon = '\0';
-            /* Throttle expensive password hashing: an unauthenticated client
-             * that spams Basic auth from one IP is backed off, and a flood from
-             * many IPs is bounded by the global concurrent-hash cap. Both deny
-             * WITHOUT hashing (return -2 -> 429). */
-            char ip[64];
-            http_peer_ip(c, ip, sizeof ip);
-            uint64_t now_ms = uv_now(c->server->loop);
-            if (authlimit_retry_after_ms(ip, now_ms) > 0)
-                return -2;
-            if (authlimit_hash_begin() != 0)
-                return -2;
-            int verified = authstore_verify(as, plain, colon + 1);
-            authlimit_hash_end();
-            if (!verified) {
-                authlimit_record_failure(ip, now_ms);
-                return 0;
-            }
-            authlimit_record_success(ip);
-            uint32_t tags = authstore_user_tags(as, plain);
-            size_t ul = strlen(plain);
-            if (user_cap) {
-                if (ul >= user_cap) ul = user_cap - 1;
-                memcpy(user_out, plain, ul);
-                user_out[ul] = '\0';
-            }
-            if (tags & AUTH_TAG_ADMINISTRATOR) return 2; /* full management */
-            if (tags & AUTH_TAG_MANAGEMENT)    return 1; /* read-only management */
-            return -1; /* authenticated but no management tag: forbidden */
-        }
+            strncasecmp(p, "Authorization:", 14) == 0) { auth = p; break; }
     }
-    return 0;
+    if (!auth) { http_dispatch_level(c, method, path, 0, ""); return; }
+    auth += 14;
+    while (*auth == ' ') auth++;
+    if (strncasecmp(auth, "Basic", 5) != 0) { http_dispatch_level(c, method, path, 0, ""); return; }
+    auth += 5;
+    while (*auth == ' ') auth++;
+    const char *e = auth;
+    while (e < head + head_len && *e != '\r' && *e != '\n') e++;
+    char plain[300];
+    if (!b64_decode(auth, (size_t)(e - auth), plain, sizeof plain)) {
+        http_dispatch_level(c, method, path, 0, ""); return;
+    }
+    char *colon = strchr(plain, ':');
+    if (!colon) { http_dispatch_level(c, method, path, 0, ""); return; }
+    *colon = '\0';
+    /* A username at/over the store's max length can never match a stored user
+     * (names that long are rejected at creation), and would only truncate into
+     * the work buffer - treat it as a bad credential without hashing. */
+    if (strlen(plain) >= AUTHSTORE_NAME_MAX) {
+        http_dispatch_level(c, method, path, 0, ""); return;
+    }
+
+    /* Throttle expensive hashing: a client spamming Basic auth from one IP is
+     * backed off, and a flood from many IPs is bounded by the global
+     * concurrent-hash cap - both deny WITHOUT hashing (429). */
+    char ip[64];
+    http_peer_ip(c, ip, sizeof ip);
+    uint64_t now_ms = uv_now(c->server->loop);
+    if (authlimit_retry_after_ms(ip, now_ms) > 0 || authlimit_hash_begin() != 0) {
+        http_dispatch_level(c, method, path, -2, "");
+        return;
+    }
+
+    http_auth_work_t *w = calloc(1, sizeof *w);
+    if (!w) {
+        authlimit_hash_end();
+        http_respond_error(c, 500, "Internal Server Error", "out of memory");
+        return;
+    }
+    w->c      = c;
+    w->now_ms = now_ms;
+    snprintf(w->user,   sizeof w->user,   "%s", plain);
+    snprintf(w->ip,     sizeof w->ip,     "%s", ip);
+    snprintf(w->pass,   sizeof w->pass,   "%s", colon + 1);
+    snprintf(w->method, sizeof w->method, "%s", method);
+    snprintf(w->path,   sizeof w->path,   "%s", path);
+    w->user_exists = authstore_lookup_hash(as, plain, w->stored, sizeof w->stored);
+    c->pending_auth = w;
+    /* Stop reading until we answer: one request per connection (the response
+     * closes it), so a second request must never start a second auth. */
+    uv_read_stop((uv_stream_t *)&c->handle);
+    if (uv_queue_work(c->server->loop, &w->req,
+                      http_auth_work_cb, http_auth_after_cb) != 0) {
+        c->pending_auth = NULL;
+        authlimit_hash_end();
+        free(w);
+        http_respond_error(c, 500, "Internal Server Error", "failed to start auth");
+    }
 }
 
 /* Serialize a json_t (transferring ownership), then respond + free. */
@@ -953,64 +1035,18 @@ static int handle_mgmt(http_conn_t *c, const char *method, const char *path,
 /* request parsing + routing                                                  */
 /* ========================================================================= */
 
-static void handle_request(http_conn_t *c)
+/* Gate on the resolved auth level, then route the request. Called either
+ * synchronously (bootstrap / bad-credential / rate-limited cases) or from the
+ * off-loop hash completion (http_auth_after_cb). `method`/`path` are copies;
+ * the request body is still in c->inbuf. */
+static void http_dispatch_level(http_conn_t *c, const char *method,
+                                const char *path, int auth_level,
+                                const char *auth_user)
 {
-    const char *buf = c->inbuf;
-    size_t len = c->inbuf_len;
-
-    /* Parse "METHOD SP PATH SP VERSION". */
-    const char *sp1 = memchr(buf, ' ', len);
-    if (!sp1) {
-        http_respond_error(c, 400, "Bad Request", "malformed request line");
+    if (c->closing || c->responded)
         return;
-    }
-    size_t method_len = (size_t)(sp1 - buf);
-    const char *path_start = sp1 + 1;
-    const char *sp2 = memchr(path_start, ' ', len - (size_t)(path_start - buf));
-    if (!sp2) {
-        http_respond_error(c, 400, "Bad Request", "malformed request line");
-        return;
-    }
-
-    char method[8] = {0};
-    if (method_len >= sizeof(method))
-        method_len = sizeof(method) - 1;
-    memcpy(method, buf, method_len);
-
-    char path[256] = {0};
-    size_t path_len = (size_t)(sp2 - path_start);
-    /* Strip any query string. */
-    const char *q = memchr(path_start, '?', path_len);
-    if (q)
-        path_len = (size_t)(q - path_start);
-    if (path_len >= sizeof(path))
-        path_len = sizeof(path) - 1;
-    memcpy(path, path_start, path_len);
-
-    LOG_INFO("HTTP %s %s", method, path);
-
     beaver_http_server_t *h = c->server;
 
-    /* Liveness/build probe - deliberately UNAUTHENTICATED (no broker state
-     * beyond the version): lets a deploy script confirm which build the
-     * running process is, so a stale not-restarted broker is caught at once. */
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/healthz") == 0) {
-        json_t *o = json_object();
-        json_object_set_new(o, "status", json_string("ok"));
-        json_object_set_new(o, "version", json_string(BEAVER_VERSION));
-        json_object_set_new(o, "build", json_string(beaver_build_stamp));
-        respond_obj(c, o);
-        return;
-    }
-
-    /* Access control: everything (API + dashboard) requires HTTP Basic auth once
-     * any user exists; mutations additionally require the administrator tag. On
-     * a fresh broker (no users) access is open so the first admin can be made. */
-    char *head_end = memmem(c->inbuf, c->inbuf_len, "\r\n\r\n", 4);
-    size_t head_len = head_end ? (size_t)(head_end - c->inbuf) + 4 : c->inbuf_len;
-    char auth_user[128];
-    int auth_level = mgmt_authenticate(c, c->inbuf, head_len,
-                                       auth_user, sizeof auth_user);
     if (auth_level == 0) {
         http_respond_401(c);
         return;
@@ -1089,6 +1125,64 @@ static void handle_request(http_conn_t *c)
         http_respond_error(c, 404, "Not Found", "no such API resource");
     else
         serve_static(c, path); /* "/" -> index.html, plus app.js, css, ... */
+}
+
+static void handle_request(http_conn_t *c)
+{
+    const char *buf = c->inbuf;
+    size_t len = c->inbuf_len;
+
+    /* Parse "METHOD SP PATH SP VERSION". */
+    const char *sp1 = memchr(buf, ' ', len);
+    if (!sp1) {
+        http_respond_error(c, 400, "Bad Request", "malformed request line");
+        return;
+    }
+    size_t method_len = (size_t)(sp1 - buf);
+    const char *path_start = sp1 + 1;
+    const char *sp2 = memchr(path_start, ' ', len - (size_t)(path_start - buf));
+    if (!sp2) {
+        http_respond_error(c, 400, "Bad Request", "malformed request line");
+        return;
+    }
+
+    char method[8] = {0};
+    if (method_len >= sizeof(method))
+        method_len = sizeof(method) - 1;
+    memcpy(method, buf, method_len);
+
+    char path[256] = {0};
+    size_t path_len = (size_t)(sp2 - path_start);
+    /* Strip any query string. */
+    const char *q = memchr(path_start, '?', path_len);
+    if (q)
+        path_len = (size_t)(q - path_start);
+    if (path_len >= sizeof(path))
+        path_len = sizeof(path) - 1;
+    memcpy(path, path_start, path_len);
+
+    LOG_INFO("HTTP %s %s", method, path);
+
+    /* Liveness/build probe - deliberately UNAUTHENTICATED (no broker state
+     * beyond the version): lets a deploy script confirm which build the
+     * running process is, so a stale not-restarted broker is caught at once. */
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/healthz") == 0) {
+        json_t *o = json_object();
+        json_object_set_new(o, "status", json_string("ok"));
+        json_object_set_new(o, "version", json_string(BEAVER_VERSION));
+        json_object_set_new(o, "build", json_string(beaver_build_stamp));
+        respond_obj(c, o);
+        return;
+    }
+
+    /* Access control: everything (API + dashboard) requires HTTP Basic auth once
+     * any user exists; mutations additionally require the administrator tag. On
+     * a fresh broker (no users) access is open so the first admin can be made.
+     * The password hash runs OFF the event loop; routing continues in
+     * http_dispatch_level once the auth level is known. */
+    char *head_end = memmem(c->inbuf, c->inbuf_len, "\r\n\r\n", 4);
+    size_t head_len = head_end ? (size_t)(head_end - c->inbuf) + 4 : c->inbuf_len;
+    mgmt_auth_start(c, method, path, c->inbuf, head_len);
 }
 
 /* ========================================================================= */
@@ -1195,6 +1289,11 @@ static void on_http_handle_closed(uv_handle_t *handle)
     http_conn_t *c = handle->data;
     if (++c->n_handles_closed < c->n_handles)
         return;
+    /* If a password verification is still running on a worker thread, detach it
+     * so its completion callback (which always fires) cleans itself up without
+     * touching this freed connection. The work object is freed by that callback. */
+    if (c->pending_auth)
+        ((http_auth_work_t *)c->pending_auth)->c = NULL;
     free(c->inbuf);
     free(c);
 }

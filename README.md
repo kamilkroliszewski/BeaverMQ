@@ -399,8 +399,13 @@ exists, **everything locks**: AMQP requires valid credentials, and the entire
 management API + dashboard require HTTP **Basic auth** (the browser prompts;
 mutations additionally require the `administrator` tag).
 
-- **Auth** — SASL `PLAIN`; passwords are stored as a salted SHA‑256 hash. A bad
-  login is refused with `403`.
+- **Auth** — SASL `PLAIN` (AMQP) / HTTP Basic (management); passwords are
+  stored as salted **PBKDF2‑HMAC‑SHA256** (legacy salted‑SHA‑256 records still
+  verify). The hash runs **off the event loop** on a libuv worker thread so a
+  slow verification never stalls other connections, and logins are **rate
+  limited per client IP** (exponential backoff) with a global cap on concurrent
+  hashes. A bad login is refused with `403` (AMQP) / `401` (HTTP); a flood is
+  shed with `429`.
 - **Vhosts** — object names are **namespaced per vhost**: queue `orders` in `/`
   and in `prod` are different queues, and each vhost has its own `amq.*`
   exchanges. `Connection.Open` is rejected (`530`) unless the vhost exists and
@@ -589,6 +594,9 @@ now refuses to reproduce.
 - `test_authlimit` — the login rate limiter: per‑IP exponential backoff after a
   failure burst, delay expiry, success clearing the backoff, key independence,
   and the concurrent‑hash cap
+- `test_authstore` — the PBKDF2 hash round‑trip through the on‑loop lookup +
+  off‑loop verify split, agreement with `authstore_verify`, and rejection of
+  over‑long names / permission patterns
 - `test_fuzz_frame` — a deterministic fuzzer that drives the frame parser and
   the bounds‑checked field readers with 400k random + semi‑structured inputs,
   asserting the safety invariants (most valuable under `make test-asan`)
@@ -598,6 +606,11 @@ now refuses to reproduce.
 - `test_cluster.sh` — brings up a local 3‑node cluster, verifies a leader is
   elected, kills it, and verifies the surviving majority elects a new leader at
   a higher term (run directly: `bash tests/test_cluster.sh`)
+- `test_fault_storage.sh` — storage-layer fault injection: an `LD_PRELOAD` shim
+  (`tests/faultlib.c`) fails `fsync`/`write`/`rename` **only** on the cluster
+  WAL/snapshot files and asserts the node marks itself storage‑failed (the P0
+  fail‑stop) rather than trusting broken storage; a control run proves no false
+  positives (`make fault-test`)
 
 ### Integration tests (live broker)
 
@@ -621,12 +634,13 @@ make test-asan     # every unit test rebuilt + run under ASan + UBSan
 make tsan && ./build/beavermq   # ThreadSanitizer build; drive it with a client
 make fuzz && ./build/fuzz_frame -max_total_time=60   # libFuzzer (clang)
 make integration   # live AMQP + management API tests
+make fault-test    # storage-layer fault injection (WAL/snapshot fail-stop)
 bash tests/test_cluster.sh      # 3-node Raft election + failover
 ```
 
 All of these run in CI (`.github/workflows/ci.yml`): release unit tests,
-ASan/UBSan, Valgrind, the supervisor and cluster process tests, the integration
-suite, and a 60‑second libFuzzer run.
+ASan/UBSan, Valgrind, the supervisor / cluster / storage-fault process tests,
+the integration suite, and a 60‑second libFuzzer run.
 
 ---
 
