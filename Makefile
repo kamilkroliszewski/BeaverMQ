@@ -118,6 +118,13 @@ test: $(TEST_BINS) $(BIN)
 run: $(BIN)
 	@$(BIN)
 
+# End-to-end integration tests against a live broker (AMQP via pika + the
+# management HTTP API). Separate from `make test` because it needs python3
+# (and pika, which it installs into a venv or SKIPs if offline).
+.PHONY: integration
+integration: $(BIN)
+	@bash $(TEST_DIR)/integration/run.sh
+
 debug: OPT := -O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer
 debug: LDFLAGS += -fsanitize=address,undefined
 debug: clean all
@@ -126,6 +133,31 @@ debug: clean all
 tsan: OPT := -O1 -g -fsanitize=thread -fno-omit-frame-pointer
 tsan: LDFLAGS += -fsanitize=thread
 tsan: clean all
+
+# Build EVERY tests/*.c binary with ASan+UBSan and run them. The plain `test`
+# target runs the same binaries in release; this one turns any out-of-bounds
+# read / UB (e.g. in the frame fuzzer) into a hard failure. Used in CI.
+.PHONY: test-asan
+test-asan: OPT := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+test-asan: LDFLAGS += -fsanitize=address,undefined
+test-asan: clean $(TEST_BINS)
+	@echo "=== Running tests under ASan/UBSan ==="
+	@fail=0; for t in $(TEST_BINS); do \
+		echo "--- $$t (asan+ubsan) ---"; \
+		ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 $$t || fail=1; \
+	done; \
+	if [ $$fail -eq 0 ]; then echo "=== All sanitized tests passed ==="; \
+	else echo "=== Some sanitized tests FAILED ==="; exit 1; fi
+
+# Coverage-guided fuzzing of the frame parser via libFuzzer (clang only). Builds
+# a standalone fuzz binary; run it with an optional corpus dir + time budget:
+#   make fuzz && ./build/fuzz_frame -max_total_time=60
+.PHONY: fuzz
+fuzz: | $(BUILD_DIR)
+	@echo "  FUZZ  build/fuzz_frame"
+	@clang -D_GNU_SOURCE -DFUZZ_LIBFUZZER $(INCLUDES) \
+		-g -O1 -fsanitize=fuzzer,address,undefined \
+		$(TEST_DIR)/test_fuzz_frame.c $(SRC_DIR)/frame.c -o $(BUILD_DIR)/fuzz_frame
 
 clean:
 	@echo "  CLEAN"

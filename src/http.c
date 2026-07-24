@@ -17,6 +17,7 @@
 #include "protocol.h"
 #include "cluster.h"
 #include "authstore.h"
+#include "authlimit.h"
 #include "crypto.h"
 #include "logger.h"
 #include "version.h"
@@ -514,11 +515,27 @@ static int http_has_bootstrap_token(http_conn_t *c, const char *head, size_t hea
     return 0;
 }
 
+/* Resolve the client's IP (no port) into `out`, or "" if unavailable. Used as
+ * the authlimit key so all connections from one address share a backoff. */
+static void http_peer_ip(http_conn_t *c, char *out, size_t cap)
+{
+    if (cap) out[0] = '\0';
+    struct sockaddr_storage ss;
+    int len = (int)sizeof(ss);
+    if (uv_tcp_getpeername(&c->handle, (struct sockaddr *)&ss, &len) != 0)
+        return;
+    if (ss.ss_family == AF_INET)
+        uv_ip4_name((struct sockaddr_in *)&ss, out, cap);
+    else if (ss.ss_family == AF_INET6)
+        uv_ip6_name((struct sockaddr_in6 *)&ss, out, cap);
+}
+
 /* Authenticate the request against the authstore via HTTP Basic auth.
  * Returns: 3 = bootstrap window (valid X-Bootstrap-Token, no users yet),
  * 3 = bootstrap window, 2 = administrator, 1 = management (read-only),
  * 0 = no/bad credentials, -1 = authenticated but lacks any management tag
- * (caller answers 403, not 401). The authenticated username is copied into
+ * (caller answers 403, not 401), -2 = rate limited (caller answers 429 and no
+ * password hash was computed). The authenticated username is copied into
  * user_out ("" in the bootstrap window). While the store has NO users (first
  * boot), only a request carrying the bootstrap token can create the initial
  * admin; the moment a user exists, all management access requires real
@@ -551,7 +568,24 @@ static int mgmt_authenticate(http_conn_t *c, const char *head, size_t head_len,
             char *colon = strchr(plain, ':');
             if (!colon) return 0;
             *colon = '\0';
-            if (!authstore_verify(as, plain, colon + 1)) return 0;
+            /* Throttle expensive password hashing: an unauthenticated client
+             * that spams Basic auth from one IP is backed off, and a flood from
+             * many IPs is bounded by the global concurrent-hash cap. Both deny
+             * WITHOUT hashing (return -2 -> 429). */
+            char ip[64];
+            http_peer_ip(c, ip, sizeof ip);
+            uint64_t now_ms = uv_now(c->server->loop);
+            if (authlimit_retry_after_ms(ip, now_ms) > 0)
+                return -2;
+            if (authlimit_hash_begin() != 0)
+                return -2;
+            int verified = authstore_verify(as, plain, colon + 1);
+            authlimit_hash_end();
+            if (!verified) {
+                authlimit_record_failure(ip, now_ms);
+                return 0;
+            }
+            authlimit_record_success(ip);
             uint32_t tags = authstore_user_tags(as, plain);
             size_t ul = strlen(plain);
             if (user_cap) {
@@ -979,6 +1013,13 @@ static void handle_request(http_conn_t *c)
                                        auth_user, sizeof auth_user);
     if (auth_level == 0) {
         http_respond_401(c);
+        return;
+    }
+    if (auth_level == -2) {
+        /* Too many recent failed logins from this IP, or too many hashes in
+         * flight: shed load without spending a PBKDF2 hash on this request. */
+        http_respond_error(c, 429, "Too Many Requests",
+                           "rate limited; slow down and retry");
         return;
     }
     if (auth_level < 0) {

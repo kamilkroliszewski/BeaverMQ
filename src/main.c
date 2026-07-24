@@ -19,6 +19,7 @@
 #include "cluster.h"
 #include "config.h"
 #include "authstore.h"
+#include "authlimit.h"
 #include "crypto.h"
 #include "supervisor.h"
 #include "version.h"
@@ -694,6 +695,7 @@ int main(int argc, char **argv)
     config_resolve_threads(&app.config);
     log_set_level(app.config.log_level);
     queue_set_default_limits(app.config.queue_max_length, app.config.queue_max_bytes);
+    authlimit_init(); /* login rate limiter / concurrent-hash cap */
 
     LOG_INFO("BeaverMQ %s (build %s) starting up "
              "(%d worker thread%s, AMQP :%d, HTTP :%d)",

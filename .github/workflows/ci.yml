@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  APT_DEPS: build-essential libuv1-dev libjansson-dev
+
+jobs:
+  unit:
+    name: Unit tests (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y $APT_DEPS
+      - name: Build
+        run: make
+      - name: Unit tests
+        run: make test
+
+  sanitizers:
+    name: Unit tests (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y $APT_DEPS
+      - name: Unit tests under ASan/UBSan
+        run: make test-asan
+
+  valgrind:
+    name: Unit tests (Valgrind)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y $APT_DEPS valgrind
+      - name: Build test binaries (release)
+        run: make test   # builds AND runs the release unit tests
+      - name: Valgrind on unit test binaries
+        run: |
+          set -e
+          # Fast, allocation-focused suites only; the heavy ones (test_routing's
+          # 100k-message thread stress, test_fuzz_frame's 400k iterations) are
+          # covered by the ASan job instead - under Valgrind they would time out.
+          for t in build/test_frame build/test_logger build/test_authlimit; do
+            echo "--- valgrind $t ---"
+            valgrind --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite "$t"
+          done
+
+  process-tests:
+    name: Supervisor + cluster failover
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y $APT_DEPS curl
+      - name: Build
+        run: make
+      - name: Supervisor crash/respawn
+        run: bash tests/test_supervisor.sh
+      - name: Cluster leader election + failover
+        run: bash tests/test_cluster.sh
+
+  integration:
+    name: AMQP + management integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y $APT_DEPS curl python3 python3-pip python3-venv
+      - name: Build
+        run: make
+      - name: Integration suite (pika + management API)
+        run: make integration
+
+  fuzz:
+    name: Fuzz frame parser (libFuzzer, 60s)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y $APT_DEPS clang
+      - name: Build fuzzer
+        run: make fuzz
+      - name: Run fuzzer
+        run: ./build/fuzz_frame -max_total_time=60 -print_final_stats=1

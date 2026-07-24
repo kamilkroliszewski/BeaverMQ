@@ -8,13 +8,16 @@ RabbitMQ. Under the hood: an asynchronous `libuv` network core, an in‑memory
 routing engine, an embedded HTTP management API, and a modern Material‑Design
 web dashboard.
 
-- **Native AMQP 0‑9‑1** — byte‑for‑byte wire compatible: protocol handshake,
-  the exact method argument layouts, field tables, and the multi‑frame content
-  flow (method → content‑header → body). Works with off‑the‑shelf clients.
+- **Native AMQP 0‑9‑1** — a useful subset of the wire protocol: the handshake,
+  the method argument layouts, field tables, and the multi‑frame content flow
+  (method → content‑header → body), so off‑the‑shelf clients (pika, etc.)
+  interoperate. It is **not** a full RabbitMQ replacement — see
+  [The AMQP 0‑9‑1 protocol](#the-amqp-0-9-1-protocol) for what is and isn't
+  implemented.
 - **Multi‑threaded** — one `libuv` event loop per worker thread, each with a
   `SO_REUSEPORT` listener so the kernel load‑balances connections across CPU
-  cores. Worker count is configurable or auto‑detected. Verified race‑free
-  (ThreadSanitizer) and leak‑free (Valgrind).
+  cores. Worker count is configurable or auto‑detected. The covered paths are
+  exercised under ThreadSanitizer and Valgrind in CI (see [Testing](#testing)).
 - **Asynchronous & non‑blocking** — scales to thousands of concurrent
   connections per worker.
 - **Exchanges** — Direct, Fanout, and Topic (`*` / `#` wildcards), plus the
@@ -28,8 +31,9 @@ web dashboard.
   negotiated heartbeats (dead connections are detected and reaped).
 - **Management API + dashboard** — JSON REST API and a Vuetify SPA on port
   `15672`.
-- **Memory‑safe** — every module is verified leak‑free and race‑free under
-  Valgrind (`memcheck` + `helgrind`).
+- **Memory‑safety focus** — the unit tests run clean under AddressSanitizer,
+  UBSan and Valgrind, and the threaded paths under ThreadSanitizer, in CI. This
+  raises confidence but is not a proof of absolute leak/race freedom.
 
 ---
 
@@ -268,10 +272,12 @@ leader; bring it back and it rejoins and catches up automatically.
 
 > **Scope today:** leader election + failover, durable‑topology and
 > **persistent‑message** replication (publish to any node), on‑disk persistence
-> with crash recovery, and rejoin/catch‑up — all implemented and tested.
+> with crash recovery, log compaction (topology snapshot + WAL prefix drop),
+> rejoin/catch‑up, and **publisher confirms** (`Confirm.Select`): a persistent
+> publish is `Basic.Ack`‑ed only after it commits on a quorum, a transient one
+> as soon as it is routed.
 > *Not yet:* coordinated exactly‑once delivery across replicas (a message
-> replicated to 3 nodes is consumed independently per node), log compaction, and
-> publisher‑confirm‑after‑commit.
+> replicated to 3 nodes is consumed independently per node).
 
 ### Supervisor mode ("let it crash")
 
@@ -311,13 +317,14 @@ completely unmodified), and:
 | Heartbeat timeout        | `BEAVERMQ_SUPERVISOR_HEARTBEAT_TIMEOUT_MS` | 6000    |
 | Worker processes         | `BEAVERMQ_SUPERVISOR_WORKERS`              | 1       |
 
-> **`BEAVERMQ_SUPERVISOR_WORKERS` stays at 1 unless `cluster = on`.** Each
-> worker process is a completely independent broker with its own in‑memory
-> queues/exchanges — it is *not* the same thing as the worker **threads**
-> inside one process (those already share state safely). Running more than
-> one worker **process** without clustering would silently split your queue
-> namespace across uncoordinated processes behind the same port; the
-> supervisor refuses to start in that configuration.
+> **`BEAVERMQ_SUPERVISOR_WORKERS` must be 1.** Multiple worker **processes** are
+> unsupported and the supervisor refuses to start with more than one: the
+> supervisor gives every child an identical command line and environment (same
+> `node_id`, `data_dir`, WAL files and ports), so they would collide on the WAL
+> and ports and can corrupt persisted data — even with `cluster = on`, because
+> they are not distinct Raft nodes. Scale out with worker **threads** inside one
+> process (those share state safely), or run separate, properly‑configured
+> processes as distinct cluster nodes.
 
 Set `data_dir` (same config key the cluster's WAL uses) so `supervisor.pid`
 and `worker.pid` land somewhere predictable — useful for `kill -TERM $(cat
@@ -528,17 +535,28 @@ Implemented classes/methods (official AMQP 0‑9‑1 ids):
 | Exchange (40)    | Declare/DeclareOk                                         |
 | Queue (50)       | Declare/DeclareOk, Bind/BindOk                             |
 | Basic (60)       | Qos/QosOk, Consume/ConsumeOk, Cancel/CancelOk, Publish,    |
-|                  | Deliver, Get/GetOk/GetEmpty, Ack                          |
+|                  | Deliver, Get/GetOk/GetEmpty, Ack, Nack, Reject             |
+| Confirm (85)     | Select/SelectOk (publisher confirms)                      |
 
-The handshake authenticates with SASL `PLAIN` (accepted as‑is — no user store).
-Field tables (client capabilities, method `arguments`) are parsed safely.
-Layouts live in [`include/protocol.h`](include/protocol.h) /
-[`src/protocol.c`](src/protocol.c).
+The handshake authenticates with SASL `PLAIN` against the replicated user
+store (see [Access control](#access-control-vhosts-users-permissions)); logins
+are rate‑limited per client IP. Field tables (client capabilities, method
+`arguments`) are parsed safely. Layouts live in
+[`include/protocol.h`](include/protocol.h) / [`src/protocol.c`](src/protocol.c).
 
-> **Compatibility:** verified against the official `pika` client (and a
-> dependency‑free reference client in
-> [`tests/amqp_raw_client.py`](tests/amqp_raw_client.py)). Standard AMQP 0‑9‑1
-> clients connect, declare, publish and consume with no special configuration.
+**Not implemented / partial** (so clients don't assume more than is there):
+
+- `Basic.Qos` honours `prefetch-count`, but not `prefetch-size` or the `global`
+  flag.
+- The `mandatory` / `immediate` publish flags are parsed but do **not** produce
+  `Basic.Return` for unroutable messages.
+- No transactions (`Tx` class), and no coordinated exactly‑once delivery across
+  cluster replicas (a replicated message is consumed independently per node).
+
+> **Compatibility:** exercised in CI against the official `pika` client (see
+> [`tests/integration/test_amqp.py`](tests/integration/test_amqp.py)). Standard
+> AMQP 0‑9‑1 clients connect, declare, publish and consume — including publisher
+> confirms — with no special configuration.
 
 ---
 
@@ -564,45 +582,51 @@ now refuses to reproduce.
   every line from 8 threads × 300 messages arrives intact and unmangled
 - `test_routing` — message refcounting (incl. deep‑copy, not aliasing), the
   queue's FIFO order across a ring‑buffer regrow, `queue_set_default_limits`,
+  lossless internal requeue past a full queue, replicated‑drain byte accounting,
   direct/fanout/topic exchange routing (incl. binding dedup), and a
   100k‑message 4×4 producer/consumer stress test verified by both count *and*
   checksum (so a dropped message masked by a duplicate elsewhere can't hide)
+- `test_authlimit` — the login rate limiter: per‑IP exponential backoff after a
+  failure burst, delay expiry, success clearing the backoff, key independence,
+  and the concurrent‑hash cap
+- `test_fuzz_frame` — a deterministic fuzzer that drives the frame parser and
+  the bounds‑checked field readers with 400k random + semi‑structured inputs,
+  asserting the safety invariants (most valuable under `make test-asan`)
 - `test_supervisor.sh` — starts the broker under `--supervisor`, `SIGSEGV`s
   the worker, verifies it respawns while the supervisor survives, then
   verifies a clean exit on `SIGTERM` (see "Supervisor mode" above)
+- `test_cluster.sh` — brings up a local 3‑node cluster, verifies a leader is
+  elected, kills it, and verifies the surviving majority elects a new leader at
+  a higher term (run directly: `bash tests/test_cluster.sh`)
 
-### Python integration tests
+### Integration tests (live broker)
 
-Start the broker, then (from the `tests/` directory):
+`make integration` starts a real broker and runs, against it:
 
-```bash
-# Real AMQP client (the compatibility proof):
-pip install pika
-python3 test_amqp_pika.py        # pika: declare/publish/get/consume/ack, props
+- `tests/integration/test_amqp.py` — a **pika** client: connect + SASL PLAIN
+  auth, `Queue.Declare`, a publish→`Basic.Get` round‑trip, **publisher confirms**
+  (`Confirm.Select` → two `Basic.Ack`s), and ordered `Basic.Consume` delivery.
+- `tests/integration/test_management.py` — stdlib only: `healthz` is open,
+  the API demands credentials (401), correct ones work (200), and a wrong‑login
+  burst from one IP is rate‑limited (429).
 
-# Dependency-free AMQP reference client (no pip needed):
-python3 test_amqp_raw.py         # handshake, content frames, all exchange types,
-                                 # round-robin, requeue, 200 KB multi-frame body
+It installs `pika` into a throwaway venv, or SKIPs the AMQP client test with a
+clear message when offline; the stdlib management test always runs.
 
-python3 test_management.py       # the JSON API reflects live state
-python3 test_dashboard.py        # static dashboard is served correctly
-python3 stress_throughput.py     # fast producer + consumer (perf-test style)
-python3 stress_connections.py --count 5000   # connection concurrency stress
-```
-
-### Memory & race verification
-
-The multi‑threaded build is checked race‑free with **ThreadSanitizer** (which
-understands C11 atomics + pthreads) and leak‑free with **Valgrind**:
+### Sanitizers, fuzzing & CI
 
 ```bash
-# Zero data races: run under ThreadSanitizer, then drive it with the tests.
-make tsan && ./build/beavermq        # 0 data races, 0 warnings
-
-# Zero leaks/errors under memcheck (rebuild normal first):
-make && valgrind --leak-check=full --error-exitcode=99 ./build/beavermq
-# (drive with the tests above, then Ctrl-C)
+make test          # release unit tests + supervisor smoke test
+make test-asan     # every unit test rebuilt + run under ASan + UBSan
+make tsan && ./build/beavermq   # ThreadSanitizer build; drive it with a client
+make fuzz && ./build/fuzz_frame -max_total_time=60   # libFuzzer (clang)
+make integration   # live AMQP + management API tests
+bash tests/test_cluster.sh      # 3-node Raft election + failover
 ```
+
+All of these run in CI (`.github/workflows/ci.yml`): release unit tests,
+ASan/UBSan, Valgrind, the supervisor and cluster process tests, the integration
+suite, and a 60‑second libFuzzer run.
 
 ---
 

@@ -21,6 +21,7 @@
 #include "broker.h"
 #include "cluster.h"
 #include "authstore.h"
+#include "authlimit.h"
 #include "dispatch.h"
 #include "message.h"
 #include "logger.h"
@@ -60,6 +61,9 @@ typedef struct {
     uint16_t prefetch;   /* Basic.Qos prefetch-count; 0 = unlimited */
     get_unacked_t *get_unacked;
     size_t         n_get_unacked, cap_get_unacked;
+    int            confirm_mode; /* Confirm.Select seen: publishes are (n)acked */
+    uint64_t       confirm_seq;  /* last publisher delivery-tag assigned on this
+                                  * channel (the next is confirm_seq + 1) */
 } proto_chan_t;
 
 struct beaver_proto {
@@ -234,6 +238,8 @@ static int channel_add(beaver_proto_t *p, uint16_t ch)
     p->channels[p->n_channels].get_unacked     = NULL;
     p->channels[p->n_channels].n_get_unacked   = 0;
     p->channels[p->n_channels].cap_get_unacked = 0;
+    p->channels[p->n_channels].confirm_mode    = 0;
+    p->channels[p->n_channels].confirm_seq     = 0;
     p->n_channels++;
     return 1;
 }
@@ -339,6 +345,7 @@ typedef enum {
     PENDING_EXCHANGE_DECLARE_OK,
     PENDING_QUEUE_DECLARE_OK,
     PENDING_QUEUE_BIND_OK,
+    PENDING_PUBLISH_CONFIRM,  /* publisher confirm: Basic.Ack on commit, Nack on fail */
 } pending_kind_t;
 
 typedef struct pending_cluster_op {
@@ -351,6 +358,7 @@ typedef struct pending_cluster_op {
     pending_kind_t       kind;
     char                 qname[256];  /* PENDING_QUEUE_DECLARE_OK only */
     uint32_t             depth;
+    uint64_t             confirm_tag; /* PENDING_PUBLISH_CONFIRM only */
     uint64_t             deadline_ms;
     uv_timer_t           timer;
 } pending_cluster_op_t;
@@ -391,6 +399,21 @@ static void cancel_pending_ops(beaver_proto_t *p, int channel_filter)
     }
 }
 
+/* Send a publisher confirm (Basic.Ack, or Basic.Nack on failure) for a single
+ * delivery-tag on `channel`. Body: delivery-tag (u64) + a bits octet (bit 0 =
+ * multiple; for Nack bit 1 = requeue - always 0 here, one tag at a time). */
+static void send_publish_confirm(beaver_proto_t *p, uint16_t channel,
+                                 uint64_t tag, int nack)
+{
+    bmqp_buf_t a;
+    bmqp_buf_init(&a);
+    bmqp_buf_put_u64(&a, tag);
+    bmqp_buf_put_u8(&a, 0); /* multiple = 0 */
+    send_method(p, channel, BMQP_CLASS_BASIC,
+                nack ? BMQP_BASIC_NACK : BMQP_BASIC_ACK, &a);
+    bmqp_buf_free(&a);
+}
+
 static void pending_op_timer_cb(uv_timer_t *t)
 {
     pending_cluster_op_t *op = t->data;
@@ -407,6 +430,14 @@ static void pending_op_timer_cb(uv_timer_t *t)
     beaver_proto_t *p = op->p;
     uint16_t channel = op->channel;
     detach_pending_op(op);
+    /* A publisher confirm reports the outcome IN BAND (Basic.Ack/Nack) rather
+     * than as a channel exception, so the channel stays usable either way. */
+    if (op->kind == PENDING_PUBLISH_CONFIRM) {
+        send_publish_confirm(p, channel, op->confirm_tag,
+                             st != CL_PROPOSAL_COMMITTED /* nack on fail/timeout */);
+        uv_close((uv_handle_t *)&op->timer, pending_op_closed_cb);
+        return;
+    }
     if (st == CL_PROPOSAL_COMMITTED) {
         switch (op->kind) {
         case PENDING_EXCHANGE_DECLARE_OK:
@@ -426,6 +457,8 @@ static void pending_op_timer_cb(uv_timer_t *t)
         case PENDING_QUEUE_BIND_OK:
             send_method(p, channel, BMQP_CLASS_QUEUE, BMQP_QUEUE_BIND_OK, NULL);
             break;
+        case PENDING_PUBLISH_CONFIRM:
+            break; /* handled above */
         }
     } else {
         send_channel_close(p, channel, 541,
@@ -458,6 +491,35 @@ static void await_cluster_commit(beaver_proto_t *p, uint16_t channel, uint64_t s
     if (qname)
         snprintf(op->qname, sizeof(op->qname), "%s", qname);
     op->depth = depth;
+    uv_loop_t *loop = p->conn->handle.loop;
+    op->deadline_ms = uv_now(loop) + CLUSTER_WAIT_TIMEOUT_MS;
+    uv_timer_init(loop, &op->timer);
+    op->timer.data = op;
+    op->next = p->pending_ops;
+    p->pending_ops = op;
+    uv_timer_start(&op->timer, pending_op_timer_cb,
+                   CLUSTER_WAIT_POLL_MS, CLUSTER_WAIT_POLL_MS);
+}
+
+/* Register a poll that sends a publisher confirm (Basic.Ack) for `tag` once the
+ * cluster proposal `seq` commits, or a Basic.Nack if it is rejected / times
+ * out. On allocation failure we Nack immediately: the publish may still commit,
+ * but we can no longer track it, and a spurious Nack (client retries) is safer
+ * than silently never confirming. */
+static void await_publish_confirm(beaver_proto_t *p, uint16_t channel,
+                                  uint64_t seq, uint64_t tag)
+{
+    pending_cluster_op_t *op = calloc(1, sizeof(*op));
+    if (!op) {
+        send_publish_confirm(p, channel, tag, 1 /* nack */);
+        return;
+    }
+    op->p           = p;
+    op->cluster     = p->conn->server->cluster;
+    op->seq         = seq;
+    op->channel     = channel;
+    op->kind        = PENDING_PUBLISH_CONFIRM;
+    op->confirm_tag = tag;
     uv_loop_t *loop = p->conn->handle.loop;
     op->deadline_ms = uv_now(loop) + CLUSTER_WAIT_TIMEOUT_MS;
     uv_timer_init(loop, &op->timer);
@@ -665,6 +727,34 @@ static void put_table_str(bmqp_buf_t *t, const char *key, const char *val)
     bmqp_buf_put_longstr(t, val, strlen(val));
 }
 
+/* Append a boolean-valued field ('t') to a field table. */
+static void put_table_bool(bmqp_buf_t *t, const char *key, int val)
+{
+    bmqp_buf_put_shortstr(t, key);
+    bmqp_buf_put_u8(t, 't');                  /* field value type: boolean */
+    bmqp_buf_put_u8(t, val ? 1 : 0);
+}
+
+/* Append the "capabilities" field: a nested field table ('F') of booleans that
+ * clients (e.g. pika) inspect before using an extension. We advertise exactly
+ * what we implement: publisher confirms (Confirm.Select) and Basic.Nack. */
+static void put_capabilities(bmqp_buf_t *t)
+{
+    bmqp_buf_t caps;
+    bmqp_buf_init(&caps);
+    put_table_bool(&caps, "publisher_confirms", 1);
+    put_table_bool(&caps, "basic.nack", 1);
+    bmqp_buf_put_shortstr(t, "capabilities");
+    bmqp_buf_put_u8(t, 'F');                  /* field value type: field table */
+    if (!caps.error) {
+        bmqp_buf_put_u32(t, (uint32_t)caps.len);
+        bmqp_buf_put_bytes(t, caps.data, caps.len);
+    } else {
+        bmqp_buf_put_u32(t, 0);
+    }
+    bmqp_buf_free(&caps);
+}
+
 static void put_server_properties(bmqp_buf_t *a)
 {
     bmqp_buf_t t;
@@ -672,6 +762,7 @@ static void put_server_properties(bmqp_buf_t *a)
     put_table_str(&t, "product", "BeaverMQ");
     put_table_str(&t, "version", "1.0.0");
     put_table_str(&t, "platform", "C");
+    put_capabilities(&t);
     if (!t.error) {
         bmqp_buf_put_u32(a, (uint32_t)t.len);
         bmqp_buf_put_bytes(a, t.data, t.len);
@@ -768,12 +859,39 @@ static void handle_connection(beaver_proto_t *p, uint16_t channel,
                     "admin with 'beavermq add-user'");
                 return;
             }
-            if (!user[0] || !authstore_verify(as, user, pass)) {
+            /* Rate-limit password hashing (see authlimit): key on the client
+             * IP only (strip the ":port" from conn->peer) so all attempts from
+             * one address share a backoff. */
+            char ip[64];
+            copy_str(ip, sizeof ip, p->conn->peer, strlen(p->conn->peer));
+            char *last_colon = strrchr(ip, ':');
+            if (last_colon) *last_colon = '\0';
+            uint64_t now_ms = uv_now(p->conn->handle.loop);
+
+            if (!user[0]) {
+                authlimit_record_failure(ip, now_ms);
+                LOG_WARN("conn #%" PRIu64 ": auth FAILED (empty user)", p->conn->id);
+                send_connection_close(p, 403, "ACCESS_REFUSED - login refused");
+                return;
+            }
+            if (authlimit_retry_after_ms(ip, now_ms) > 0 ||
+                authlimit_hash_begin() != 0) {
+                LOG_WARN("conn #%" PRIu64 ": auth throttled for '%s' from %s",
+                         p->conn->id, user, ip);
+                send_connection_close(p, 403,
+                    "ACCESS_REFUSED - too many attempts; retry later");
+                return;
+            }
+            int verified = authstore_verify(as, user, pass);
+            authlimit_hash_end();
+            if (!verified) {
+                authlimit_record_failure(ip, now_ms);
                 LOG_WARN("conn #%" PRIu64 ": auth FAILED for user '%s'",
                          p->conn->id, user);
                 send_connection_close(p, 403, "ACCESS_REFUSED - login refused");
                 return;
             }
+            authlimit_record_success(ip);
             p->user_tags = authstore_user_tags(as, user);
         }
         copy_str(p->user, sizeof p->user, user, strlen(user));
@@ -1193,6 +1311,33 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
 }
 
 /* ========================================================================= */
+/* confirm class (publisher confirms)                                         */
+/* ========================================================================= */
+
+static void handle_confirm(beaver_proto_t *p, uint16_t channel,
+                           uint16_t method, bmqp_reader_t *r)
+{
+    if (!require_channel(p, channel))
+        return;
+    if (method != BMQP_CONFIRM_SELECT) {
+        proto_fatal(p, "unsupported confirm method %u", method);
+        return;
+    }
+    uint8_t nowait = bmqp_read_u8(r) & 0x01;
+    if (r->error) {
+        proto_fatal(p, "malformed Confirm.Select");
+        return;
+    }
+    proto_chan_t *ch = channel_find(p, channel);
+    if (ch)
+        ch->confirm_mode = 1; /* subsequent publishes are (n)acked */
+    LOG_INFO("conn #%" PRIu64 " ch=%u: Confirm.Select (publisher confirms on)",
+             p->conn->id, channel);
+    if (!nowait)
+        send_method(p, channel, BMQP_CLASS_CONFIRM, BMQP_CONFIRM_SELECT_OK, NULL);
+}
+
+/* ========================================================================= */
 /* basic class                                                                */
 /* ========================================================================= */
 
@@ -1583,14 +1728,33 @@ static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
         return;
     }
 
+    /* Publisher confirms (RabbitMQ's Confirm.Select): once a channel is in
+     * confirm mode, every successful publish is answered with a Basic.Ack -
+     * IMMEDIATELY for a transient message that is routed locally, or only after
+     * the cluster COMMITS it on a quorum for a persistent (replicated) one, so
+     * the publisher can tell durably-committed from merely-accepted. */
+    proto_chan_t *pubch = channel_find(p, p->pub_channel);
+    int confirm = pubch && pubch->confirm_mode;
+
     /* Persistent messages are replicated through the cluster (forwarded to the
      * leader, committed on a majority, then applied/enqueued on EVERY node).
      * We must NOT also route locally, or the origin node would enqueue twice. */
     int replicated = 0;
     if (srv->cluster && props_is_persistent(p->pub_props, p->pub_props_len)) {
-        replicated = cluster_replicate_publish(srv->cluster, p->vhost,
-                         p->pub_exchange, p->pub_routing_key, body, body_len,
-                         p->pub_props, p->pub_props_len) == 0;
+        if (confirm) {
+            /* Track the proposal so the confirm follows the actual commit. */
+            uint64_t seq = cluster_replicate_publish_tracked(srv->cluster,
+                              p->vhost, p->pub_exchange, p->pub_routing_key,
+                              body, body_len, p->pub_props, p->pub_props_len);
+            replicated = seq != 0;
+            if (replicated)
+                await_publish_confirm(p, p->pub_channel, seq,
+                                      ++pubch->confirm_seq);
+        } else {
+            replicated = cluster_replicate_publish(srv->cluster, p->vhost,
+                             p->pub_exchange, p->pub_routing_key, body, body_len,
+                             p->pub_props, p->pub_props_len) == 0;
+        }
         /* Flow control: if the cluster is congested, pause this producer's reads
          * (TCP backpressure) so it can't outrun durable replication. */
         if (replicated && cluster_should_throttle(srv->cluster))
@@ -1599,7 +1763,8 @@ static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
             /* Proposals are buffered even without a live leader, so this only
              * fails on OOM / oversized names. NEVER route a persistent message
              * locally instead - the replicas would silently diverge from the
-             * origin node. Tell the client so it can retry. */
+             * origin node. Tell the client so it can retry (a channel exception
+             * also implicitly nacks any outstanding confirms). */
             send_channel_close(p, p->pub_channel, 506,
                                "RESOURCE_ERROR - cannot replicate publish; retry",
                                BMQP_CLASS_BASIC, BMQP_BASIC_PUBLISH);
@@ -1618,6 +1783,9 @@ static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
         }
         broker_route(srv->broker, p->vhost, msg);
         message_unref(msg);
+        /* Transient publish: nothing to wait for, confirm right away. */
+        if (confirm)
+            send_publish_confirm(p, p->pub_channel, ++pubch->confirm_seq, 0);
     }
     proto_advance(p, BMQP_STATE_ACTIVE);
     /* Hot path: keep at DEBUG so high-throughput publishing isn't throttled by
@@ -1651,6 +1819,7 @@ static void handle_method(beaver_proto_t *p, uint16_t channel,
     case BMQP_CLASS_EXCHANGE:   handle_exchange(p, channel, method_id, &r);   break;
     case BMQP_CLASS_QUEUE:      handle_queue(p, channel, method_id, &r);      break;
     case BMQP_CLASS_BASIC:      handle_basic(p, channel, method_id, &r);      break;
+    case BMQP_CLASS_CONFIRM:    handle_confirm(p, channel, method_id, &r);    break;
     default:
         proto_fatal(p, "unknown method class %u", class_id);
     }
