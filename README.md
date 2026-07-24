@@ -268,10 +268,12 @@ leader; bring it back and it rejoins and catches up automatically.
 
 > **Scope today:** leader election + failover, durable‑topology and
 > **persistent‑message** replication (publish to any node), on‑disk persistence
-> with crash recovery, and rejoin/catch‑up — all implemented and tested.
+> with crash recovery, log compaction (topology snapshot + WAL prefix drop),
+> rejoin/catch‑up, and **publisher confirms** (`Confirm.Select`): a persistent
+> publish is `Basic.Ack`‑ed only after it commits on a quorum, a transient one
+> as soon as it is routed.
 > *Not yet:* coordinated exactly‑once delivery across replicas (a message
-> replicated to 3 nodes is consumed independently per node), log compaction, and
-> publisher‑confirm‑after‑commit.
+> replicated to 3 nodes is consumed independently per node).
 
 ### Supervisor mode ("let it crash")
 

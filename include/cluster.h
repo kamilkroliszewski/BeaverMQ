@@ -514,6 +514,15 @@ int cluster_replicate_publish(cluster_node_t *n, const char *vhost,
                               const void *body, size_t body_len,
                               const void *props, size_t props_len);
 
+/* Like cluster_replicate_publish(), but returns a nonzero `seq` to poll with
+ * cluster_proposal_status() so a publisher confirm (Basic.Ack) can be sent only
+ * once the message COMMITS on a quorum. Returns 0 on outright failure (OOM /
+ * oversized names / no reachable leader path). */
+uint64_t cluster_replicate_publish_tracked(cluster_node_t *n, const char *vhost,
+                              const char *exchange, const char *routing_key,
+                              const void *body, size_t body_len,
+                              const void *props, size_t props_len);
+
 /* Replicate a queue's consume watermark so every node drains its replica copies
  * of messages with cluster_id <= watermark. Returns 0 if accepted. */
 int cluster_replicate_consume(cluster_node_t *n, const char *vhost,

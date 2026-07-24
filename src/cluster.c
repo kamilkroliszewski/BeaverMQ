@@ -3430,19 +3430,23 @@ uint64_t cluster_replicate_bind(cluster_node_t *n, const char *vhost,
     return cluster_propose_tracked(n, CL_OP_BIND, buf, (size_t)(p - buf));
 }
 
-int cluster_replicate_publish(cluster_node_t *n, const char *vhost,
-                              const char *exchange, const char *routing_key,
-                              const void *body, size_t body_len,
-                              const void *props, size_t props_len)
+/* Encode a PUBLISH op payload into a malloc'd buffer (caller frees), returning
+ * its length in *out_len, or NULL on OOM / oversized names. Shared by the
+ * tracked and untracked replicate-publish entry points. */
+static uint8_t *encode_publish_op(const char *vhost, const char *exchange,
+                                  const char *routing_key,
+                                  const void *body, size_t body_len,
+                                  const void *props, size_t props_len,
+                                  size_t *out_len)
 {
     if (strlen(vhost) > 250 || strlen(exchange) > 250 || strlen(routing_key) > 250)
-        return -1;
+        return NULL;
     /* vhost + exchange + rk (shortstr) | props (u32+bytes) | body (u32+bytes) */
     size_t need = (2 + strlen(vhost)) + (2 + strlen(exchange)) +
                   (2 + strlen(routing_key)) + (4 + props_len) + (4 + body_len);
     uint8_t *buf = malloc(need);
     if (!buf)
-        return -1;
+        return NULL;
     uint8_t *p = buf;
     wr_str(&p, vhost);
     wr_str(&p, exchange);
@@ -3451,9 +3455,38 @@ int cluster_replicate_publish(cluster_node_t *n, const char *vhost,
     if (props_len) { memcpy(p, props, props_len); p += props_len; }
     put_be32(p, (uint32_t)body_len);  p += 4;
     if (body_len)  { memcpy(p, body, body_len);   p += body_len; }
-    int rc = cluster_propose(n, CL_OP_PUBLISH, buf, (size_t)(p - buf));
+    *out_len = (size_t)(p - buf);
+    return buf;
+}
+
+int cluster_replicate_publish(cluster_node_t *n, const char *vhost,
+                              const char *exchange, const char *routing_key,
+                              const void *body, size_t body_len,
+                              const void *props, size_t props_len)
+{
+    size_t len = 0;
+    uint8_t *buf = encode_publish_op(vhost, exchange, routing_key, body,
+                                     body_len, props, props_len, &len);
+    if (!buf)
+        return -1;
+    int rc = cluster_propose(n, CL_OP_PUBLISH, buf, len);
     free(buf);
     return rc;
+}
+
+uint64_t cluster_replicate_publish_tracked(cluster_node_t *n, const char *vhost,
+                              const char *exchange, const char *routing_key,
+                              const void *body, size_t body_len,
+                              const void *props, size_t props_len)
+{
+    size_t len = 0;
+    uint8_t *buf = encode_publish_op(vhost, exchange, routing_key, body,
+                                     body_len, props, props_len, &len);
+    if (!buf)
+        return 0;
+    uint64_t seq = cluster_propose_tracked(n, CL_OP_PUBLISH, buf, len);
+    free(buf);
+    return seq;
 }
 
 int cluster_replicate_consume(cluster_node_t *n, const char *vhost,

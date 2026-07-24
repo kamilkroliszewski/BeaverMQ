@@ -40,6 +40,7 @@ typedef struct beaver_proto beaver_proto_t;
 #define BMQP_CLASS_EXCHANGE   40
 #define BMQP_CLASS_QUEUE      50
 #define BMQP_CLASS_BASIC      60
+#define BMQP_CLASS_CONFIRM    85
 
 /* ---- connection methods (class 10) --------------------------------------- */
 #define BMQP_CONNECTION_START     10  /* S->C */
@@ -79,9 +80,13 @@ typedef struct beaver_proto beaver_proto_t;
 #define BMQP_BASIC_GET         70  /* C->S */
 #define BMQP_BASIC_GET_OK      71  /* S->C */
 #define BMQP_BASIC_GET_EMPTY   72  /* S->C */
-#define BMQP_BASIC_ACK         80  /* C->S */
+#define BMQP_BASIC_ACK         80  /* C->S, and S->C for publisher confirms */
 #define BMQP_BASIC_REJECT      90  /* C->S */
-#define BMQP_BASIC_NACK       120  /* C->S (RabbitMQ extension) */
+#define BMQP_BASIC_NACK       120  /* C->S, and S->C for publisher confirms */
+
+/* ---- confirm methods (class 85; publisher confirms) ---------------------- */
+#define BMQP_CONFIRM_SELECT     10  /* C->S */
+#define BMQP_CONFIRM_SELECT_OK  11  /* S->C */
 
 /* ---- queue/exchange flag bits (in the u8 flags argument) ----------------- */
 #define BMQP_FLAG_PASSIVE      0x01
