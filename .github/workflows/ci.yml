@@ -1,21 +1,29 @@
 name: CI
 
+# Runs inside a debian:13 (Trixie) container so the toolchain matches the
+# development/target environment - in particular libuv >= 1.49, which provides
+# UV_TCP_REUSEPORT (Ubuntu 24.04's libuv 1.48 does not, so a plain ubuntu-latest
+# runner fails to build src/net.c).
+
 on:
   push:
     branches: ["**"]
   pull_request:
 
 env:
-  APT_DEPS: build-essential libuv1-dev libjansson-dev
+  # Base packages every job needs (git + certs so actions/checkout works in the
+  # container; the build toolchain and library headers).
+  BASE_DEPS: build-essential git ca-certificates libuv1-dev libjansson-dev
 
 jobs:
   unit:
     name: Unit tests (release)
     runs-on: ubuntu-latest
+    container: debian:13
     steps:
-      - uses: actions/checkout@v4
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y $APT_DEPS
+        run: apt-get update && apt-get install -y $BASE_DEPS
+      - uses: actions/checkout@v4
       - name: Build
         run: make
       - name: Unit tests
@@ -24,20 +32,22 @@ jobs:
   sanitizers:
     name: Unit tests (ASan + UBSan)
     runs-on: ubuntu-latest
+    container: debian:13
     steps:
-      - uses: actions/checkout@v4
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y $APT_DEPS
+        run: apt-get update && apt-get install -y $BASE_DEPS
+      - uses: actions/checkout@v4
       - name: Unit tests under ASan/UBSan
         run: make test-asan
 
   valgrind:
     name: Unit tests (Valgrind)
     runs-on: ubuntu-latest
+    container: debian:13
     steps:
-      - uses: actions/checkout@v4
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y $APT_DEPS valgrind
+        run: apt-get update && apt-get install -y $BASE_DEPS valgrind
+      - uses: actions/checkout@v4
       - name: Build test binaries (release)
         run: make test   # builds AND runs the release unit tests
       - name: Valgrind on unit test binaries
@@ -54,10 +64,11 @@ jobs:
   process-tests:
     name: Supervisor + cluster failover
     runs-on: ubuntu-latest
+    container: debian:13
     steps:
-      - uses: actions/checkout@v4
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y $APT_DEPS curl
+        run: apt-get update && apt-get install -y $BASE_DEPS curl procps
+      - uses: actions/checkout@v4
       - name: Build
         run: make
       - name: Supervisor crash/respawn
@@ -70,12 +81,13 @@ jobs:
   integration:
     name: AMQP + management integration
     runs-on: ubuntu-latest
+    container: debian:13
     steps:
-      - uses: actions/checkout@v4
       - name: Install deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y $APT_DEPS curl python3 python3-pip python3-venv
+          apt-get update
+          apt-get install -y $BASE_DEPS curl python3 python3-pip python3-venv
+      - uses: actions/checkout@v4
       - name: Build
         run: make
       - name: Integration suite (pika + management API)
@@ -84,10 +96,11 @@ jobs:
   fuzz:
     name: Fuzz frame parser (libFuzzer, 60s)
     runs-on: ubuntu-latest
+    container: debian:13
     steps:
-      - uses: actions/checkout@v4
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y $APT_DEPS clang
+        run: apt-get update && apt-get install -y $BASE_DEPS clang
+      - uses: actions/checkout@v4
       - name: Build fuzzer
         run: make fuzz
       - name: Run fuzzer
