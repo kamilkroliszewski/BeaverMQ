@@ -245,7 +245,12 @@ static void chan_release_get_unacked(proto_chan_t *pc)
 {
     for (size_t i = 0; i < pc->n_get_unacked; i++) {
         get_unacked_t *g = &pc->get_unacked[i];
-        queue_enqueue(g->queue, g->msg);
+        /* Internal requeue: bypass publisher caps so a full queue cannot drop
+         * an unacked Basic.Get delivery as the channel tears down. */
+        if (queue_requeue_internal(g->queue, g->msg) != 0)
+            LOG_ERROR("OOM requeuing unacked Basic.Get message on channel "
+                      "teardown (queue=%s): message dropped",
+                      queue_name(g->queue));
         message_unref(g->msg);
         queue_unref(g->queue);
     }
@@ -301,9 +306,13 @@ static size_t chan_get_unacked_settle(proto_chan_t *pc, uint64_t delivery_tag,
             continue;
         }
         get_unacked_t g = pc->get_unacked[i];
-        if (requeue)
-            queue_enqueue(g.queue, g.msg);
-        else
+        if (requeue) {
+            /* Internal requeue: bypass publisher caps so a reject/nack onto a
+             * full queue cannot silently drop the message. */
+            if (queue_requeue_internal(g.queue, g.msg) != 0)
+                LOG_ERROR("OOM requeuing rejected Basic.Get message "
+                          "(queue=%s): message dropped", queue_name(g.queue));
+        } else
             queue_consume_on_ack(g.queue, g.msg->cluster_id);
         message_unref(g.msg);
         queue_unref(g.queue);

@@ -466,11 +466,16 @@ static int b64_val(int ch)
 }
 static size_t b64_decode(const char *in, size_t inlen, char *out, size_t outcap)
 {
-    size_t o = 0; int acc = 0, bits = 0;
+    /* acc is unsigned and masked to its meaningful low bits: the old signed
+     * `int acc` was left-shifted every iteration without ever clearing the high
+     * bits, so on a long (attacker-controlled) Authorization header the shift
+     * eventually overflowed a signed int - undefined behaviour. At most bits+6
+     * (<= 13) bits are ever live, so a 24-bit mask is always safe. */
+    size_t o = 0; uint32_t acc = 0; int bits = 0;
     for (size_t i = 0; i < inlen && in[i] != '='; i++) {
         int v = b64_val((unsigned char)in[i]);
         if (v < 0) return 0;
-        acc = (acc << 6) | v; bits += 6;
+        acc = ((acc << 6) | (uint32_t)v) & 0xFFFFFFu; bits += 6;
         if (bits >= 8) {
             bits -= 8;
             if (o + 1 >= outcap) return 0;
@@ -511,11 +516,14 @@ static int http_has_bootstrap_token(http_conn_t *c, const char *head, size_t hea
 
 /* Authenticate the request against the authstore via HTTP Basic auth.
  * Returns: 3 = bootstrap window (valid X-Bootstrap-Token, no users yet),
- * 2 = administrator, 1 = valid non-admin user, 0 = no/bad credentials. The
- * authenticated username is copied into user_out ("" in the bootstrap
- * window). While the store has NO users (first boot), only a request
- * carrying the bootstrap token can create the initial admin; the moment a
- * user exists, all management access requires real credentials. */
+ * 3 = bootstrap window, 2 = administrator, 1 = management (read-only),
+ * 0 = no/bad credentials, -1 = authenticated but lacks any management tag
+ * (caller answers 403, not 401). The authenticated username is copied into
+ * user_out ("" in the bootstrap window). While the store has NO users (first
+ * boot), only a request carrying the bootstrap token can create the initial
+ * admin; the moment a user exists, all management access requires real
+ * credentials AND the administrator or management tag - a plain authenticated
+ * user with neither tag gets no access to the management API. */
 static int mgmt_authenticate(http_conn_t *c, const char *head, size_t head_len,
                              char *user_out, size_t user_cap)
 {
@@ -551,7 +559,9 @@ static int mgmt_authenticate(http_conn_t *c, const char *head, size_t head_len,
                 memcpy(user_out, plain, ul);
                 user_out[ul] = '\0';
             }
-            return (tags & AUTH_TAG_ADMINISTRATOR) ? 2 : 1;
+            if (tags & AUTH_TAG_ADMINISTRATOR) return 2; /* full management */
+            if (tags & AUTH_TAG_MANAGEMENT)    return 1; /* read-only management */
+            return -1; /* authenticated but no management tag: forbidden */
         }
     }
     return 0;
@@ -763,6 +773,10 @@ static int mgmt_name_ok(const char *s)
 {
     if (!s || !s[0])
         return 0;
+    /* Reject at the door what the authstore would reject anyway, so the client
+     * gets a clean 400 instead of the name silently failing to apply later. */
+    if (strlen(s) >= AUTHSTORE_NAME_MAX)
+        return 0;
     for (; *s; s++)
         if ((unsigned char)*s < 0x20 || (unsigned char)*s == 0x7f)
             return 0;
@@ -786,11 +800,24 @@ static size_t url_decode(char *s)
     return (size_t)(o - s);
 }
 
+/* Parse a comma/space/semicolon separated tag list, matching each token
+ * EXACTLY. The old code used strstr(), so "not-administrator" or "xmanagement"
+ * granted the corresponding privilege - a token-boundary bug that could elevate
+ * a user beyond what was intended. */
 static uint32_t parse_tags(const char *s)
 {
     uint32_t t = 0;
-    if (s && strstr(s, "administrator")) t |= AUTH_TAG_ADMINISTRATOR;
-    if (s && strstr(s, "management"))    t |= AUTH_TAG_MANAGEMENT;
+    if (!s) return 0;
+    while (*s) {
+        while (*s == ',' || *s == ' ' || *s == '\t' || *s == ';') s++;
+        const char *start = s;
+        while (*s && *s != ',' && *s != ' ' && *s != '\t' && *s != ';') s++;
+        size_t len = (size_t)(s - start);
+        if (len == 13 && strncmp(start, "administrator", 13) == 0)
+            t |= AUTH_TAG_ADMINISTRATOR;
+        else if (len == 10 && strncmp(start, "management", 10) == 0)
+            t |= AUTH_TAG_MANAGEMENT;
+    }
     return t;
 }
 
@@ -849,9 +876,15 @@ static int handle_mgmt(http_conn_t *c, const char *method, const char *path,
         const char *cf   = j ? jstr(j,"configure",".*") : ".*";
         const char *wr   = j ? jstr(j,"write",".*") : ".*";
         const char *rd   = j ? jstr(j,"read",".*") : ".*";
-        int rc = (user[0] && vh[0]) ? cfg_apply(h, CFG_SET_PERM, user, vh, cf, wr, rd, 0) : -1;
+        /* Reject over-long names/patterns at the door so they are never
+         * truncated into a different policy than the caller sent. */
+        int rc = -1;
+        if (mgmt_name_ok(user) && mgmt_name_ok(vh) &&
+            strlen(cf) < AUTHSTORE_REGEX_MAX && strlen(wr) < AUTHSTORE_REGEX_MAX &&
+            strlen(rd) < AUTHSTORE_REGEX_MAX)
+            rc = cfg_apply(h, CFG_SET_PERM, user, vh, cf, wr, rd, 0);
         if (j) json_decref(j);
-        respond_cfg_result(c, rc, "missing 'user'/'vhost'");
+        respond_cfg_result(c, rc, "missing/invalid 'user'/'vhost'/pattern");
         return 1;
     }
     if (is_del && strncmp(path, "/api/vhosts/", 12) == 0) {
@@ -946,6 +979,13 @@ static void handle_request(http_conn_t *c)
                                        auth_user, sizeof auth_user);
     if (auth_level == 0) {
         http_respond_401(c);
+        return;
+    }
+    if (auth_level < 0) {
+        /* Valid credentials, but the user has neither the administrator nor the
+         * management tag: deny outright (403) rather than expose the API. */
+        http_respond_error(c, 403, "Forbidden",
+                           "administrator or management tag required");
         return;
     }
 

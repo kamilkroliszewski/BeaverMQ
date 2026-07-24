@@ -132,6 +132,65 @@ static void test_queue_default_limits(void)
     queue_set_default_limits(0, 0);
 }
 
+/* Regression: queue_drain_consumed() must decrement total_bytes so a replica
+ * that drains consumed messages does not keep counting their bytes against
+ * queue_max_bytes and spuriously reject later enqueues (audit 3.1). */
+static void test_queue_drain_frees_bytes(void)
+{
+    TEST_SECTION("queue_drain_consumed frees total_bytes so max_bytes recovers");
+    queue_set_default_limits(0, 4); /* at most 4 bytes queued at once */
+    beaver_queue_t *q = queue_new("qdrain", 0);
+
+    beaver_message_t *m1 = message_new("", "", "abcd", 4); /* 4 bytes: exactly full */
+    m1->cluster_id = 1;
+    CHECK_EQ(queue_enqueue(q, m1), 0);
+    CHECK_EQ(queue_depth(q), 1);
+
+    /* A second message must be rejected while the first still occupies the cap. */
+    beaver_message_t *reject = message_new("", "", "x", 1);
+    reject->cluster_id = 2;
+    CHECK_EQ(queue_enqueue(q, reject), QUEUE_FULL);
+    message_unref(reject);
+
+    /* Drain everything consumed up to cluster_id 1: depth AND bytes must clear. */
+    CHECK_EQ(queue_drain_consumed(q, 1), 1);
+    CHECK_EQ(queue_depth(q), 0);
+
+    /* If total_bytes was correctly decremented, a fresh 4-byte enqueue fits;
+     * the old bug left 4 "phantom" bytes charged and this returned QUEUE_FULL. */
+    beaver_message_t *m2 = message_new("", "", "wxyz", 4);
+    m2->cluster_id = 3;
+    CHECK_EQ(queue_enqueue(q, m2), 0);
+    CHECK_EQ(queue_depth(q), 1);
+
+    message_unref(m1); message_unref(m2);
+    queue_unref(q);
+    queue_set_default_limits(0, 0);
+}
+
+/* Regression: an internal requeue (nack/reject/disconnect) must never be
+ * dropped just because the queue hit its publisher-facing limit - otherwise a
+ * full queue silently loses in-flight messages on requeue (audit 2.2). */
+static void test_queue_requeue_bypasses_limits(void)
+{
+    TEST_SECTION("queue_requeue_internal ignores length/byte caps (lossless)");
+    queue_set_default_limits(1, 0); /* at most 1 message via the publisher path */
+    beaver_queue_t *q = queue_new("qrequeue", 0);
+
+    beaver_message_t *m1 = message_new("", "", "a", 1);
+    beaver_message_t *m2 = message_new("", "", "b", 1);
+    CHECK_EQ(queue_enqueue(q, m1), 0);
+    CHECK_EQ(queue_enqueue(q, m2), QUEUE_FULL); /* publisher path is capped at 1 */
+
+    /* The internal requeue path must still accept m2, growing past the cap. */
+    CHECK_EQ(queue_requeue_internal(q, m2), 0);
+    CHECK_EQ(queue_depth(q), 2);
+
+    message_unref(m1); message_unref(m2);
+    queue_unref(q);
+    queue_set_default_limits(0, 0);
+}
+
 /* ---- exchange: direct / fanout / topic ------------------------------------ */
 
 static void free_route_result(beaver_queue_t **arr, size_t n)
@@ -345,6 +404,8 @@ int main(void)
     test_queue_fifo_order();
     test_queue_purge();
     test_queue_default_limits();
+    test_queue_drain_frees_bytes();
+    test_queue_requeue_bypasses_limits();
     test_exchange_type_name_roundtrip();
     test_exchange_direct_routing();
     test_exchange_fanout_routing_and_dedup();

@@ -1,18 +1,21 @@
 /*
- * cluster.c - 3-node Raft consensus + mesh transport for BeaverMQ.
+ * cluster.c - Raft consensus + mesh transport for BeaverMQ.
  *
- * This file currently implements the CONTROL-PLANE TRANSPORT and DISCOVERY:
+ * CONTROL-PLANE TRANSPORT and DISCOVERY:
  *   - the fixed 16-byte big-endian frame codec + CRC32,
  *   - the fully-meshed TCP layer: each node listens and dials its peers
  *     (lower id dials higher id, so each pair has exactly one connection),
  *     with HELLO/HELLO_ACK handshake and capped exponential-backoff reconnect,
  *   - the election / heartbeat libuv timers (armed and randomized).
  *
- * The Raft DECISION logic (PreVote, RequestVote, AppendEntries, commit advance,
- * apply-to-broker) is deliberately left as clearly marked `TODO (phase 2)`
- * stubs: shipping a plausible-but-unproven consensus core is worse than none.
- * The structures and the wire are in place so phase 2 is purely filling in the
- * state-machine handlers - no transport rework.
+ * RAFT DECISION logic is implemented in this file: PreVote/RequestVote,
+ * AppendEntries (replication + conflict truncation), commit advancement, apply-
+ * to-broker/authstore, log compaction with a topology snapshot, and snapshot
+ * state transfer to re-seed a wiped node. Persistence (WAL + meta + snapshot)
+ * is fail-stop: a write/fsync failure marks the node storage_failed, which
+ * steps it down and blocks publishes rather than acking data the disk lost.
+ * NOTE: this consensus core is not yet backed by a partition/fault-injection
+ * test suite - treat production durability claims accordingly.
  *
  * THREADING: everything here runs on the single dedicated cluster loop, so the
  * Raft state needs no locks. The only cross-thread surface is the atomics the
@@ -427,18 +430,33 @@ static void persist_write_flush(cluster_node_t *n)
     ps->wbuf_len = 0;
 }
 
-static void persist_append(cluster_node_t *n, const cluster_log_entry_t *e)
+/* Buffer one log entry for durable persistence. Returns 0 on success, or -1 if
+ * the entry could NOT be recorded (no persistence configured is treated as
+ * success; a real OOM growing the offset table or write buffer is a failure).
+ * On a real failure the node is marked storage_failed so it stops advancing the
+ * durable index, steps down if leader and rejects publishes - a controlled
+ * fail-stop is safer than silently keeping an entry the WAL never captured. */
+static int persist_append(cluster_node_t *n, const cluster_log_entry_t *e)
 {
     cl_persist_t *ps = n->persist;
-    if (!ps || ps->log_fd < 0) return;
-    if (off_ensure(ps, e->index - ps->base_index) != 0) return;
+    if (!ps || ps->log_fd < 0) return 0; /* persistence disabled: not a failure */
+    if (off_ensure(ps, e->index - ps->base_index) != 0) {
+        storage_write_failed(n, "persist_append (offset table OOM)");
+        return -1;
+    }
 
     size_t need = CL_REC_HDR + e->len;
     if (ps->wbuf_len + need > ps->wbuf_cap) {
         size_t nc = ps->wbuf_cap ? ps->wbuf_cap : (256u * 1024u);
         while (nc < ps->wbuf_len + need) nc *= 2;
         uint8_t *nb = realloc(ps->wbuf, nc);
-        if (!nb) { persist_write_flush(n); if (need > ps->wbuf_cap) return; }
+        if (!nb) {
+            persist_write_flush(n);
+            if (need > ps->wbuf_cap) {
+                storage_write_failed(n, "persist_append (write buffer OOM)");
+                return -1;
+            }
+        }
         else { ps->wbuf = nb; ps->wbuf_cap = nc; }
     }
     uint8_t *w = ps->wbuf + ps->wbuf_len;
@@ -453,6 +471,7 @@ static void persist_append(cluster_node_t *n, const cluster_log_entry_t *e)
     /* Bytes sit in wbuf until a batch boundary flushes them to the page cache;
      * fsync is async (persist_sync on a timer). Durability comes primarily from
      * REPLICATION (a majority holds the entry in RAM), like quorum queues. */
+    return 0;
 }
 
 static void persist_sync(cluster_node_t *n)
@@ -522,7 +541,13 @@ static void topo_add(cluster_node_t *n, uint32_t op, const void *data, uint32_t 
         size_t nc = n->topo_cap ? n->topo_cap : 256;
         while (nc < need) nc *= 2;
         uint8_t *nb = realloc(n->topo, nc);
-        if (!nb) return;
+        if (!nb) {
+            /* The snapshot's accumulated topology would silently lose this
+             * declare/bind/user, so a later snapshot could look complete while
+             * missing objects that recovery cannot rebuild. Fail-stop instead. */
+            storage_write_failed(n, "topo_add (topology snapshot OOM)");
+            return;
+        }
         n->topo = nb; n->topo_cap = nc;
     }
     put_be32(n->topo + n->topo_len, op);
@@ -607,7 +632,9 @@ static int snapshot_write(cluster_node_t *n, uint64_t base_index,
     char tmp[600], dst[600];
     snprintf(tmp, sizeof tmp, "%s/cluster-%d.snap.tmp", ps->dir, ps->self_id);
     snprintf(dst, sizeof dst, "%s/cluster-%d.snap", ps->dir, ps->self_id);
-    int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    /* 0600: the snapshot holds topology, permission regexes and password
+     * hashes - readable only by the broker's own user. */
+    int fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0600);
     int ok = fd >= 0 && write_all(fd, buf, head_len) == 0;
     free(buf);
 
@@ -626,9 +653,18 @@ static int snapshot_write(cluster_node_t *n, uint64_t base_index,
             int oom = 0;
             beaver_message_t **ms = queue_snapshot_refs(qs.q[i], base_index, &nm, &oom);
             if (oom) {
+                /* A snapshot MUST be all-or-nothing: if we cannot capture every
+                 * live message, abort rather than rename an incomplete file
+                 * that recovery/state-transfer would trust as authoritative
+                 * (after which the WAL prefix may be compacted, making the
+                 * dropped messages unrecoverable). */
                 LOG_ERROR("cluster: OOM snapshotting queue '%s' to disk; "
-                         "on-disk snapshot may be missing messages",
+                         "aborting snapshot (all-or-nothing)",
                          queue_name(qs.q[i]));
+                ok = 0;
+                for (size_t j = 0; j < nm; j++) message_unref(ms[j]);
+                free(ms);
+                break;
             }
             for (size_t j = 0; ok && j < nm; j++) {
                 size_t rl = snap_record_size(qs.q[i], ms[j]);
@@ -650,8 +686,23 @@ static int snapshot_write(cluster_node_t *n, uint64_t base_index,
         put_be32(cnt_buf, count);
         ok = pwrite(fd, cnt_buf, 4, count_at) == 4;
     }
-    if (fd >= 0) { if (ok) fsync(fd); close(fd); }
+    /* The snapshot data must hit stable storage BEFORE the rename makes it the
+     * authoritative file: a failed fsync means the bytes may still be lost on a
+     * crash, so treat it as failure and never rename over the good snapshot. */
+    if (fd >= 0) {
+        if (ok && fsync(fd) != 0) {
+            LOG_ERROR("cluster: fsync of snapshot temp file failed: %s",
+                      strerror(errno));
+            ok = 0;
+        }
+        close(fd);
+    }
     if (!ok || rename(tmp, dst) != 0) { unlink(tmp); return -1; }
+    /* fsync the directory so the rename itself is durable - otherwise a crash
+     * could leave the directory entry pointing at the old (or no) file even
+     * though the data blocks are on disk. */
+    int dfd = open(ps->dir, O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) { fsync(dfd); close(dfd); }
     return 0;
 }
 
@@ -915,12 +966,15 @@ static void persist_init(cluster_node_t *n, const char *dir, int self_id)
     snprintf(ps->dir, sizeof ps->dir, "%s", dir);
     ps->self_id = self_id;
     char path[512];
+    /* 0600: the WAL, meta and snapshot hold replicated messages, topology,
+     * permission regexes and password hashes - readable only by the broker's
+     * own user, never world-readable. */
     snprintf(path, sizeof path, "%s/cluster-%d.log", dir, self_id);
-    ps->log_fd = open(path, O_RDWR | O_CREAT, 0644);
+    ps->log_fd = open(path, O_RDWR | O_CREAT, 0600);
     snprintf(path, sizeof path, "%s/cluster-%d.meta", dir, self_id);
-    ps->meta_fd = open(path, O_RDWR | O_CREAT, 0644);
+    ps->meta_fd = open(path, O_RDWR | O_CREAT, 0600);
     snprintf(path, sizeof path, "%s/cluster-%d.snap", dir, self_id);
-    ps->snap_fd = open(path, O_RDWR | O_CREAT, 0644);
+    ps->snap_fd = open(path, O_RDWR | O_CREAT, 0600);
     if (ps->log_fd < 0 || ps->meta_fd < 0) {
         LOG_ERROR("cluster: cannot open persistence files in '%s' (%s)",
                   dir, strerror(errno));
@@ -1112,7 +1166,15 @@ static int log_append(cluster_node_t *n, uint64_t term, uint32_t op,
     cluster_log_entry_t *e = &log->entries[last - log->base_index];
     e->term = term; e->index = last + 1; e->op_type = op; e->len = len;
     e->payload = copy;
-    persist_append(n, e);                     /* write to disk (synced by a later batch persist_sync) */
+    /* If the WAL cannot durably record this entry, do NOT advance last_index:
+     * publishing an index the WAL never captured would let the entry reach the
+     * Raft protocol and a client response while missing on disk. persist_append
+     * has already marked the node storage_failed (fail-stop). */
+    if (persist_append(n, e) != 0) {
+        e->payload = NULL;
+        free(copy);
+        return -1;
+    }
     atomic_store(&log->last_index, last + 1); /* release: publish to readers */
     return 0;
 }
@@ -1450,10 +1512,16 @@ static void snap_pump(cluster_node_t *n, cluster_peer_t *p)
             int oom = 0;
             p->snap.msgs  = queue_snapshot_refs(q, p->snap.base, &nm, &oom);
             p->snap.nmsgs = nm;
-            if (oom)
+            if (oom) {
+                /* All-or-nothing: abort the transfer rather than send SNAP_END
+                 * over a dump that is missing messages. The peer never installs
+                 * an incomplete snapshot; the transfer is retried later. */
                 LOG_ERROR("cluster: OOM snapshotting queue '%s' for peer %d; "
-                         "state transfer may be missing messages",
+                         "aborting state transfer (will retry)",
                          queue_name(q), p->node_id);
+                snap_reset(p);
+                return;
+            }
             if (nm == 0) {                 /* empty queue: move to the next one */
                 queue_unref(q);
                 p->snap.qi++;
