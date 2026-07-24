@@ -21,6 +21,7 @@
 #include "broker.h"
 #include "cluster.h"
 #include "authstore.h"
+#include "authlimit.h"
 #include "dispatch.h"
 #include "message.h"
 #include "logger.h"
@@ -768,12 +769,39 @@ static void handle_connection(beaver_proto_t *p, uint16_t channel,
                     "admin with 'beavermq add-user'");
                 return;
             }
-            if (!user[0] || !authstore_verify(as, user, pass)) {
+            /* Rate-limit password hashing (see authlimit): key on the client
+             * IP only (strip the ":port" from conn->peer) so all attempts from
+             * one address share a backoff. */
+            char ip[64];
+            copy_str(ip, sizeof ip, p->conn->peer, strlen(p->conn->peer));
+            char *last_colon = strrchr(ip, ':');
+            if (last_colon) *last_colon = '\0';
+            uint64_t now_ms = uv_now(p->conn->handle.loop);
+
+            if (!user[0]) {
+                authlimit_record_failure(ip, now_ms);
+                LOG_WARN("conn #%" PRIu64 ": auth FAILED (empty user)", p->conn->id);
+                send_connection_close(p, 403, "ACCESS_REFUSED - login refused");
+                return;
+            }
+            if (authlimit_retry_after_ms(ip, now_ms) > 0 ||
+                authlimit_hash_begin() != 0) {
+                LOG_WARN("conn #%" PRIu64 ": auth throttled for '%s' from %s",
+                         p->conn->id, user, ip);
+                send_connection_close(p, 403,
+                    "ACCESS_REFUSED - too many attempts; retry later");
+                return;
+            }
+            int verified = authstore_verify(as, user, pass);
+            authlimit_hash_end();
+            if (!verified) {
+                authlimit_record_failure(ip, now_ms);
                 LOG_WARN("conn #%" PRIu64 ": auth FAILED for user '%s'",
                          p->conn->id, user);
                 send_connection_close(p, 403, "ACCESS_REFUSED - login refused");
                 return;
             }
+            authlimit_record_success(ip);
             p->user_tags = authstore_user_tags(as, user);
         }
         copy_str(p->user, sizeof p->user, user, strlen(user));

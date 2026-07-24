@@ -61,10 +61,18 @@ static void pbkdf2_sha256(const char *pass, const uint8_t *salt, size_t saltlen,
 }
 
 /*
- * Iteration count: enough to make offline brute-force of a leaked store
- * expensive (10000x the legacy single round), low enough that a login costs
- * only a few ms - auth runs on the worker event loop, so a much higher count
- * would stall other connections on that worker during a login burst.
+ * Iteration count for NEWLY created hashes. Deliberately kept modest for now
+ * because verification still runs SYNCHRONOUSLY on the worker event loop, and
+ * HTTP Basic re-authenticates on every request: with this build's portable
+ * (unaccelerated) SHA-256, ~10000 iterations already costs ~10ms per hash, and
+ * pushing toward the OWASP PBKDF2-HMAC-SHA256 figure (600000) would stall the
+ * loop for >100ms per login and cripple the polling dashboard. The higher work
+ * factor (and/or Argon2id) is coupled to the planned move of hashing OFF the
+ * event loop; until then the CPU/brute-force exposure is bounded by authlimit
+ * (per-IP backoff + a global cap on concurrent hashes) rather than by a work
+ * factor the loop cannot afford. Existing "$p2$<iters>$..." records keep
+ * verifying against THEIR stored iteration count, so changing this never
+ * invalidates already-stored passwords.
  */
 #define AUTH_PBKDF2_ITERS 10000u
 
@@ -102,12 +110,11 @@ static int hash_matches(const char *stored, const char *password)
     if (strncmp(stored, "$p2$", 4) == 0) {
         char *end = NULL;
         unsigned long iters = strtoul(stored + 4, &end, 10);
-        /* Cap well above our own default (10000) but far below the old
-         * 10,000,000 ceiling: this server never produces a hash above
-         * AUTH_PBKDF2_ITERS, so a stored record claiming anywhere near the
-         * old ceiling can only be a corrupted or maliciously crafted entry -
-         * and running ~1000x the normal PBKDF2 work on the event loop per
-         * login attempt against it is itself a CPU-exhaustion DoS. */
+        /* Cap at 10x our own default: this server never produces a hash above
+         * AUTH_PBKDF2_ITERS, so a stored record demanding far more work can
+         * only be corrupted or maliciously crafted, and running that inflated
+         * PBKDF2 cost on the event loop per login attempt is itself a CPU-
+         * exhaustion DoS. Legacy 10000-iter records stay well under the cap. */
         if (!end || *end != '$' || iters == 0 || iters > 10u * AUTH_PBKDF2_ITERS)
             return 0;
         const char *sh = end + 1;                 /* salt hex, then '$', digest */
