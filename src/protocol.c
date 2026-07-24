@@ -112,6 +112,8 @@ struct beaver_proto {
 
     struct pending_cluster_op *pending_ops; /* in-flight deferred cluster-commit
                                              * responses (see await_cluster_commit) */
+    struct amqp_auth_work *pending_auth;    /* in-flight off-loop SASL password
+                                             * verification (see auth_work_*) */
 };
 
 /* ---- forward declarations ------------------------------------------------ */
@@ -813,11 +815,88 @@ static void send_connection_start(beaver_proto_t *p)
     bmqp_buf_free(&a);
 }
 
+/* Finish a successful Connection.StartOk: record the identity and answer with
+ * Connection.Tune. Shared by the no-authstore path and the async auth result. */
+static void send_connection_tune(beaver_proto_t *p, const char *user, uint32_t tags)
+{
+    p->user_tags = tags;
+    copy_str(p->user, sizeof p->user, user, strlen(user));
+    LOG_INFO("conn #%" PRIu64 ": authenticated as '%s'", p->conn->id, p->user);
+
+    bmqp_buf_t a;
+    bmqp_buf_init(&a);
+    bmqp_buf_put_u16(&a, AMQP_CHANNEL_MAX);        /* channel-max */
+    bmqp_buf_put_u32(&a, AMQP_DEFAULT_FRAME_MAX);  /* frame-max   */
+    bmqp_buf_put_u16(&a, AMQP_HEARTBEAT_SECONDS);  /* heartbeat suggestion */
+    send_method(p, 0, BMQP_CLASS_CONNECTION, BMQP_CONNECTION_TUNE, &a);
+    bmqp_buf_free(&a);
+}
+
+/* Off-loop SASL password verification. The expensive PBKDF2 runs on a libuv
+ * worker thread (work_cb) so it never blocks the connection's event loop; the
+ * result is applied back on the loop (after_cb). The work object outlives a
+ * connection teardown that happens mid-hash: protocol_conn_free() nulls ->p so
+ * after_cb knows to just clean up (the cancellation discipline the deferred
+ * cluster ops already use). */
+typedef struct amqp_auth_work {
+    uv_work_t       req;      /* MUST be first */
+    beaver_proto_t *p;        /* NULL once the connection is gone */
+    char            user[128];
+    char            ip[64];
+    char            pass[256];
+    char            stored[AUTHSTORE_HASH_MAX];
+    uint64_t        now_ms;
+    int             user_exists;
+    int             result;   /* set off-loop by work_cb */
+} amqp_auth_work_t;
+
+static void auth_work_cb(uv_work_t *req)
+{
+    amqp_auth_work_t *w = (amqp_auth_work_t *)req;
+    /* Pure/reentrant: touches only the copied strings, no store, no loop. */
+    w->result = w->user_exists &&
+                authstore_password_matches(w->stored, w->pass);
+    /* Do not leave the plaintext password lying in the heap longer than needed. */
+    memset(w->pass, 0, sizeof w->pass);
+}
+
+static void auth_work_after_cb(uv_work_t *req, int status)
+{
+    amqp_auth_work_t *w = (amqp_auth_work_t *)req;
+    authlimit_hash_end(); /* release the concurrency slot held across the hash */
+
+    beaver_proto_t *p = w->p;
+    if (!p || status == UV_ECANCELED) { /* connection gone (or loop torn down) */
+        free(w);
+        return;
+    }
+    p->pending_auth = NULL;
+
+    if (!w->result) {
+        authlimit_record_failure(w->ip, w->now_ms);
+        LOG_WARN("conn #%" PRIu64 ": auth FAILED for user '%s'", p->conn->id, w->user);
+        send_connection_close(p, 403, "ACCESS_REFUSED - login refused");
+        free(w);
+        return;
+    }
+    authlimit_record_success(w->ip);
+    struct authstore *as = p->conn->server->authstore;
+    send_connection_tune(p, w->user, as ? authstore_user_tags(as, w->user) : 0);
+    free(w);
+}
+
 static void handle_connection(beaver_proto_t *p, uint16_t channel,
                               uint16_t method, bmqp_reader_t *r)
 {
     if (channel != 0) {
         proto_fatal(p, "connection class method on non-zero channel %u", channel);
+        return;
+    }
+    /* A password verification is in flight off-loop; the client must wait for
+     * our Connection.Tune before sending anything else. Any frame arriving in
+     * that window is a protocol violation (or a hostile flood). */
+    if (p->pending_auth) {
+        proto_fatal(p, "connection frame received while authentication in progress");
         return;
     }
 
@@ -846,65 +925,72 @@ static void handle_connection(beaver_proto_t *p, uint16_t channel,
                                      (rlen > pw ? rlen - pw : 0));
         }
         struct authstore *as = p->conn->server->authstore;
-        if (as) {
-            if (authstore_is_open(as)) {
-                /* Fresh, unconfigured broker: refuse EVERY login (clients like
-                 * pika silently try guest/guest - accepting them would look
-                 * like "no auth"). The operator must create the first admin. */
-                LOG_WARN("conn #%" PRIu64 ": login refused - no users configured "
-                         "(create one: beavermq add-user <name> <password>)",
-                         p->conn->id);
-                send_connection_close(p, 403,
-                    "ACCESS_REFUSED - no users configured; create the first "
-                    "admin with 'beavermq add-user'");
-                return;
-            }
-            /* Rate-limit password hashing (see authlimit): key on the client
-             * IP only (strip the ":port" from conn->peer) so all attempts from
-             * one address share a backoff. */
-            char ip[64];
-            copy_str(ip, sizeof ip, p->conn->peer, strlen(p->conn->peer));
-            char *last_colon = strrchr(ip, ':');
-            if (last_colon) *last_colon = '\0';
-            uint64_t now_ms = uv_now(p->conn->handle.loop);
-
-            if (!user[0]) {
-                authlimit_record_failure(ip, now_ms);
-                LOG_WARN("conn #%" PRIu64 ": auth FAILED (empty user)", p->conn->id);
-                send_connection_close(p, 403, "ACCESS_REFUSED - login refused");
-                return;
-            }
-            if (authlimit_retry_after_ms(ip, now_ms) > 0 ||
-                authlimit_hash_begin() != 0) {
-                LOG_WARN("conn #%" PRIu64 ": auth throttled for '%s' from %s",
-                         p->conn->id, user, ip);
-                send_connection_close(p, 403,
-                    "ACCESS_REFUSED - too many attempts; retry later");
-                return;
-            }
-            int verified = authstore_verify(as, user, pass);
-            authlimit_hash_end();
-            if (!verified) {
-                authlimit_record_failure(ip, now_ms);
-                LOG_WARN("conn #%" PRIu64 ": auth FAILED for user '%s'",
-                         p->conn->id, user);
-                send_connection_close(p, 403, "ACCESS_REFUSED - login refused");
-                return;
-            }
-            authlimit_record_success(ip);
-            p->user_tags = authstore_user_tags(as, user);
+        if (!as) {
+            /* No auth configured: accept and Tune immediately. */
+            send_connection_tune(p, user, 0);
+            break;
         }
-        copy_str(p->user, sizeof p->user, user, strlen(user));
-        LOG_INFO("conn #%" PRIu64 ": authenticated as '%s'", p->conn->id, p->user);
+        if (authstore_is_open(as)) {
+            /* Fresh, unconfigured broker: refuse EVERY login (clients like
+             * pika silently try guest/guest - accepting them would look
+             * like "no auth"). The operator must create the first admin. */
+            LOG_WARN("conn #%" PRIu64 ": login refused - no users configured "
+                     "(create one: beavermq add-user <name> <password>)",
+                     p->conn->id);
+            send_connection_close(p, 403,
+                "ACCESS_REFUSED - no users configured; create the first "
+                "admin with 'beavermq add-user'");
+            return;
+        }
+        /* Rate-limit password hashing (see authlimit): key on the client IP
+         * only (strip the ":port" from conn->peer) so all attempts from one
+         * address share a backoff. */
+        char ip[64];
+        copy_str(ip, sizeof ip, p->conn->peer, strlen(p->conn->peer));
+        char *last_colon = strrchr(ip, ':');
+        if (last_colon) *last_colon = '\0';
+        uint64_t now_ms = uv_now(p->conn->handle.loop);
 
-        bmqp_buf_t a;
-        bmqp_buf_init(&a);
-        bmqp_buf_put_u16(&a, AMQP_CHANNEL_MAX);        /* channel-max */
-        bmqp_buf_put_u32(&a, AMQP_DEFAULT_FRAME_MAX);  /* frame-max   */
-        bmqp_buf_put_u16(&a, AMQP_HEARTBEAT_SECONDS);  /* heartbeat suggestion */
-        send_method(p, 0, BMQP_CLASS_CONNECTION, BMQP_CONNECTION_TUNE, &a);
-        bmqp_buf_free(&a);
-        break;
+        if (!user[0]) {
+            authlimit_record_failure(ip, now_ms);
+            LOG_WARN("conn #%" PRIu64 ": auth FAILED (empty user)", p->conn->id);
+            send_connection_close(p, 403, "ACCESS_REFUSED - login refused");
+            return;
+        }
+        if (authlimit_retry_after_ms(ip, now_ms) > 0 ||
+            authlimit_hash_begin() != 0) {
+            LOG_WARN("conn #%" PRIu64 ": auth throttled for '%s' from %s",
+                     p->conn->id, user, ip);
+            send_connection_close(p, 403,
+                "ACCESS_REFUSED - too many attempts; retry later");
+            return;
+        }
+        /* Verify the password OFF the event loop: look the stored hash up here
+         * (cheap, under the store's read lock), then run PBKDF2 on a worker
+         * thread so a slow hash cannot stall this worker's other connections.
+         * The result is applied in auth_work_after_cb. */
+        amqp_auth_work_t *w = calloc(1, sizeof *w);
+        if (!w) {
+            authlimit_hash_end();
+            proto_fatal(p, "out of memory starting authentication");
+            return;
+        }
+        w->p      = p;
+        w->now_ms = now_ms;
+        copy_str(w->user, sizeof w->user, user, strlen(user));
+        copy_str(w->ip,   sizeof w->ip,   ip,   strlen(ip));
+        copy_str(w->pass, sizeof w->pass, pass, strlen(pass));
+        w->user_exists = authstore_lookup_hash(as, user, w->stored, sizeof w->stored);
+        p->pending_auth = w;
+        if (uv_queue_work(p->conn->handle.loop, &w->req,
+                          auth_work_cb, auth_work_after_cb) != 0) {
+            p->pending_auth = NULL;
+            authlimit_hash_end();
+            free(w);
+            proto_fatal(p, "failed to queue authentication work");
+            return;
+        }
+        break; /* async: auth_work_after_cb sends Tune or Close */
     }
     case BMQP_CONNECTION_TUNE_OK: {
         p->channel_max = bmqp_read_u16(r);
@@ -1884,6 +1970,12 @@ void protocol_conn_free(beaver_proto_t *p)
 {
     if (!p)
         return;
+    /* If a password verification is still running on a worker thread, detach it
+     * so its completion callback (which always fires) cleans itself up without
+     * touching this now-freed proto. The work object is freed by that callback,
+     * not here. */
+    if (p->pending_auth)
+        p->pending_auth->p = NULL;
     cancel_pending_ops(p, -1);
     for (size_t i = 0; i < p->n_channels; i++)
         chan_release_get_unacked(&p->channels[i]);
