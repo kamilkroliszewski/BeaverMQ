@@ -538,7 +538,7 @@ Implemented classes/methods (official AMQP 0‑9‑1 ids):
 | Connection (10)  | Start/StartOk, Tune/TuneOk, Open/OpenOk, Close/CloseOk     |
 | Channel (20)     | Open/OpenOk, Close/CloseOk                                 |
 | Exchange (40)    | Declare/DeclareOk                                         |
-| Queue (50)       | Declare/DeclareOk, Bind/BindOk                             |
+| Queue (50)       | Declare/DeclareOk, Bind/BindOk, Delete/DeleteOk           |
 | Basic (60)       | Qos/QosOk, Consume/ConsumeOk, Cancel/CancelOk, Publish,    |
 |                  | Deliver, Get/GetOk/GetEmpty, Ack, Nack, Reject             |
 | Confirm (85)     | Select/SelectOk (publisher confirms)                      |
@@ -548,6 +548,12 @@ store (see [Access control](#access-control-vhosts-users-permissions)); logins
 are rate‑limited per client IP. Field tables (client capabilities, method
 `arguments`) are parsed safely. Layouts live in
 [`include/protocol.h`](include/protocol.h) / [`src/protocol.c`](src/protocol.c).
+
+**Queue lifecycle** follows AMQP semantics: `Queue.Delete` removes a queue (with
+`if-unused` / `if-empty`), an **exclusive** queue is locked to its declaring
+connection and deleted when that connection closes, and an **auto‑delete** queue
+is removed once its last consumer goes away. In a cluster, deleting a durable
+queue replicates through Raft.
 
 **Not implemented / partial** (so clients don't assume more than is there):
 

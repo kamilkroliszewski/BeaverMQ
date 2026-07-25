@@ -114,6 +114,12 @@ struct beaver_proto {
                                              * responses (see await_cluster_commit) */
     struct amqp_auth_work *pending_auth;    /* in-flight off-loop SASL password
                                              * verification (see auth_work_*) */
+
+    /* Exclusive queues declared by THIS connection - deleted when it closes
+     * (AMQP: an exclusive queue lives only as long as its declaring
+     * connection). Stored as "<vhost>\x01<name>" registry keys. */
+    char         **excl_queues;
+    size_t         n_excl, cap_excl;
 };
 
 /* ---- forward declarations ------------------------------------------------ */
@@ -330,6 +336,44 @@ static size_t chan_get_unacked_settle(proto_chan_t *pc, uint64_t delivery_tag,
             break;
     }
     return settled;
+}
+
+/* ---- exclusive queue tracking -------------------------------------------- *
+ * An exclusive queue exists only for the lifetime of the connection that
+ * declared it; when that connection closes we delete every one it owns. We key
+ * on the queue name (a connection has a single vhost, p->vhost). */
+static void track_exclusive_queue(beaver_proto_t *p, const char *name)
+{
+    for (size_t i = 0; i < p->n_excl; i++)
+        if (strcmp(p->excl_queues[i], name) == 0)
+            return; /* already tracked */
+    if (p->n_excl == p->cap_excl) {
+        size_t nc = p->cap_excl ? p->cap_excl * 2 : 4;
+        char **na = realloc(p->excl_queues, nc * sizeof(*na));
+        if (!na)
+            return; /* best effort: worst case the queue lingers until restart */
+        p->excl_queues = na;
+        p->cap_excl    = nc;
+    }
+    char *dup = strdup(name);
+    if (dup)
+        p->excl_queues[p->n_excl++] = dup;
+}
+
+static void delete_exclusive_queues(beaver_proto_t *p)
+{
+    if (!p->conn || !p->conn->server || !p->conn->server->broker)
+        return;
+    for (size_t i = 0; i < p->n_excl; i++) {
+        if (broker_delete_queue(p->conn->server->broker, p->vhost,
+                                p->excl_queues[i], 0, 0, NULL) == 0)
+            LOG_INFO("conn #%" PRIu64 ": deleted exclusive queue '%s' on close",
+                     p->conn->id, p->excl_queues[i]);
+        free(p->excl_queues[i]);
+    }
+    free(p->excl_queues);
+    p->excl_queues = NULL;
+    p->n_excl = p->cap_excl = 0;
 }
 
 /* ---- deferred cluster-commit responses ------------------------------------
@@ -1296,6 +1340,29 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         LOG_INFO("conn #%" PRIu64 " ch=%u: Queue.Declare '%s' (%s, depth=%u)",
                  p->conn->id, channel, qname,
                  created ? "created" : "exists", depth);
+
+        /* Exclusive queues: the first declarer owns the queue; a declare from
+         * any OTHER connection is refused (AMQP RESOURCE_LOCKED). The owner is
+         * remembered so the queue is deleted when this connection closes. */
+        if (bits & BMQP_FLAG_EXCLUSIVE) {
+            beaver_queue_t *eq = broker_get_queue(p->conn->server->broker,
+                                                  p->vhost, qname);
+            if (eq) {
+                uint64_t owner = queue_exclusive_owner(eq);
+                if (owner != 0 && owner != p->conn->id) {
+                    queue_unref(eq);
+                    send_channel_close(p, channel, 405,
+                        "RESOURCE_LOCKED - queue is exclusive to another connection",
+                        BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE);
+                    return;
+                }
+                if (owner == 0)
+                    queue_set_exclusive_owner(eq, p->conn->id);
+                queue_unref(eq);
+                track_exclusive_queue(p, qname);
+            }
+        }
+
         if (p->conn->server->cluster && (bits & BMQP_FLAG_DURABLE)) {
             uint64_t seq = cluster_replicate_declare_queue(
                 p->conn->server->cluster, p->vhost, qname, bits & 0x0E);
@@ -1389,6 +1456,94 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         }
         if (!(no_wait & 0x01))
             send_method(p, channel, BMQP_CLASS_QUEUE, BMQP_QUEUE_BIND_OK, NULL);
+        break;
+    }
+    case BMQP_QUEUE_DELETE: {
+        bmqp_read_u16(r);                       /* reserved-1 */
+        size_t qn;
+        const char *q = bmqp_read_shortstr(r, &qn);
+        uint8_t bits  = bmqp_read_u8(r);        /* if-unused, if-empty, no-wait */
+        if (r->error) {
+            proto_fatal(p, "malformed Queue.Delete");
+            return;
+        }
+        int if_unused = (bits & 0x01) != 0;
+        int if_empty  = (bits & 0x02) != 0;
+        int no_wait   = (bits & 0x04) != 0;
+        char qname[256];
+        copy_str(qname, sizeof(qname), q, qn);
+        if (!name_ok(qname)) {
+            send_channel_close(p, channel, 406,
+                               "PRECONDITION_FAILED - illegal queue name",
+                               BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
+            return;
+        }
+        proto_advance(p, BMQP_STATE_ACTIVE);
+        /* Deleting a queue is a CONFIGURE operation. */
+        if (!require_perm(p, channel, AUTH_CONFIGURE, qname,
+                          BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE))
+            return;
+
+        /* Refuse to delete another connection's exclusive queue; note whether
+         * it is durable (for cluster replication) before it is gone. */
+        int was_durable = 0;
+        beaver_queue_t *eq = broker_get_queue(p->conn->server->broker,
+                                              p->vhost, qname);
+        if (eq) {
+            uint64_t owner = queue_exclusive_owner(eq);
+            was_durable = (queue_flags(eq) & BMQP_FLAG_DURABLE) != 0;
+            queue_unref(eq);
+            if (owner != 0 && owner != p->conn->id) {
+                send_channel_close(p, channel, 405,
+                    "RESOURCE_LOCKED - queue is exclusive to another connection",
+                    BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
+                return;
+            }
+        }
+
+        uint32_t msgcount = 0;
+        int drc = broker_delete_queue(p->conn->server->broker, p->vhost, qname,
+                                      if_unused, if_empty, &msgcount);
+        if (drc == -1) {
+            send_channel_close(p, channel, 404,
+                               "NOT_FOUND - no such queue",
+                               BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
+            return;
+        }
+        if (drc == -2) {
+            send_channel_close(p, channel, 406,
+                               "PRECONDITION_FAILED - queue in use (has consumers)",
+                               BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
+            return;
+        }
+        if (drc == -3) {
+            send_channel_close(p, channel, 406,
+                               "PRECONDITION_FAILED - queue not empty",
+                               BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
+            return;
+        }
+        /* Forget it from our exclusive-cleanup list (it's already gone). */
+        for (size_t i = 0; i < p->n_excl; i++) {
+            if (strcmp(p->excl_queues[i], qname) == 0) {
+                free(p->excl_queues[i]);
+                p->excl_queues[i] = p->excl_queues[--p->n_excl];
+                break;
+            }
+        }
+        LOG_INFO("conn #%" PRIu64 " ch=%u: Queue.Delete '%s' (%u message(s))",
+                 p->conn->id, channel, qname, msgcount);
+        /* Replicate the delete of a durable queue so the clustered topology
+         * stays consistent (idempotent apply on every node, incl. this one). */
+        if (p->conn->server->cluster && was_durable)
+            cluster_replicate_delete_queue(p->conn->server->cluster,
+                                           p->vhost, qname);
+        if (!no_wait) {
+            bmqp_buf_t a;
+            bmqp_buf_init(&a);
+            bmqp_buf_put_u32(&a, msgcount); /* message-count */
+            send_method(p, channel, BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE_OK, &a);
+            bmqp_buf_free(&a);
+        }
         break;
     }
     default:
@@ -1976,6 +2131,9 @@ void protocol_conn_free(beaver_proto_t *p)
      * not here. */
     if (p->pending_auth)
         p->pending_auth->p = NULL;
+    /* Delete any exclusive queues this connection owned (AMQP: they live only
+     * as long as the declaring connection). */
+    delete_exclusive_queues(p);
     cancel_pending_ops(p, -1);
     for (size_t i = 0; i < p->n_channels; i++)
         chan_release_get_unacked(&p->channels[i]);

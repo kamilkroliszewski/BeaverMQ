@@ -122,6 +122,22 @@ int exchange_bind(beaver_exchange_t *ex, const char *routing_key,
     return 0;
 }
 
+size_t exchange_unbind_queue(beaver_exchange_t *ex, const beaver_queue_t *q)
+{
+    size_t removed = 0;
+    for (size_t i = 0; i < ex->n_bindings; ) {
+        if (ex->bindings[i].queue == q) {
+            free(ex->bindings[i].routing_key);
+            queue_unref(ex->bindings[i].queue);
+            ex->bindings[i] = ex->bindings[--ex->n_bindings]; /* swap-remove */
+            removed++;
+        } else {
+            i++;
+        }
+    }
+    return removed;
+}
+
 /* ---- topic matching ------------------------------------------------------ */
 
 /* Split `s` on '.' into a buffer + pointer array (single allocation each). */

@@ -81,9 +81,11 @@ echo "== AMQP client-compat test (pika) =="
 PYBIN="$(find_pika_python)"
 if [ -z "$PYBIN" ]; then
     echo "SKIP: 'pika' is unavailable and could not be installed (offline?);"
-    echo "      AMQP client-compat test not run. Install pika to enable it."
+    echo "      AMQP client tests not run. Install pika to enable them."
 else
     "$PYBIN" "$SCRIPT_DIR/test_amqp.py" 127.0.0.1 "$AMQP_PORT" "$USER" "$PASS" || FAILED=1
+    echo "== AMQP queue lifecycle test (pika) =="
+    "$PYBIN" "$SCRIPT_DIR/test_queue_lifecycle.py" 127.0.0.1 "$AMQP_PORT" "$HTTP_PORT" "$USER" "$PASS" || FAILED=1
 fi
 
 echo "== management API test (stdlib) =="

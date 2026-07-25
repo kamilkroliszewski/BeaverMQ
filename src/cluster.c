@@ -1254,6 +1254,11 @@ static void apply_op(cluster_node_t *n, const cluster_log_entry_t *e)
             rd_str(&p, end, c, sizeof c) == 0)
             broker_bind(n->broker, vh, a, b, c);
         break;
+    case CL_OP_DELETE_QUEUE:
+        if (rd_str(&p, end, vh, sizeof vh) == 0 &&
+            rd_str(&p, end, a, sizeof a) == 0)
+            broker_delete_queue(n->broker, vh, a, 0, 0, NULL);
+        break;
     case CL_OP_PUBLISH: {
         char ex[256], rk[256];
         if (rd_str(&p, end, vh, sizeof vh) != 0 ||
@@ -1334,7 +1339,7 @@ static void apply_op(cluster_node_t *n, const cluster_log_entry_t *e)
      * rebuild the broker/authstore on recovery even after the declaring entry is
      * dropped): carry them in the snapshot set. */
     if (e->op_type == CL_OP_DECLARE_QUEUE || e->op_type == CL_OP_DECLARE_EXCH ||
-        e->op_type == CL_OP_BIND ||
+        e->op_type == CL_OP_BIND || e->op_type == CL_OP_DELETE_QUEUE ||
         (e->op_type >= CL_OP_ADD_VHOST && e->op_type <= CL_OP_CLEAR_PERM))
         topo_add(n, e->op_type, e->payload, e->len);
     if (e->op_type == CL_OP_PUBLISH || e->op_type == CL_OP_ACK)
@@ -3487,6 +3492,18 @@ uint64_t cluster_replicate_publish_tracked(cluster_node_t *n, const char *vhost,
     uint64_t seq = cluster_propose_tracked(n, CL_OP_PUBLISH, buf, len);
     free(buf);
     return seq;
+}
+
+int cluster_replicate_delete_queue(cluster_node_t *n, const char *vhost,
+                                   const char *queue)
+{
+    if (strlen(vhost) > 250 || strlen(queue) > 250)
+        return -1;
+    uint8_t buf[2 * (2 + 251)];
+    uint8_t *p = buf;
+    wr_str(&p, vhost);
+    wr_str(&p, queue);
+    return cluster_propose(n, CL_OP_DELETE_QUEUE, buf, (size_t)(p - buf));
 }
 
 int cluster_replicate_consume(cluster_node_t *n, const char *vhost,
