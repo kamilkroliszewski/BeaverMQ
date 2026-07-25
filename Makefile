@@ -134,6 +134,11 @@ integration: $(BIN)
 fault-test: $(BIN)
 	@bash $(TEST_DIR)/test_fault_storage.sh
 
+# Standalone authstore persistence + durable bootstrap across restarts.
+.PHONY: persistence-test
+persistence-test: $(BIN)
+	@bash $(TEST_DIR)/test_persistence.sh
+
 debug: OPT := -O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer
 debug: LDFLAGS += -fsanitize=address,undefined
 debug: clean all

@@ -9,12 +9,17 @@
  */
 #include "authstore.h"
 #include "crypto.h"
+#include "logger.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <regex.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static void to_hex(const uint8_t *b, size_t n, char *out)
 {
@@ -160,6 +165,13 @@ struct authstore {
     vhost_t *vhosts; size_t nv, cv;
     user_t  *users;  size_t nu, cu;
     perm_t  *perms;  size_t np, cp;
+
+    /* Local persistence (STANDALONE only; a cluster persists via Raft). When
+     * persist_path is set, every mutation atomically rewrites the file. */
+    char persist_path[512];
+    /* Sticky once the first user is ever created: the first-boot bootstrap
+     * window never re-opens just because users were later deleted. */
+    int  bootstrap_completed;
 };
 
 authstore_t *authstore_new(void)
@@ -219,6 +231,100 @@ static void drop_perms_matching(authstore_t *s, const char *u, const char *v)
     }
 }
 
+/* ---- local persistence (standalone) -------------------------------------- *
+ * A compact binary file: magic, version, bootstrap flag, then the vhosts, users
+ * (name, hash, tags) and permissions (patterns). Written atomically (temp +
+ * fsync + rename, 0600) on every mutation; loaded once at startup. A cluster
+ * does NOT use this - its authstore is replicated and snapshotted via Raft. */
+#define AUTHSTORE_DB_MAGIC   0x41535442u /* 'ASTB' */
+#define AUTHSTORE_DB_VERSION 1u
+
+static int put_u32(FILE *f, uint32_t v)
+{
+    uint8_t b[4] = { (uint8_t)(v>>24), (uint8_t)(v>>16), (uint8_t)(v>>8), (uint8_t)v };
+    return fwrite(b, 1, 4, f) == 4 ? 0 : -1;
+}
+static int put_str(FILE *f, const char *s)
+{
+    size_t n = strlen(s);
+    if (n > 0xffff) return -1;
+    uint8_t b[2] = { (uint8_t)(n>>8), (uint8_t)n };
+    if (fwrite(b, 1, 2, f) != 2) return -1;
+    return (n == 0 || fwrite(s, 1, n, f) == n) ? 0 : -1;
+}
+static int get_u32(FILE *f, uint32_t *out)
+{
+    uint8_t b[4];
+    if (fread(b, 1, 4, f) != 4) return -1;
+    *out = (uint32_t)b[0]<<24 | (uint32_t)b[1]<<16 | (uint32_t)b[2]<<8 | b[3];
+    return 0;
+}
+/* Read a length-prefixed string into `out` (cap includes the NUL). Rejects a
+ * field that would not fit (corrupt/hostile file). */
+static int get_str(FILE *f, char *out, size_t cap)
+{
+    uint8_t b[2];
+    if (fread(b, 1, 2, f) != 2) return -1;
+    size_t n = (size_t)b[0]<<8 | b[1];
+    if (n >= cap) return -1;
+    if (n && fread(out, 1, n, f) != n) return -1;
+    out[n] = '\0';
+    return 0;
+}
+
+/* Serialize the whole store to persist_path atomically. Caller holds the lock.
+ * Best-effort: a write failure is logged, never fatal (the in-memory store
+ * stays authoritative). */
+static void authstore_save_locked(authstore_t *s)
+{
+    if (!s->persist_path[0])
+        return;
+    char tmp[600];
+    int n = snprintf(tmp, sizeof tmp, "%s.tmp", s->persist_path);
+    if (n < 0 || (size_t)n >= sizeof tmp)
+        return;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600); /* hashes: 0600 */
+    if (fd < 0) { LOG_WARN("authstore: cannot write '%s': %s", tmp, strerror(errno)); return; }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { close(fd); return; }
+
+    int ok = put_u32(f, AUTHSTORE_DB_MAGIC) == 0 &&
+             put_u32(f, AUTHSTORE_DB_VERSION) == 0 &&
+             put_u32(f, (uint32_t)s->bootstrap_completed) == 0 &&
+             put_u32(f, (uint32_t)s->nv) == 0;
+    for (size_t i = 0; ok && i < s->nv; i++) ok = put_str(f, s->vhosts[i].name) == 0;
+    ok = ok && put_u32(f, (uint32_t)s->nu) == 0;
+    for (size_t i = 0; ok && i < s->nu; i++)
+        ok = put_str(f, s->users[i].name) == 0 &&
+             put_str(f, s->users[i].hash) == 0 &&
+             put_u32(f, s->users[i].tags) == 0;
+    ok = ok && put_u32(f, (uint32_t)s->np) == 0;
+    for (size_t i = 0; ok && i < s->np; i++)
+        ok = put_str(f, s->perms[i].user) == 0 &&
+             put_str(f, s->perms[i].vhost) == 0 &&
+             put_str(f, s->perms[i].conf) == 0 &&
+             put_str(f, s->perms[i].wr) == 0 &&
+             put_str(f, s->perms[i].rd) == 0;
+
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0)
+        ok = 0;
+    fclose(f); /* closes fd */
+    if (!ok || rename(tmp, s->persist_path) != 0) {
+        LOG_WARN("authstore: failed to persist to '%s'", s->persist_path);
+        unlink(tmp);
+        return;
+    }
+    /* Make the rename itself durable. */
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s", s->persist_path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        int dfd = open(dir[0] ? dir : "/", O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) { fsync(dfd); close(dfd); }
+    }
+}
+
 int authstore_add_vhost(authstore_t *s, const char *vhost)
 {
     if (too_long(vhost, AUTHSTORE_NAME_MAX)) return -1;
@@ -228,6 +334,7 @@ int authstore_add_vhost(authstore_t *s, const char *vhost)
         GROW(s->vhosts, s->nv, s->cv);
         snprintf(s->vhosts[s->nv].name, sizeof(s->vhosts[s->nv].name), "%s", vhost);
         s->nv++;
+        authstore_save_locked(s);
     }
     pthread_rwlock_unlock(&s->lock);
     return rc;
@@ -237,7 +344,11 @@ int authstore_del_vhost(authstore_t *s, const char *vhost)
 {
     pthread_rwlock_wrlock(&s->lock);
     size_t i = find_vhost(s, vhost);
-    if (i != (size_t)-1) { s->vhosts[i] = s->vhosts[--s->nv]; drop_perms_matching(s, NULL, vhost); }
+    if (i != (size_t)-1) {
+        s->vhosts[i] = s->vhosts[--s->nv];
+        drop_perms_matching(s, NULL, vhost);
+        authstore_save_locked(s);
+    }
     pthread_rwlock_unlock(&s->lock);
     return 0;
 }
@@ -253,6 +364,8 @@ int authstore_add_user(authstore_t *s, const char *user,
     snprintf(s->users[i].name, sizeof(s->users[i].name), "%s", user);
     snprintf(s->users[i].hash, sizeof(s->users[i].hash), "%s", pass_hash);
     s->users[i].tags = tags;
+    s->bootstrap_completed = 1; /* a user now exists: bootstrap never re-opens */
+    authstore_save_locked(s);
     pthread_rwlock_unlock(&s->lock);
     return 0;
 }
@@ -261,7 +374,11 @@ int authstore_del_user(authstore_t *s, const char *user)
 {
     pthread_rwlock_wrlock(&s->lock);
     size_t i = find_user(s, user);
-    if (i != (size_t)-1) { s->users[i] = s->users[--s->nu]; drop_perms_matching(s, user, NULL); }
+    if (i != (size_t)-1) {
+        s->users[i] = s->users[--s->nu];
+        drop_perms_matching(s, user, NULL);
+        authstore_save_locked(s);
+    }
     pthread_rwlock_unlock(&s->lock);
     return 0;
 }
@@ -300,6 +417,7 @@ int authstore_set_perm(authstore_t *s, const char *user, const char *vhost,
         if (rr_ok) regfree(&p->rr);
     }
     p->compiled = ok;  /* if a pattern was malformed, treat the row as deny-all */
+    authstore_save_locked(s);
     pthread_rwlock_unlock(&s->lock);
     return ok ? 0 : -1;
 }
@@ -308,7 +426,11 @@ int authstore_clear_perm(authstore_t *s, const char *user, const char *vhost)
 {
     pthread_rwlock_wrlock(&s->lock);
     size_t i = find_perm(s, user, vhost);
-    if (i != (size_t)-1) { perm_free_regex(&s->perms[i]); s->perms[i] = s->perms[--s->np]; }
+    if (i != (size_t)-1) {
+        perm_free_regex(&s->perms[i]);
+        s->perms[i] = s->perms[--s->np];
+        authstore_save_locked(s);
+    }
     pthread_rwlock_unlock(&s->lock);
     return 0;
 }
@@ -318,9 +440,78 @@ int authstore_clear_perm(authstore_t *s, const char *user, const char *vhost)
 int authstore_is_open(authstore_t *s)
 {
     pthread_rwlock_rdlock(&s->lock);
-    int open = (s->nu == 0);
+    /* The bootstrap window is open ONLY on a truly fresh store: no users AND no
+     * user was ever created (bootstrap_completed is sticky). Deleting the last
+     * user therefore does NOT re-open bootstrap - recovery is an explicit,
+     * out-of-band action, not something a delete silently re-enables. */
+    int open = (s->nu == 0 && !s->bootstrap_completed);
     pthread_rwlock_unlock(&s->lock);
     return open;
+}
+
+/* Load a persisted store from `path` and enable auto-save to it (standalone
+ * only; a cluster must not call this). If the file does not exist yet, the path
+ * is still remembered so future mutations create it. Returns 0 on success (incl.
+ * "no file yet"), -1 on a corrupt file (the store is left as-is). */
+int authstore_load(authstore_t *s, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        /* No store yet: remember the path so the first mutation writes it. */
+        pthread_rwlock_wrlock(&s->lock);
+        snprintf(s->persist_path, sizeof s->persist_path, "%s", path);
+        pthread_rwlock_unlock(&s->lock);
+        return 0;
+    }
+
+    uint32_t magic = 0, version = 0, boot = 0, n = 0;
+    int bad = get_u32(f, &magic) != 0 || magic != AUTHSTORE_DB_MAGIC ||
+              get_u32(f, &version) != 0 || version != AUTHSTORE_DB_VERSION ||
+              get_u32(f, &boot) != 0;
+    char name[AUTHSTORE_NAME_MAX], hash[AUTHSTORE_HASH_MAX];
+    char vh[AUTHSTORE_NAME_MAX];
+    char cf[AUTHSTORE_REGEX_MAX], wr[AUTHSTORE_REGEX_MAX], rd[AUTHSTORE_REGEX_MAX];
+
+    if (!bad && get_u32(f, &n) == 0) {
+        for (uint32_t i = 0; i < n && !bad; i++) {
+            if (get_str(f, name, sizeof name) != 0) { bad = 1; break; }
+            authstore_add_vhost(s, name); /* persist_path not set yet -> no save */
+        }
+    } else bad = 1;
+    if (!bad && get_u32(f, &n) == 0) {
+        for (uint32_t i = 0; i < n && !bad; i++) {
+            uint32_t tags = 0;
+            if (get_str(f, name, sizeof name) != 0 ||
+                get_str(f, hash, sizeof hash) != 0 ||
+                get_u32(f, &tags) != 0) { bad = 1; break; }
+            authstore_add_user(s, name, hash, tags);
+        }
+    } else bad = 1;
+    if (!bad && get_u32(f, &n) == 0) {
+        for (uint32_t i = 0; i < n && !bad; i++) {
+            if (get_str(f, name, sizeof name) != 0 ||
+                get_str(f, vh, sizeof vh) != 0 ||
+                get_str(f, cf, sizeof cf) != 0 ||
+                get_str(f, wr, sizeof wr) != 0 ||
+                get_str(f, rd, sizeof rd) != 0) { bad = 1; break; }
+            authstore_set_perm(s, name, vh, cf, wr, rd);
+        }
+    } else bad = 1;
+    fclose(f);
+
+    if (bad) {
+        LOG_ERROR("authstore: '%s' is corrupt or truncated; ignoring it", path);
+        return -1;
+    }
+    /* Restore the sticky bootstrap flag and enable future auto-saves. */
+    pthread_rwlock_wrlock(&s->lock);
+    if (boot)
+        s->bootstrap_completed = 1;
+    snprintf(s->persist_path, sizeof s->persist_path, "%s", path);
+    pthread_rwlock_unlock(&s->lock);
+    LOG_INFO("authstore: loaded %zu user(s), %zu vhost(s), %zu permission(s) from '%s'",
+             s->nu, s->nv, s->np, path);
+    return 0;
 }
 
 int authstore_vhost_exists(authstore_t *s, const char *vhost)
