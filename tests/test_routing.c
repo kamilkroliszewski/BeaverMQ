@@ -293,6 +293,18 @@ static void test_exchange_topic_match_patterns(void)
     CHECK(!exchange_topic_match("orders.eu", "orders.us"));
     CHECK(exchange_topic_match("orders.eu", "orders.eu"));
     CHECK(!exchange_topic_match("orders.*", "orders")); /* * requires a word to be present */
+
+    /* Pathological many-'#' pattern against a long key. A naive recursive
+     * matcher re-explores exponentially many (pattern,key) positions and would
+     * hang here; the memoized matcher returns instantly. We assert correctness
+     * on the tricky cases - reaching this point at all proves it did not blow
+     * up (the suite would otherwise time out). */
+    CHECK(exchange_topic_match("#.#.#.#.#.#.#.#",
+                               "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t"));
+    CHECK(exchange_topic_match("#.a.#.b.#.c.#", "x.a.y.z.b.q.c"));
+    CHECK(!exchange_topic_match("#.a.#.b.#.c.#.NOPE",
+                                "a.a.a.b.b.b.c.c.c.d.d.d"));
+    CHECK(exchange_topic_match("#.#.#", "one.two")); /* extra #'s match zero words */
 }
 
 static void test_exchange_topic_routing(void)

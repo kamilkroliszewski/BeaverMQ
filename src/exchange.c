@@ -186,23 +186,36 @@ static void free_words(words_t *w)
     free(w->buf);
 }
 
-/* Recursive token matcher: '*' matches one word, '#' matches zero or more. */
-static int match_tokens(char **pat, int pi, int np, char **key, int ki, int nk)
+/* Token matcher: '*' matches one word, '#' matches zero or more. Memoized on
+ * (pi, ki) so it runs in O(np*nk) instead of exploding exponentially on
+ * patterns with several '#' wildcards - a naive recursion re-explores the same
+ * (pi, ki) states over and over, which a hostile pattern like "#.#.#.#..."
+ * against a long key turns into a CPU-exhaustion DoS. `memo` holds a tri-state
+ * per (pi, ki): -1 = not computed, 0/1 = cached result. */
+static int match_tokens(char **pat, int np, char **key, int nk,
+                        int pi, int ki, signed char *memo)
 {
-    if (pi == np)
-        return ki == nk;
+    signed char *slot = &memo[pi * (nk + 1) + ki];
+    if (*slot >= 0)
+        return *slot;
 
-    if (strcmp(pat[pi], "#") == 0) {
-        for (int k = ki; k <= nk; k++)
-            if (match_tokens(pat, pi + 1, np, key, k, nk))
-                return 1;
-        return 0;
+    int r;
+    if (pi == np) {
+        r = (ki == nk);
+    } else if (strcmp(pat[pi], "#") == 0) {
+        r = 0;
+        for (int k = ki; k <= nk; k++) {
+            if (match_tokens(pat, np, key, nk, pi + 1, k, memo)) { r = 1; break; }
+        }
+    } else if (ki == nk) {
+        r = 0;
+    } else if (strcmp(pat[pi], "*") == 0 || strcmp(pat[pi], key[ki]) == 0) {
+        r = match_tokens(pat, np, key, nk, pi + 1, ki + 1, memo);
+    } else {
+        r = 0;
     }
-    if (ki == nk)
-        return 0;
-    if (strcmp(pat[pi], "*") == 0 || strcmp(pat[pi], key[ki]) == 0)
-        return match_tokens(pat, pi + 1, np, key, ki + 1, nk);
-    return 0;
+    *slot = (signed char)r;
+    return r;
 }
 
 int exchange_topic_match(const char *pattern, const char *key)
@@ -214,7 +227,15 @@ int exchange_topic_match(const char *pattern, const char *key)
         free_words(&pw);
         return 0;
     }
-    int r = match_tokens(pw.words, 0, pw.n, kw.words, 0, kw.n);
+    /* (np+1) * (nk+1) memo cells; routing keys/patterns are shortstrings
+     * (<=255 bytes -> <=128 words), so this is at most a few KB. */
+    signed char *memo = malloc((size_t)(pw.n + 1) * (size_t)(kw.n + 1));
+    int r = 0;
+    if (memo) {
+        memset(memo, -1, (size_t)(pw.n + 1) * (size_t)(kw.n + 1));
+        r = match_tokens(pw.words, pw.n, kw.words, kw.n, 0, 0, memo);
+        free(memo);
+    }
     free_words(&pw);
     free_words(&kw);
     return r;
