@@ -39,6 +39,27 @@ def main() -> int:
     assert req(base + "/api/overview", user, pw) == 200, "correct creds should be 200"
     print("OK: correct credentials accepted (200)")
 
+    # Fuzz the custom HTTP parser with random + malformed requests over raw
+    # sockets; the broker must survive every one (checked by healthz below).
+    import random
+    import socket
+    rnd = random.Random(1234)
+    frags = [b"GET ", b"POST ", b"/api/overview", b"/api/vhosts/%", b" HTTP/1.1",
+             b"\r\n", b"Host: x", b"Content-Length: ", b"-1", b"99999999999999",
+             b"Authorization: Basic ", b"\x00\x01\x02", b"%", b"%zz", b"%f"]
+    for _ in range(200):
+        try:
+            s = socket.socket(); s.settimeout(1); s.connect((host, port))
+            if rnd.random() < 0.5:
+                s.sendall(bytes(rnd.getrandbits(8) for _ in range(rnd.randint(0, 64))))
+            else:
+                s.sendall(b"".join(rnd.choice(frags) for _ in range(rnd.randint(1, 12))))
+            s.close()
+        except OSError:
+            pass
+    assert req(base + "/api/healthz") == 200, "broker must survive HTTP fuzzing"
+    print("OK: HTTP parser survived 200 random/malformed requests")
+
     # A burst of wrong-password requests from this IP must eventually be
     # rate-limited (429) rather than hashing every one (authlimit).
     codes = [req(base + "/api/overview", user, "wrongpw") for _ in range(12)]

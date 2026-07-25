@@ -636,8 +636,9 @@ now refuses to reproduce.
   auth, `Queue.Declare`, a publish→`Basic.Get` round‑trip, **publisher confirms**
   (`Confirm.Select` → two `Basic.Ack`s), and ordered `Basic.Consume` delivery.
 - `tests/integration/test_management.py` — stdlib only: `healthz` is open,
-  the API demands credentials (401), correct ones work (200), and a wrong‑login
-  burst from one IP is rate‑limited (429).
+  the API demands credentials (401), correct ones work (200), a wrong‑login
+  burst from one IP is rate‑limited (429), and the custom HTTP parser survives
+  200 random/malformed requests.
 
 It installs `pika` into a throwaway venv, or SKIPs the AMQP client test with a
 clear message when offline; the stdlib management test always runs.
