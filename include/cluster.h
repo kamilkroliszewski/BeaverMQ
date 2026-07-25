@@ -189,6 +189,7 @@ typedef enum {
     CL_OP_DEL_USER      = 9,  /* str(user) */
     CL_OP_SET_PERM      = 10, /* str(user) str(vhost) str(conf) str(write) str(read) */
     CL_OP_CLEAR_PERM    = 11, /* str(user) str(vhost) */
+    CL_OP_DELETE_QUEUE  = 12, /* str(vhost) str(queue) - delete a durable queue */
 } cluster_op_t;
 
 typedef struct {
@@ -522,6 +523,11 @@ uint64_t cluster_replicate_publish_tracked(cluster_node_t *n, const char *vhost,
                               const char *exchange, const char *routing_key,
                               const void *body, size_t body_len,
                               const void *props, size_t props_len);
+
+/* Replicate a durable queue deletion so every node drops it (idempotent apply,
+ * carried in the topology snapshot). Returns 0 if accepted. */
+int cluster_replicate_delete_queue(cluster_node_t *n, const char *vhost,
+                                   const char *queue);
 
 /* Replicate a queue's consume watermark so every node drains its replica copies
  * of messages with cluster_id <= watermark. Returns 0 if accepted. */

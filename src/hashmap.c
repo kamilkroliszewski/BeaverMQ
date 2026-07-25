@@ -1,10 +1,21 @@
 /*
  * hashmap.c - Separate-chaining string hash map with automatic growth.
+ *
+ * Keys (queue/exchange names, registry keys) are largely client-controlled, so
+ * the bucket hash is SipHash-1-3 keyed by a per-process random secret. A plain
+ * unseeded hash like djb2 lets an attacker precompute many keys that collide
+ * into one bucket, degrading every lookup to O(n) (a hash-flooding DoS); with a
+ * secret key they cannot know, colliding keys can no longer be precomputed.
  */
 #include "hashmap.h"
+#include "crypto.h"
 
+#include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 typedef struct entry {
     char         *key;
@@ -22,14 +33,72 @@ struct hashmap {
 #define HASHMAP_INITIAL_BUCKETS 16
 #define HASHMAP_MAX_LOAD        0.75
 
-/* djb2 string hash. */
+/* ---- SipHash-1-3, keyed by a per-process secret -------------------------- */
+
+static uint64_t g_sip_k0, g_sip_k1;
+static pthread_once_t g_sip_once = PTHREAD_ONCE_INIT;
+
+static void sip_key_init(void)
+{
+    uint8_t k[16];
+    if (crypto_random_bytes(k, sizeof k) == 0) {
+        memcpy(&g_sip_k0, k,     8);
+        memcpy(&g_sip_k1, k + 8, 8);
+    } else {
+        /* No CSPRNG: still better than a fixed key. Mix pid + time + address. */
+        uint64_t a = (uint64_t)getpid();
+        uint64_t b = (uint64_t)time(NULL);
+        uint64_t c = (uint64_t)(uintptr_t)&g_sip_k0;
+        g_sip_k0 = a * 0x9e3779b97f4a7c15ull ^ (b << 1);
+        g_sip_k1 = c * 0xbf58476d1ce4e5b9ull ^ (a << 3);
+    }
+}
+
+#define SIP_ROTL(x, b) (((x) << (b)) | ((x) >> (64 - (b))))
+#define SIP_ROUND()                                            \
+    do {                                                       \
+        v0 += v1; v1 = SIP_ROTL(v1, 13); v1 ^= v0; v0 = SIP_ROTL(v0, 32); \
+        v2 += v3; v3 = SIP_ROTL(v3, 16); v3 ^= v2;             \
+        v0 += v3; v3 = SIP_ROTL(v3, 21); v3 ^= v0;             \
+        v2 += v1; v1 = SIP_ROTL(v1, 17); v1 ^= v2; v2 = SIP_ROTL(v2, 32); \
+    } while (0)
+
+/* SipHash-1-3 (1 compression round, 3 finalization rounds). Little-endian
+ * word loads (the broker's platform); adequate for hash-table keying. */
 static size_t hash_str(const char *s)
 {
-    size_t h = 5381;
-    int c;
-    while ((c = (unsigned char)*s++))
-        h = ((h << 5) + h) + (size_t)c;
-    return h;
+    pthread_once(&g_sip_once, sip_key_init);
+
+    size_t inlen = strlen(s);
+    const uint8_t *in = (const uint8_t *)s;
+
+    uint64_t v0 = 0x736f6d6570736575ull ^ g_sip_k0;
+    uint64_t v1 = 0x646f72616e646f6dull ^ g_sip_k1;
+    uint64_t v2 = 0x6c7967656e657261ull ^ g_sip_k0;
+    uint64_t v3 = 0x7465646279746573ull ^ g_sip_k1;
+
+    const uint8_t *end = in + (inlen & ~(size_t)7);
+    for (; in != end; in += 8) {
+        uint64_t mi;
+        memcpy(&mi, in, 8);
+        v3 ^= mi; SIP_ROUND(); v0 ^= mi;
+    }
+
+    uint64_t b = (uint64_t)inlen << 56;
+    switch (inlen & 7) {
+    case 7: b |= (uint64_t)in[6] << 48; /* fallthrough */
+    case 6: b |= (uint64_t)in[5] << 40; /* fallthrough */
+    case 5: b |= (uint64_t)in[4] << 32; /* fallthrough */
+    case 4: b |= (uint64_t)in[3] << 24; /* fallthrough */
+    case 3: b |= (uint64_t)in[2] << 16; /* fallthrough */
+    case 2: b |= (uint64_t)in[1] << 8;  /* fallthrough */
+    case 1: b |= (uint64_t)in[0];       /* fallthrough */
+    case 0: break;
+    }
+    v3 ^= b; SIP_ROUND(); v0 ^= b;
+    v2 ^= 0xff;
+    SIP_ROUND(); SIP_ROUND(); SIP_ROUND();
+    return (size_t)(v0 ^ v1 ^ v2 ^ v3);
 }
 
 hashmap_t *hashmap_new(void)

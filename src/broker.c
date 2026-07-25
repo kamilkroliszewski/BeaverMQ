@@ -177,6 +177,52 @@ int broker_bind(beaver_broker_t *b, const char *vhost, const char *queue,
     return rc;
 }
 
+/* hashmap_iter callback: drop every binding to the queue in `ctx`. */
+static int unbind_queue_cb(const char *key, void *value, void *ctx)
+{
+    (void)key;
+    exchange_unbind_queue((beaver_exchange_t *)value, (const beaver_queue_t *)ctx);
+    return 0;
+}
+
+int broker_delete_queue(beaver_broker_t *b, const char *vhost, const char *name,
+                        int if_unused, int if_empty, uint32_t *out_msgcount)
+{
+    char key[512];
+    broker_vkey(key, vhost, name);
+    int rc = 0;
+    pthread_rwlock_wrlock(&b->lock);
+
+    beaver_queue_t *q = hashmap_get(b->queues, key);
+    if (!q) {
+        rc = -1; /* no such queue */
+        goto done;
+    }
+    if (if_unused && queue_consumer_count(q) > 0) {
+        rc = -2; /* IN_USE: has consumers */
+        goto done;
+    }
+    uint32_t depth = (uint32_t)queue_depth(q); /* broker -> queue lock order */
+    if (if_empty && depth > 0) {
+        rc = -3; /* NOT_EMPTY */
+        goto done;
+    }
+    if (out_msgcount)
+        *out_msgcount = depth;
+
+    /* Drop every binding that points at this queue, then remove it from the
+     * registry. Other holders (worker dispatchers, in-flight routes) keep it
+     * alive via their own refs until they let go - only the registry's ref is
+     * released here. */
+    hashmap_iter(b->exchanges, unbind_queue_cb, q);
+    hashmap_remove(b->queues, key);
+    queue_unref(q);
+
+done:
+    pthread_rwlock_unlock(&b->lock);
+    return rc;
+}
+
 int broker_route(beaver_broker_t *b, const char *vhost, beaver_message_t *msg)
 {
     msg->id = atomic_fetch_add_explicit(&b->next_msg_id, 1, memory_order_relaxed);

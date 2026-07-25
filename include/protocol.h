@@ -67,6 +67,8 @@ typedef struct beaver_proto beaver_proto_t;
 #define BMQP_QUEUE_DECLARE_OK  11  /* S->C */
 #define BMQP_QUEUE_BIND        20  /* C->S */
 #define BMQP_QUEUE_BIND_OK     21  /* S->C */
+#define BMQP_QUEUE_DELETE      40  /* C->S */
+#define BMQP_QUEUE_DELETE_OK   41  /* S->C */
 
 /* ---- basic methods (class 60) -------------------------------------------- */
 #define BMQP_BASIC_CONSUME     20  /* C->S */

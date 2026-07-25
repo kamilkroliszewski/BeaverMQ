@@ -53,6 +53,10 @@ void            exchange_set_vhost(beaver_exchange_t *ex, const char *vhost);
  * Bind `q` to the exchange under `routing_key`. Takes its own reference to the
  * queue. Re-binding the same (queue, key) pair is a no-op. Returns 0 or -1.
  */
+/* Remove every binding to `q` (used when a queue is deleted). Returns how many
+ * bindings were removed. Caller holds the broker write lock. */
+size_t exchange_unbind_queue(beaver_exchange_t *ex, const beaver_queue_t *q);
+
 int exchange_bind(beaver_exchange_t *ex, const char *routing_key,
                   beaver_queue_t *q);
 

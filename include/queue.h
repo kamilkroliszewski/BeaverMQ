@@ -35,6 +35,12 @@ void            queue_unref(beaver_queue_t *q);
 
 const char *queue_name(const beaver_queue_t *q);
 uint8_t     queue_flags(const beaver_queue_t *q);
+
+/* Exclusive-queue ownership: the connection id that declared it exclusive, or 0
+ * if the queue is not exclusive. Set by the broker/protocol at declare time and
+ * read to reject access from other connections (AMQP RESOURCE_LOCKED). */
+void     queue_set_exclusive_owner(beaver_queue_t *q, uint64_t conn_id);
+uint64_t queue_exclusive_owner(beaver_queue_t *q);
 /* Owning virtual host. Set once by the broker at declare time. */
 const char *queue_vhost(const beaver_queue_t *q);
 void        queue_set_vhost(beaver_queue_t *q, const char *vhost);

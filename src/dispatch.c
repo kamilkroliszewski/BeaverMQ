@@ -67,6 +67,7 @@ struct group {
 struct beaver_dispatcher {
     uv_loop_t       *loop;
     beaver_broker_t *broker;
+    int              tearing_down; /* in dispatcher_free: suppress auto-delete */
 
     uv_async_t       async;
     int              async_closing;
@@ -232,6 +233,18 @@ static void consumer_destroy(beaver_dispatcher_t *d, consumer_t *c, int requeue)
         dispatcher_notify(d, g->queue); /* let remaining consumers take them */
     }
 
+    /* Auto-delete: once the LAST consumer ANYWHERE is gone (the global consumer
+     * count, decremented above, reaches zero), an auto-delete queue is dropped -
+     * AMQP semantics (RabbitMQ's perf-test relies on this to clean up). Skipped
+     * during dispatcher teardown (the broker is going away too). Idempotent, so
+     * a race between workers each losing their last consumer is harmless. */
+    if (!d->tearing_down &&
+        (queue_flags(c->queue) & BMQP_FLAG_AUTO_DELETE) &&
+        queue_consumer_count(c->queue) == 0) {
+        broker_delete_queue(d->broker, queue_vhost(c->queue),
+                            queue_name(c->queue), 0, 0, NULL);
+    }
+
     /* Remove from the global list. */
     if (c->prev)
         c->prev->next = c->next;
@@ -250,6 +263,7 @@ void dispatcher_free(beaver_dispatcher_t *d)
 {
     if (!d)
         return;
+    d->tearing_down = 1; /* don't auto-delete queues as we drop consumers */
     /* Drop every consumer without requeuing (we're tearing down). */
     while (d->consumers)
         consumer_destroy(d, d->consumers, 0);

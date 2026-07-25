@@ -42,6 +42,13 @@ typedef enum {
 authstore_t *authstore_new(void);
 void         authstore_free(authstore_t *s);
 
+/* STANDALONE persistence: load the store from `path` and thereafter rewrite it
+ * atomically on every mutation, so users/vhosts/permissions survive a restart
+ * (a cluster must NOT call this - it persists via Raft). Missing file = fresh
+ * start (the path is remembered for the first write). Returns 0 on success or
+ * "no file yet", -1 if the file is corrupt (store left unchanged). */
+int authstore_load(authstore_t *s, const char *path);
+
 /* ---- mutators (cluster loop; idempotent upserts) ------------------------- */
 int authstore_add_vhost(authstore_t *s, const char *vhost);
 int authstore_del_vhost(authstore_t *s, const char *vhost);

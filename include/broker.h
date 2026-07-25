@@ -74,6 +74,14 @@ void broker_declare_default_exchanges(beaver_broker_t *b, const char *vhost);
  * Bind a queue to an exchange under a routing key (both within `vhost`).
  * Returns 0 on success, or -1 if either does not exist (or on OOM).
  */
+/* Delete a queue: remove its bindings from every exchange and drop it from the
+ * registry (other holders keep it alive via refcount until they release it).
+ * `if_unused` fails with -2 when the queue still has consumers; `if_empty`
+ * fails with -3 when it still holds messages; `out_msgcount` (optional) gets the
+ * depth at deletion. Returns 0 on success, -1 if no such queue. */
+int broker_delete_queue(beaver_broker_t *b, const char *vhost, const char *name,
+                        int if_unused, int if_empty, uint32_t *out_msgcount);
+
 int broker_bind(beaver_broker_t *b, const char *vhost, const char *queue,
                 const char *exchange, const char *routing_key);
 

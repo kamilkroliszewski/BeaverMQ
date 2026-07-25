@@ -380,12 +380,18 @@ A small JSON REST API on port `15672`. All responses are
 
 Authentication and authorization are **replicated through Raft**, so the user /
 vhost / permission table is identical on every node and survives restart +
-compaction.
+compaction. **Standalone** (non‑cluster) with a `data_dir` persists the same
+table locally to `data_dir/authstore.db` (written `0600`, atomically on every
+change), so users/vhosts/permissions also survive a restart; without a
+`data_dir` it is in‑memory only (and says so at startup).
 
 **First boot.** There is **no default user** (a `guest` default would silently
 accept every stock AMQP client). A fresh broker refuses every AMQP login and
 its management API/dashboard are open only long enough to create the first
-administrator:
+administrator. That bootstrap window is **one‑way**: once any user has ever been
+created it stays closed permanently — deleting the last user does **not** reopen
+it (recovery is then an explicit, out‑of‑band action, not something a stray
+delete re‑enables):
 
 ```bash
 build/beavermq add-user admin 's3cret'          # first admin (bootstrap window)
@@ -538,7 +544,7 @@ Implemented classes/methods (official AMQP 0‑9‑1 ids):
 | Connection (10)  | Start/StartOk, Tune/TuneOk, Open/OpenOk, Close/CloseOk     |
 | Channel (20)     | Open/OpenOk, Close/CloseOk                                 |
 | Exchange (40)    | Declare/DeclareOk                                         |
-| Queue (50)       | Declare/DeclareOk, Bind/BindOk                             |
+| Queue (50)       | Declare/DeclareOk, Bind/BindOk, Delete/DeleteOk           |
 | Basic (60)       | Qos/QosOk, Consume/ConsumeOk, Cancel/CancelOk, Publish,    |
 |                  | Deliver, Get/GetOk/GetEmpty, Ack, Nack, Reject             |
 | Confirm (85)     | Select/SelectOk (publisher confirms)                      |
@@ -548,6 +554,12 @@ store (see [Access control](#access-control-vhosts-users-permissions)); logins
 are rate‑limited per client IP. Field tables (client capabilities, method
 `arguments`) are parsed safely. Layouts live in
 [`include/protocol.h`](include/protocol.h) / [`src/protocol.c`](src/protocol.c).
+
+**Queue lifecycle** follows AMQP semantics: `Queue.Delete` removes a queue (with
+`if-unused` / `if-empty`), an **exclusive** queue is locked to its declaring
+connection and deleted when that connection closes, and an **auto‑delete** queue
+is removed once its last consumer goes away. In a cluster, deleting a durable
+queue replicates through Raft.
 
 **Not implemented / partial** (so clients don't assume more than is there):
 
@@ -611,6 +623,10 @@ now refuses to reproduce.
   WAL/snapshot files and asserts the node marks itself storage‑failed (the P0
   fail‑stop) rather than trusting broken storage; a control run proves no false
   positives (`make fault-test`)
+- `test_persistence.sh` — standalone authstore persistence + durable bootstrap:
+  a user survives a restart, `authstore.db` is `0600`, and the first‑boot
+  bootstrap window stays closed once any user has existed — even after the last
+  user is deleted (`make persistence-test`)
 
 ### Integration tests (live broker)
 
@@ -635,6 +651,7 @@ make tsan && ./build/beavermq   # ThreadSanitizer build; drive it with a client
 make fuzz && ./build/fuzz_frame -max_total_time=60   # libFuzzer (clang)
 make integration   # live AMQP + management API tests
 make fault-test    # storage-layer fault injection (WAL/snapshot fail-stop)
+make persistence-test           # standalone persistence + durable bootstrap
 bash tests/test_cluster.sh      # 3-node Raft election + failover
 ```
 

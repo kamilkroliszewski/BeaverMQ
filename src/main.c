@@ -37,6 +37,7 @@
 #include <limits.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifdef __GLIBC__
@@ -725,11 +726,35 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     if (!app.config.cluster_enabled) {
-        authstore_add_vhost(app.authstore, "/");
-        LOG_WARN("no users configured - AMQP logins are refused");
+        /* Standalone: persist the access-control store locally so users/vhosts/
+         * permissions survive a restart (a cluster persists via Raft instead).
+         * Without a data_dir it stays in-memory only - warn, since that means
+         * config is lost on restart. */
+        if (app.config.data_dir[0]) {
+            mkdir(app.config.data_dir, 0700); /* best-effort; may already exist */
+            char adb[600];
+            int an = snprintf(adb, sizeof adb, "%s/authstore.db", app.config.data_dir);
+            if (an > 0 && (size_t)an < sizeof adb)
+                authstore_load(app.authstore, adb);
+        } else {
+            LOG_WARN("no data_dir configured - users/vhosts/permissions are "
+                     "in-memory only and will NOT survive a restart");
+        }
+        authstore_add_vhost(app.authstore, "/"); /* ensure the default vhost */
+        if (authstore_is_open(app.authstore))
+            LOG_WARN("no users configured - AMQP logins are refused");
     }
-    char bootstrap_token[64];
-    generate_bootstrap_token(&app.config, bootstrap_token, sizeof bootstrap_token);
+    /* Only mint a bootstrap token while the window is actually open. A store
+     * loaded from disk that already has users (or has completed bootstrap
+     * before) keeps the window closed - deleting the last user does NOT reopen
+     * it. In a cluster the store is empty until Raft catches up, so the window
+     * is open at startup and closes (dynamically, per request) once a user is
+     * applied. */
+    char bootstrap_token[64] = "";
+    if (authstore_is_open(app.authstore))
+        generate_bootstrap_token(&app.config, bootstrap_token, sizeof bootstrap_token);
+    else
+        LOG_INFO("bootstrap already completed; first-boot window is closed");
 
     atomic_init(&app.stats.next_conn_id, 0);
     atomic_init(&app.stats.total_conns, 0);

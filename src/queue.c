@@ -67,6 +67,8 @@ struct beaver_queue {
 
     _Atomic int        consumers;  /* live consumer count (management metric) */
     _Atomic int        refcount;
+    _Atomic uint64_t   exclusive_owner; /* owning connection id for an exclusive
+                                         * queue, or 0 if not exclusive */
 };
 
 beaver_queue_t *queue_new(const char *name, uint8_t flags)
@@ -130,6 +132,15 @@ void queue_set_vhost(beaver_queue_t *q, const char *vhost)
     q->vhost = strdup(vhost ? vhost : "");
 }
 uint8_t     queue_flags(const beaver_queue_t *q) { return q->flags; }
+
+void queue_set_exclusive_owner(beaver_queue_t *q, uint64_t conn_id)
+{
+    atomic_store_explicit(&q->exclusive_owner, conn_id, memory_order_relaxed);
+}
+uint64_t queue_exclusive_owner(beaver_queue_t *q)
+{
+    return atomic_load_explicit(&q->exclusive_owner, memory_order_relaxed);
+}
 
 /* Double the ring buffer, re-linearizing live elements from index 0.
  * Caller must hold q->lock. Returns 0 or -1 on OOM. */
