@@ -199,6 +199,9 @@ typedef struct {
     uint64_t max_length;
     int      has_max_bytes;
     uint64_t max_bytes;
+    int      has_dlx;
+    char     dlx[256];
+    char     dlx_rkey[256];
 } queue_args_t;
 
 /* Consume one AMQP field-table value of the given type, yielding its integer
@@ -241,15 +244,31 @@ static void parse_queue_args(const uint8_t *tbl, size_t len, queue_args_t *out)
         uint8_t type = bmqp_read_u8(&r);
         if (r.error || !name)
             break;
-        /* x-overflow is a string value: capture it before consuming. */
-        if (type == 'S' && nlen == 10 && memcmp(name, "x-overflow", 10) == 0) {
-            size_t vlen;
-            const char *v = bmqp_read_longstr(&r, &vlen);
-            if (r.error)
-                break;
-            out->has_overflow = 1;
-            copy_str(out->overflow, sizeof out->overflow, v, vlen);
-            continue;
+        /* String-valued keys we care about: capture in place before consuming. */
+        if (type == 'S') {
+            if (nlen == 10 && memcmp(name, "x-overflow", 10) == 0) {
+                size_t vlen;
+                const char *v = bmqp_read_longstr(&r, &vlen);
+                if (r.error) break;
+                out->has_overflow = 1;
+                copy_str(out->overflow, sizeof out->overflow, v, vlen);
+                continue;
+            }
+            if (nlen == 22 && memcmp(name, "x-dead-letter-exchange", 22) == 0) {
+                size_t vlen;
+                const char *v = bmqp_read_longstr(&r, &vlen);
+                if (r.error) break;
+                out->has_dlx = 1;
+                copy_str(out->dlx, sizeof out->dlx, v, vlen);
+                continue;
+            }
+            if (nlen == 25 && memcmp(name, "x-dead-letter-routing-key", 25) == 0) {
+                size_t vlen;
+                const char *v = bmqp_read_longstr(&r, &vlen);
+                if (r.error) break;
+                copy_str(out->dlx_rkey, sizeof out->dlx_rkey, v, vlen);
+                continue;
+            }
         }
         uint64_t ival;
         if (!read_field_value(&r, type, &ival))
@@ -383,7 +402,7 @@ static int chan_get_unacked_add(proto_chan_t *pc, uint64_t tag,
  * if delivery_tag == 0, matching dispatch.c's settle_unacked semantics).
  * Returns the number settled. */
 static size_t chan_get_unacked_settle(proto_chan_t *pc, uint64_t delivery_tag,
-                                      int multiple, int requeue)
+                                      int multiple, int requeue, int rejected)
 {
     size_t settled = 0;
     for (size_t i = 0; i < pc->n_get_unacked; ) {
@@ -401,8 +420,13 @@ static size_t chan_get_unacked_settle(proto_chan_t *pc, uint64_t delivery_tag,
             if (queue_requeue_internal(g.queue, g.msg) != 0)
                 LOG_ERROR("OOM requeuing rejected Basic.Get message "
                           "(queue=%s): message dropped", queue_name(g.queue));
-        } else
+        } else {
+            /* Reject/nack without requeue dead-letters (if a DLX is set); a
+             * positive ack (rejected == 0) is just consumed-and-gone. */
+            if (rejected)
+                queue_dead_letter(g.queue, g.msg);
             queue_consume_on_ack(g.queue, g.msg->cluster_id);
+        }
         message_unref(g.msg);
         queue_unref(g.queue);
         pc->get_unacked[i] = pc->get_unacked[--pc->n_get_unacked];
@@ -1424,7 +1448,8 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         if (created) {
             queue_args_t qa;
             parse_queue_args((const uint8_t *)args, tbl, &qa);
-            if (qa.has_overflow || qa.has_max_length || qa.has_max_bytes) {
+            if (qa.has_overflow || qa.has_max_length || qa.has_max_bytes ||
+                qa.has_dlx) {
                 beaver_queue_t *lq = broker_get_queue(p->conn->server->broker,
                                                       p->vhost, qname);
                 if (lq) {
@@ -1441,14 +1466,28 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
                         LOG_WARN("conn #%" PRIu64 ": unsupported x-overflow '%s' "
                                  "on queue '%s'; using reject-publish",
                                  p->conn->id, qa.overflow, qname);
+                    if (qa.has_dlx) {
+                        /* Illegal exchange name in a DLX arg would be silently
+                         * unroutable; reject it up front. */
+                        if (!name_ok(qa.dlx)) {
+                            queue_unref(lq);
+                            send_channel_close(p, channel, 406,
+                                "PRECONDITION_FAILED - illegal x-dead-letter-exchange",
+                                BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE);
+                            return;
+                        }
+                        broker_set_queue_dead_letter(p->conn->server->broker, lq,
+                                                     qa.dlx, qa.dlx_rkey);
+                    }
                     LOG_INFO("conn #%" PRIu64 ": queue '%s' limits "
                              "max_length=%" PRIu64 " max_bytes=%" PRIu64
-                             " overflow=%s", p->conn->id, qname,
+                             " overflow=%s dlx='%s'", p->conn->id, qname,
                              qa.has_max_length ? qa.max_length : 0,
                              qa.has_max_bytes ? qa.max_bytes : 0,
                              (qa.has_overflow &&
                               strcmp(qa.overflow, "drop-head") == 0)
-                                 ? "drop-head" : "reject-publish");
+                                 ? "drop-head" : "reject-publish",
+                             qa.has_dlx ? qa.dlx : "");
                     queue_unref(lq);
                 }
             }
@@ -1904,7 +1943,7 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
          * both; for a single tag, only try the dispatcher if it wasn't a
          * tracked Basic.Get delivery (avoids a spurious "unknown tag" log). */
         proto_chan_t *pc = channel_find(p, channel);
-        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, multiple, 0) : 0;
+        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, multiple, 0, 0) : 0;
         if (multiple || got == 0)
             dispatcher_ack(p->conn->server->dispatcher, p->conn, channel,
                           delivery_tag, multiple);
@@ -1921,7 +1960,8 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
             return;
         }
         proto_chan_t *pc = channel_find(p, channel);
-        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, 0, requeue) : 0;
+        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, 0, requeue,
+                                                  !requeue) : 0;
         if (got == 0)
             dispatcher_nack(p->conn->server->dispatcher, p->conn, channel,
                            delivery_tag, 0 /* multiple */, requeue);
@@ -1941,7 +1981,8 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
         int multiple = (bits & 0x01) != 0;
         int requeue2 = (bits & 0x02) != 0;
         proto_chan_t *pc = channel_find(p, channel);
-        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, multiple, requeue2) : 0;
+        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, multiple,
+                                                  requeue2, !requeue2) : 0;
         if (multiple || got == 0)
             dispatcher_nack(p->conn->server->dispatcher, p->conn, channel,
                            delivery_tag, multiple, requeue2);
@@ -2184,6 +2225,13 @@ static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
                               body, body_len, p->pub_props, p->pub_props_len);
     }
     proto_advance(p, BMQP_STATE_ACTIVE);
+    /* Local producer flow control: if any queue is over its high-water mark,
+     * pause this producer's reads (TCP backpressure) so it cannot outrun the
+     * consumers. The per-server throttle timer resumes reads once the broker-wide
+     * flow alarm clears (see on_throttle_timer / beaver_conn_throttle_read). This
+     * complements the cluster-congestion throttle on the replicated path above. */
+    if (queue_flow_alarm_active())
+        beaver_conn_throttle_read(p->conn);
     /* Hot path: keep at DEBUG so high-throughput publishing isn't throttled by
      * synchronous logging (the LOG_DEBUG macro is a no-op when filtered). */
     LOG_DEBUG("conn #%" PRIu64 " ch=%u: Basic.Publish exchange='%s' key='%s' "

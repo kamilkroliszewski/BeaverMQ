@@ -670,12 +670,15 @@ int dispatcher_add_consumer(beaver_dispatcher_t *d, beaver_conn_t *conn,
  *     outstanding when delivery_tag == 0), per AMQP semantics;
  *   - `requeue` (nack only) puts the message back on its queue for redelivery
  *     instead of discarding it.
+ *   - `rejected` (only meaningful when !requeue) marks a negative settle
+ *     (nack/reject without requeue) as opposed to a positive ack, so the
+ *     message is dead-lettered (if the queue has a DLX) rather than just dropped.
  * Returns the number of deliveries settled. Queues that had deliveries
  * settled are re-notified: acks free prefetch slots, requeues need delivery.
  */
 static size_t settle_unacked(beaver_dispatcher_t *d, beaver_conn_t *conn,
                              uint16_t channel, uint64_t delivery_tag,
-                             int multiple, int requeue)
+                             int multiple, int requeue, int rejected)
 {
     size_t settled = 0;
     for (consumer_t *c = d->consumers; c; c = c->next) {
@@ -700,8 +703,12 @@ static size_t settle_unacked(beaver_dispatcher_t *d, beaver_conn_t *conn,
                     LOG_ERROR("OOM requeuing nacked message on queue=%s: "
                               "message dropped", queue_name(c->queue));
             } else {
-                /* Consumed-and-gone: let the watermark pass it so replicas
-                 * drop their copies too. */
+                /* Nack/reject without requeue: dead-letter it first (if the
+                 * queue has a DLX), then let the watermark pass it so replicas
+                 * drop their copies too. A positive ack (rejected == 0) is just
+                 * consumed-and-gone. */
+                if (rejected)
+                    queue_dead_letter(c->queue, msg);
                 queue_consume_on_ack(c->queue, msg->cluster_id);
             }
             message_unref(msg);
@@ -724,7 +731,7 @@ static size_t settle_unacked(beaver_dispatcher_t *d, beaver_conn_t *conn,
 void dispatcher_ack(beaver_dispatcher_t *d, beaver_conn_t *conn,
                     uint16_t channel, uint64_t delivery_tag, int multiple)
 {
-    if (settle_unacked(d, conn, channel, delivery_tag, multiple, 0) == 0)
+    if (settle_unacked(d, conn, channel, delivery_tag, multiple, 0, 0) == 0)
         LOG_WARN("ack for unknown delivery_tag=%" PRIu64 " (multiple=%d)",
                  delivery_tag, multiple);
 }
@@ -733,7 +740,9 @@ void dispatcher_nack(beaver_dispatcher_t *d, beaver_conn_t *conn,
                      uint16_t channel, uint64_t delivery_tag,
                      int multiple, int requeue)
 {
-    size_t n = settle_unacked(d, conn, channel, delivery_tag, multiple, requeue);
+    /* Not requeued => a genuine reject: dead-letter (if a DLX is configured). */
+    size_t n = settle_unacked(d, conn, channel, delivery_tag, multiple, requeue,
+                              !requeue);
     if (n == 0)
         LOG_WARN("nack/reject for unknown delivery_tag=%" PRIu64, delivery_tag);
     else

@@ -16,6 +16,7 @@
 #include "protocol.h"
 #include "dispatch.h"
 #include "message.h"
+#include "queue.h"
 #include "http.h"
 #include "cluster.h"
 
@@ -519,9 +520,13 @@ static void on_shutdown_async(uv_async_t *handle)
 static void on_throttle_timer(uv_timer_t *timer)
 {
     beaver_server_t *server = timer->data;
-    if (!server->shutting_down && server->cluster &&
-        cluster_should_throttle(server->cluster))
-        return; /* still congested: keep producers paused */
+    /* Keep producers paused while EITHER the cluster is congested (durable
+     * replication backpressure) OR any local queue is over its high-water mark
+     * (the broker-wide flow alarm). Resume only once both have cleared. */
+    if (!server->shutting_down &&
+        ((server->cluster && cluster_should_throttle(server->cluster)) ||
+         queue_flow_alarm_active()))
+        return;
 
     pthread_mutex_lock(&server->conns_lock);
     for (beaver_conn_t *c = server->conns_head; c; c = c->next) {

@@ -123,6 +123,14 @@ int broker_publish(beaver_broker_t *b, const char *vhost, const char *exchange,
  */
 int broker_route(beaver_broker_t *b, const char *vhost, beaver_message_t *msg);
 
+/* Install this broker's dead-letter re-router on `q`, targeting exchange `dlx`
+ * (with optional `dl_rkey`; NULL/"" reuses each message's own routing key). Once
+ * set, messages that leave `q` as dead letters (drop-head eviction, or a
+ * nack/reject without requeue) are re-routed to `dlx`. Pass dlx == NULL/"" to
+ * clear. Call at declare time. */
+void broker_set_queue_dead_letter(beaver_broker_t *b, beaver_queue_t *q,
+                                  const char *dlx, const char *dl_rkey);
+
 /* Look up a queue by (vhost, name), returning a NEW reference (caller
  * queue_unref's) or NULL. */
 beaver_queue_t *broker_get_queue(beaver_broker_t *b, const char *vhost,
