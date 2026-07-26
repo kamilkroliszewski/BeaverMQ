@@ -244,6 +244,47 @@ static void test_queue_overflow_drop_head_lone_big(void)
     queue_unref(q);
 }
 
+/* drop-head evictions are handed to the queue's dead-letter callback (the broker
+ * installs the real re-router; here a stub captures them) rather than silently
+ * dropped, and the callback runs without the queue lock held. */
+static beaver_message_t *g_dl_captured[16];
+static size_t            g_dl_n;
+static void capture_dead_letter(void *ctx, beaver_queue_t *src,
+                                beaver_message_t *msg)
+{
+    (void)ctx; (void)src;
+    if (g_dl_n < 16)
+        g_dl_captured[g_dl_n++] = message_ref(msg);
+}
+
+static void test_queue_dead_letter_drop_head(void)
+{
+    TEST_SECTION("drop-head evictions are handed to the dead-letter callback");
+    queue_set_default_limits(0, 0);
+    g_dl_n = 0;
+    beaver_queue_t *q = queue_new("qdl", 0);
+    queue_set_limits(q, 2, 0, QUEUE_OVERFLOW_DROP_HEAD);
+    queue_set_dead_letter(q, "dlx", "k", capture_dead_letter, NULL);
+    CHECK(queue_has_dead_letter(q));
+
+    beaver_message_t *m1 = message_new("", "", "1", 1);
+    beaver_message_t *m2 = message_new("", "", "2", 1);
+    beaver_message_t *m3 = message_new("", "", "3", 1);
+    CHECK_EQ(queue_enqueue(q, m1), 0);
+    CHECK_EQ(queue_enqueue(q, m2), 0);
+    CHECK_EQ(queue_enqueue(q, m3), 0); /* evicts m1 (the head) */
+    CHECK_EQ(queue_depth(q), 2);
+    CHECK_EQ(queue_total_dropped(q), 1);
+    /* The evicted head (m1) was dead-lettered exactly once. */
+    CHECK_EQ(g_dl_n, 1);
+    CHECK(g_dl_n == 1 && ((const char *)g_dl_captured[0]->body)[0] == '1');
+
+    for (size_t i = 0; i < g_dl_n; i++)
+        message_unref(g_dl_captured[i]);
+    message_unref(m1); message_unref(m2); message_unref(m3);
+    queue_unref(q);
+}
+
 /* Regression: an internal requeue (nack/reject/disconnect) must never be
  * dropped just because the queue hit its publisher-facing limit - otherwise a
  * full queue silently loses in-flight messages on requeue (audit 2.2). */
@@ -496,6 +537,7 @@ int main(void)
     test_queue_overflow_drop_head();
     test_queue_overflow_reject_publish();
     test_queue_overflow_drop_head_lone_big();
+    test_queue_dead_letter_drop_head();
     test_queue_requeue_bypasses_limits();
     test_exchange_type_name_roundtrip();
     test_exchange_direct_routing();

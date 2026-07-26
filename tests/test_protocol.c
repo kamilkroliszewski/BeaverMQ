@@ -298,6 +298,37 @@ static void put_consume(bmqp_buf_t *out, uint16_t channel, const char *queue,
     bmqp_buf_free(&a);
 }
 
+/* Exchange.Declare: reserved + exchange + type + bits + arguments(empty). */
+static void put_exchange_declare(bmqp_buf_t *out, uint16_t channel,
+                                 const char *name, const char *type)
+{
+    bmqp_buf_t a;
+    bmqp_buf_init(&a);
+    bmqp_buf_put_u16(&a, 0);
+    bmqp_buf_put_shortstr(&a, name);
+    bmqp_buf_put_shortstr(&a, type);
+    bmqp_buf_put_u8(&a, 0);            /* passive,durable,auto-del,internal,no-wait */
+    bmqp_buf_put_longstr(&a, "", 0);  /* arguments */
+    put_method(out, channel, BMQP_CLASS_EXCHANGE, BMQP_EXCHANGE_DECLARE, a.data, a.len);
+    bmqp_buf_free(&a);
+}
+
+/* Queue.Bind: reserved + queue + exchange + routing-key + no-wait + args. */
+static void put_queue_bind(bmqp_buf_t *out, uint16_t channel, const char *queue,
+                           const char *exchange, const char *rkey)
+{
+    bmqp_buf_t a;
+    bmqp_buf_init(&a);
+    bmqp_buf_put_u16(&a, 0);
+    bmqp_buf_put_shortstr(&a, queue);
+    bmqp_buf_put_shortstr(&a, exchange);
+    bmqp_buf_put_shortstr(&a, rkey);
+    bmqp_buf_put_u8(&a, 0);            /* no-wait */
+    bmqp_buf_put_longstr(&a, "", 0);  /* arguments */
+    put_method(out, channel, BMQP_CLASS_QUEUE, BMQP_QUEUE_BIND, a.data, a.len);
+    bmqp_buf_free(&a);
+}
+
 /* Parse a Basic.Deliver method's arguments and return its delivery-tag. */
 static uint64_t deliver_tag(const uint8_t *args, size_t alen)
 {
@@ -632,6 +663,97 @@ static void test_consume_no_ack(void)
     h_teardown(&h);
 }
 
+/* Dead-lettering end-to-end: a queue declared with x-dead-letter-exchange, whose
+ * delivery is nack'd without requeue, re-routes the message to the DLX (and thus
+ * to a queue bound to it). Exercises the arg parsing, the broker's dead-letter
+ * re-router, and the dispatcher nack path together. */
+static void test_dead_letter_on_nack(void)
+{
+    TEST_SECTION("nack(requeue=0) on a queue with x-dead-letter-exchange re-routes to the DLX");
+    harness_t h;
+    h_setup(&h);
+    h_handshake(&h);
+    uint8_t buf[4096];
+    rdr_t r;
+    bmqp_buf_t req;
+
+    /* DLX topology: fanout exchange "dlx" with a queue "dlq" bound to it. */
+    bmqp_buf_init(&req);
+    put_exchange_declare(&req, 1, "dlx", "fanout");
+    h_send(&h, req.data, req.len);
+    bmqp_buf_free(&req);
+    h_collect(&h, buf, sizeof buf); /* Exchange.Declare-Ok */
+
+    bmqp_buf_init(&req);
+    put_queue_declare(&req, 1, "dlq", 0, NULL, 0);
+    h_send(&h, req.data, req.len);
+    bmqp_buf_free(&req);
+    h_collect(&h, buf, sizeof buf);
+
+    bmqp_buf_init(&req);
+    put_queue_bind(&req, 1, "dlq", "dlx", "");
+    h_send(&h, req.data, req.len);
+    bmqp_buf_free(&req);
+    h_collect(&h, buf, sizeof buf); /* Queue.Bind-Ok */
+
+    /* Source queue with a dead-letter target of exchange "dlx". */
+    bmqp_buf_t tbl;
+    bmqp_buf_init(&tbl);
+    bmqp_buf_put_shortstr(&tbl, "x-dead-letter-exchange");
+    bmqp_buf_put_u8(&tbl, 'S');
+    bmqp_buf_put_longstr(&tbl, "dlx", 3);
+    bmqp_buf_init(&req);
+    put_queue_declare(&req, 1, "srcq", 0, tbl.data, tbl.len);
+    h_send(&h, req.data, req.len);
+    bmqp_buf_free(&req);
+    bmqp_buf_free(&tbl);
+    h_collect(&h, buf, sizeof buf); /* Queue.Declare-Ok */
+
+    /* Consume srcq (manual ack), publish, receive, then nack without requeue. */
+    bmqp_buf_init(&req);
+    put_consume(&req, 1, "srcq", "cs", 0);
+    h_send(&h, req.data, req.len);
+    bmqp_buf_free(&req);
+    h_collect(&h, buf, sizeof buf); /* Consume-Ok */
+
+    bmqp_buf_init(&req);
+    put_publish(&req, 1, "", "srcq", 0, "dead");
+    h_send(&h, req.data, req.len);
+    bmqp_buf_free(&req);
+    size_t n = h_collect(&h, buf, sizeof buf);
+    rdr_init(&r, buf, n);
+    const uint8_t *args; size_t alen;
+    uint64_t tag = 0;
+    if (expect_method(&r, BMQP_CLASS_BASIC, BMQP_BASIC_DELIVER, &args, &alen))
+        tag = deliver_tag(args, alen);
+
+    /* Basic.Nack(delivery-tag, bits=0): multiple=0, requeue=0 -> dead-letter. */
+    bmqp_buf_t nack;
+    bmqp_buf_init(&nack);
+    bmqp_buf_put_u64(&nack, tag);
+    bmqp_buf_put_u8(&nack, 0x00);
+    send_method_frame(&h, 1, BMQP_CLASS_BASIC, BMQP_BASIC_NACK, nack.data, nack.len);
+    bmqp_buf_free(&nack);
+    h_collect(&h, buf, sizeof buf); /* drive the re-route */
+
+    /* The message must have landed in the dead-letter queue. */
+    beaver_queue_t *dlq = broker_get_queue(h.broker, "/", "dlq");
+    CHECK(dlq != NULL);
+    if (dlq) {
+        CHECK_EQ(queue_depth(dlq), 1);
+        beaver_message_t *m = queue_dequeue(dlq);
+        CHECK(m && m->body_len == 4 && memcmp(m->body, "dead", 4) == 0);
+        if (m) message_unref(m);
+        queue_unref(dlq);
+    }
+    /* srcq is empty (the message left it). */
+    beaver_queue_t *src = broker_get_queue(h.broker, "/", "srcq");
+    CHECK(src != NULL);
+    if (src) { CHECK_EQ(queue_depth(src), 0); queue_unref(src); }
+
+    h_teardown(&h);
+}
+
 int main(void)
 {
     test_handshake_sequence();
@@ -640,5 +762,6 @@ int main(void)
     test_publisher_confirms();
     test_consume_deliver_ack();
     test_consume_no_ack();
+    test_dead_letter_on_nack();
     return test_summary("test_protocol");
 }
