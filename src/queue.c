@@ -35,6 +35,13 @@ struct beaver_queue {
     char              *vhost;   /* owning virtual host ("" until set) */
     uint8_t            flags;
 
+    /* Per-queue limit/overflow overrides (guarded by `lock`). A 0 length/bytes
+     * override means "use the global default"; overflow picks what happens when
+     * a publish would exceed the effective limit. */
+    uint64_t           max_length;    /* 0 = use g_queue_max_length */
+    uint64_t           max_bytes;     /* 0 = use g_queue_max_bytes */
+    queue_overflow_t   overflow;      /* default REJECT_PUBLISH (0) */
+
     pthread_mutex_t    lock;
     beaver_message_t **slots;
     size_t             cap;
@@ -49,6 +56,7 @@ struct beaver_queue {
      * enqueue/dequeue hot path (broker_stats samples every queue). */
     _Atomic uint64_t   total_enqueued;
     _Atomic uint64_t   total_dequeued;
+    _Atomic uint64_t   total_dropped;  /* evicted by drop-head overflow (metric) */
     uint64_t           total_bytes;   /* sum of body_len currently queued (invariant; under lock) */
 
     /* Cluster consume-tracking (guarded by `lock`). The replicated consume
@@ -138,6 +146,21 @@ void queue_set_vhost(beaver_queue_t *q, const char *vhost)
 }
 uint8_t     queue_flags(const beaver_queue_t *q) { return q->flags; }
 
+void queue_set_limits(beaver_queue_t *q, uint64_t max_length, uint64_t max_bytes,
+                      queue_overflow_t overflow)
+{
+    pthread_mutex_lock(&q->lock);
+    q->max_length = max_length;
+    q->max_bytes  = max_bytes;
+    q->overflow   = overflow;
+    pthread_mutex_unlock(&q->lock);
+}
+
+uint64_t queue_total_dropped(beaver_queue_t *q)
+{
+    return atomic_load_explicit(&q->total_dropped, memory_order_relaxed);
+}
+
 void queue_set_exclusive_owner(beaver_queue_t *q, uint64_t conn_id)
 {
     atomic_store_explicit(&q->exclusive_owner, conn_id, memory_order_relaxed);
@@ -165,13 +188,44 @@ static int queue_grow(beaver_queue_t *q)
     return 0;
 }
 
+/* Would appending a `body_len`-byte message exceed the effective limits?
+ * Caller holds q->lock. Per-queue overrides win; 0 means "use the global
+ * default". */
+static int queue_would_overflow(const beaver_queue_t *q, size_t body_len)
+{
+    uint64_t max_len   = q->max_length ? q->max_length : g_queue_max_length;
+    uint64_t max_bytes = q->max_bytes  ? q->max_bytes  : g_queue_max_bytes;
+    return (max_len   && q->count + 1 > max_len) ||
+           (max_bytes && q->total_bytes + body_len > max_bytes);
+}
+
 int queue_enqueue(beaver_queue_t *q, beaver_message_t *msg)
 {
     pthread_mutex_lock(&q->lock);
-    if ((g_queue_max_length && q->count >= g_queue_max_length) ||
-        (g_queue_max_bytes && q->total_bytes + msg->body_len > g_queue_max_bytes)) {
-        pthread_mutex_unlock(&q->lock);
-        return QUEUE_FULL;
+    if (queue_would_overflow(q, msg->body_len)) {
+        if (q->overflow != QUEUE_OVERFLOW_DROP_HEAD) {
+            pthread_mutex_unlock(&q->lock);
+            return QUEUE_FULL; /* reject-publish (default) */
+        }
+        /* drop-head: evict the oldest message(s) until the newcomer fits. A lone
+         * message larger than max_bytes is still admitted (the loop stops at an
+         * empty queue) - RabbitMQ likewise never drops the only message.
+         *
+         * NOTE (cluster caveat): the evicted messages are READY (never delivered),
+         * so this does not disturb the unacked/deliver_hi watermark invariant. But
+         * on a durable, replicated queue the drop is local only - replica copies on
+         * other nodes are not told to drop the same message. drop-head is therefore
+         * intended for non-durable queues; durable+cluster drop-head propagation is
+         * a follow-up (tracked with the DLX work). */
+        while (q->count > 0 && queue_would_overflow(q, msg->body_len)) {
+            beaver_message_t *old = q->slots[q->head];
+            q->slots[q->head] = NULL;
+            q->head = (q->head + 1) % q->cap;
+            q->count--;
+            q->total_bytes -= old->body_len;
+            atomic_fetch_add_explicit(&q->total_dropped, 1, memory_order_relaxed);
+            message_unref(old);
+        }
     }
     if (q->count == q->cap) {
         if (queue_grow(q) != 0) {

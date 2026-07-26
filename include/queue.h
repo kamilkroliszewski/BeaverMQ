@@ -51,6 +51,22 @@ void        queue_set_vhost(beaver_queue_t *q, const char *vhost);
  * respects max_message_size. Set once at startup. */
 void queue_set_default_limits(uint64_t max_length, uint64_t max_bytes);
 
+/* What a queue does when a publish would exceed its length/byte limit. */
+typedef enum {
+    QUEUE_OVERFLOW_REJECT_PUBLISH = 0, /* default: reject the new message (QUEUE_FULL) */
+    QUEUE_OVERFLOW_DROP_HEAD      = 1, /* evict oldest message(s) to make room */
+} queue_overflow_t;
+
+/* Per-queue limit/overflow overrides (from the AMQP Queue.Declare arguments:
+ * x-max-length, x-max-length-bytes, x-overflow). A 0 length/bytes value means
+ * "fall back to the global default"; overflow selects the full-queue behavior.
+ * Typically set once, right after the queue is created. */
+void queue_set_limits(beaver_queue_t *q, uint64_t max_length, uint64_t max_bytes,
+                      queue_overflow_t overflow);
+
+/* Messages evicted by the drop-head overflow policy (management metric). */
+uint64_t queue_total_dropped(beaver_queue_t *q);
+
 /* Returned by queue_enqueue() when a configured limit (see
  * queue_set_default_limits) would be exceeded - distinct from -1 (OOM) so
  * callers can tell "queue is full" apart from "allocation failed". */
