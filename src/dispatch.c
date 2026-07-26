@@ -169,9 +169,19 @@ void dispatcher_set_cluster(beaver_dispatcher_t *d, struct cluster_node *cluster
 
 void dispatcher_request_close(beaver_dispatcher_t *d)
 {
-    if (!d || d->async_closing)
+    if (!d)
         return;
+    /* Publish async_closing under pending_lock BEFORE uv_close so a concurrent
+     * dispatcher_notify (running on a publishing thread) either observes the
+     * flag and skips uv_async_send, or gets its send in under the same lock
+     * while the handle is still live - never uv_async_send on a closed handle. */
+    pthread_mutex_lock(&d->pending_lock);
+    if (d->async_closing) {
+        pthread_mutex_unlock(&d->pending_lock);
+        return;
+    }
     d->async_closing = 1;
+    pthread_mutex_unlock(&d->pending_lock);
     uv_close((uv_handle_t *)&d->async, NULL);
     if (!uv_is_closing((uv_handle_t *)&d->consume_timer))
         uv_close((uv_handle_t *)&d->consume_timer, NULL);
@@ -287,6 +297,12 @@ void dispatcher_free(beaver_dispatcher_t *d)
 static void dispatcher_notify(beaver_dispatcher_t *d, beaver_queue_t *q)
 {
     pthread_mutex_lock(&d->pending_lock);
+    if (d->async_closing) {
+        /* Dispatcher is tearing down; the async handle is being/has been closed.
+         * Do not queue or wake - servicing will never run again anyway. */
+        pthread_mutex_unlock(&d->pending_lock);
+        return;
+    }
     for (size_t i = 0; i < d->n_pending; i++) {
         if (d->pending[i] == q) {
             pthread_mutex_unlock(&d->pending_lock);
@@ -304,8 +320,12 @@ static void dispatcher_notify(beaver_dispatcher_t *d, beaver_queue_t *q)
         d->cap_pending = nc;
     }
     d->pending[d->n_pending++] = queue_ref(q);
+    /* uv_async_send under pending_lock (see dispatcher_request_close): this
+     * pairs with the async_closing check above to guarantee we never signal a
+     * handle that close has already begun on. uv_async_send takes no lock of
+     * ours, so there is no ordering hazard. */
+    uv_async_send(&d->async);
     pthread_mutex_unlock(&d->pending_lock);
-    uv_async_send(&d->async); /* uv_async_send is itself thread-safe */
 }
 
 /* queue_waiter_fn adapter: the broker calls this (on the publishing thread)
@@ -415,9 +435,16 @@ static int deliver(beaver_dispatcher_t *d, consumer_t *c,
         sent = beaver_conn_send_delivery(c->conn, payload, plen, msg);
     } else {
         /* Empty body (no body frame) or a body large enough to be chunked across
-         * multiple frames: assemble the whole thing into one buffer. */
+         * multiple frames: assemble the whole thing into one buffer. Pre-size it
+         * to the exact final length (body bytes + per-frame 8-byte overhead) so
+         * the loop below does a single allocation instead of doubling `out`
+         * (and recopying everything already written) once per power-of-two. */
         const uint8_t *bp = msg->body;
         size_t rem = msg->body_len;
+        if (rem > 0 && chunk > 0) {
+            size_t nframes = (rem + chunk - 1) / chunk;
+            bmqp_buf_reserve(&out, rem + nframes * BMQP_FRAME_OVERHEAD);
+        }
         while (rem > 0) {
             size_t n = rem < chunk ? rem : chunk;
             bmqp_frame_write(&out, BMQP_FRAME_BODY, c->channel, bp, n);

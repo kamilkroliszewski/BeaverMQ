@@ -82,8 +82,15 @@ void config_defaults(beaver_config_t *c)
     c->http_max_body_bytes    = 16u * 1024u * 1024u; /* 16 MiB */
     c->http_max_connections   = 512;
     c->http_request_timeout_ms = 30000; /* 30 s to receive one full request */
-    c->queue_max_length = 0; /* unlimited, for compatibility with existing deployments */
-    c->queue_max_bytes  = 0;
+    /* Safety backstop against OOM: without a global memory watermark, a queue
+     * with no (or a stuck) consumer would otherwise grow until the broker is
+     * killed. These per-queue caps bound BOTH dimensions - message count and
+     * body bytes - out of the box; over-capacity publishes are rejected
+     * (QUEUE_FULL) rather than swallowing all RAM. Generous enough not to bite
+     * normal workloads; an operator can raise them, or set either to 0 to
+     * disable that dimension explicitly. */
+    c->queue_max_length = 1000000u;                 /* 1M messages per queue */
+    c->queue_max_bytes  = 256u * 1024u * 1024u;     /* 256 MiB body per queue */
 
     c->cluster_enabled   = 0;
     c->cluster_explicit  = 0;

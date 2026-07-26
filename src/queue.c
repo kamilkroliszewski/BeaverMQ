@@ -42,9 +42,14 @@ struct beaver_queue {
     size_t             tail;
     size_t             count;
 
-    uint64_t           total_enqueued;
-    uint64_t           total_dequeued;
-    uint64_t           total_bytes;   /* sum of body_len currently queued */
+    /* Pure monotonic metrics: never used in control flow, only incremented
+     * (under `lock`, so increments stay consistent with the buffer mutation
+     * they accompany) and sampled by the management thread. Atomic so those
+     * getters read them lock-free instead of contending on `lock` with the
+     * enqueue/dequeue hot path (broker_stats samples every queue). */
+    _Atomic uint64_t   total_enqueued;
+    _Atomic uint64_t   total_dequeued;
+    uint64_t           total_bytes;   /* sum of body_len currently queued (invariant; under lock) */
 
     /* Cluster consume-tracking (guarded by `lock`). The replicated consume
      * watermark = the cluster_id below which everything is consumed: the oldest
@@ -177,7 +182,7 @@ int queue_enqueue(beaver_queue_t *q, beaver_message_t *msg)
     q->slots[q->tail] = message_ref(msg);
     q->tail = (q->tail + 1) % q->cap;
     q->count++;
-    q->total_enqueued++;
+    atomic_fetch_add_explicit(&q->total_enqueued, 1, memory_order_relaxed);
     q->total_bytes += msg->body_len;
     pthread_mutex_unlock(&q->lock);
     return 0;
@@ -201,7 +206,7 @@ int queue_requeue_internal(beaver_queue_t *q, beaver_message_t *msg)
     q->slots[q->tail] = message_ref(msg);
     q->tail = (q->tail + 1) % q->cap;
     q->count++;
-    q->total_enqueued++;
+    atomic_fetch_add_explicit(&q->total_enqueued, 1, memory_order_relaxed);
     q->total_bytes += msg->body_len;
     pthread_mutex_unlock(&q->lock);
     return 0;
@@ -216,7 +221,7 @@ beaver_message_t *queue_dequeue(beaver_queue_t *q)
         q->slots[q->head] = NULL;
         q->head = (q->head + 1) % q->cap;
         q->count--;
-        q->total_dequeued++;
+        atomic_fetch_add_explicit(&q->total_dequeued, 1, memory_order_relaxed);
         q->total_bytes -= msg->body_len;
     }
     pthread_mutex_unlock(&q->lock);
@@ -361,7 +366,7 @@ size_t queue_drain_consumed(beaver_queue_t *q, uint64_t watermark)
         q->slots[q->head] = NULL;
         q->head = (q->head + 1) % q->cap;
         q->count--;
-        q->total_dequeued++;
+        atomic_fetch_add_explicit(&q->total_dequeued, 1, memory_order_relaxed);
         /* Keep the byte accounting in step with the message actually leaving the
          * queue - the normal dequeue/purge paths do this, but the replicated
          * drain used to skip it, so a replica could keep counting drained bytes
@@ -385,18 +390,14 @@ size_t queue_depth(beaver_queue_t *q)
 
 uint64_t queue_total_enqueued(beaver_queue_t *q)
 {
-    pthread_mutex_lock(&q->lock);
-    uint64_t n = q->total_enqueued;
-    pthread_mutex_unlock(&q->lock);
-    return n;
+    /* Lock-free: monotonic atomic counter, no need to contend on q->lock. */
+    return atomic_load_explicit(&q->total_enqueued, memory_order_relaxed);
 }
 
 uint64_t queue_total_dequeued(beaver_queue_t *q)
 {
-    pthread_mutex_lock(&q->lock);
-    uint64_t n = q->total_dequeued;
-    pthread_mutex_unlock(&q->lock);
-    return n;
+    /* Lock-free: monotonic atomic counter, no need to contend on q->lock. */
+    return atomic_load_explicit(&q->total_dequeued, memory_order_relaxed);
 }
 
 size_t queue_purge(beaver_queue_t *q)
@@ -414,7 +415,7 @@ size_t queue_purge(beaver_queue_t *q)
     /* Keep total_dequeued consistent with a real dequeue - purge used to skip
      * this, leaving management stats undercounting how many messages actually
      * left the queue. */
-    q->total_dequeued += purged;
+    atomic_fetch_add_explicit(&q->total_dequeued, purged, memory_order_relaxed);
     pthread_mutex_unlock(&q->lock);
     return purged;
 }

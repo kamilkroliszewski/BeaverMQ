@@ -97,6 +97,7 @@ struct beaver_proto {
     /* ---- in-progress content assembly (Basic.Publish) ---- */
     int            pub_active;        /* a publish awaits its content frames */
     int            pub_have_header;   /* content header received */
+    int            pub_mandatory;     /* mandatory bit: Basic.Return if unroutable */
     uint16_t       pub_channel;
     char           pub_exchange[256];
     char           pub_routing_key[256];
@@ -586,6 +587,7 @@ static void publish_reset(beaver_proto_t *p)
     p->pub_props         = NULL;
     p->pub_active        = 0;
     p->pub_have_header   = 0;
+    p->pub_mandatory     = 0;
     p->pub_body_size     = 0;
     p->pub_body_received = 0;
     p->pub_props_len     = 0;
@@ -1614,15 +1616,16 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
         size_t en, kn;
         const char *e = bmqp_read_shortstr(r, &en);
         const char *k = bmqp_read_shortstr(r, &kn);
-        bmqp_read_u8(r);                        /* mandatory, immediate bits */
+        uint8_t pubbits = bmqp_read_u8(r);      /* bit0 mandatory, bit1 immediate */
         if (r->error) {
             proto_fatal(p, "malformed Basic.Publish");
             return;
         }
         /* Begin content assembly; the content header + body frames follow. */
         publish_reset(p);
-        p->pub_active  = 1;
-        p->pub_channel = channel;
+        p->pub_active    = 1;
+        p->pub_mandatory = (pubbits & 0x01) != 0;
+        p->pub_channel   = channel;
         copy_str(p->pub_exchange, sizeof(p->pub_exchange), e, en);
         copy_str(p->pub_routing_key, sizeof(p->pub_routing_key), k, kn);
         if (!name_ok(p->pub_exchange)) {
@@ -1951,6 +1954,31 @@ static int props_is_persistent(const uint8_t *props, size_t len)
     return !r.error && dm == 2;
 }
 
+/* Return an unroutable `mandatory` publish to its sender: a Basic.Return method
+ * frame (reply-code + text + the original exchange/routing-key) followed by the
+ * message's content header and body, exactly as a delivery carries them. Without
+ * this a mandatory publish that matched no queue was dropped silently, which is
+ * precisely the case the mandatory flag exists to surface. */
+static void send_basic_return(beaver_proto_t *p, uint16_t channel,
+                              uint16_t code, const char *text,
+                              const char *exchange, const char *routing_key,
+                              const uint8_t *body, size_t body_len,
+                              const uint8_t *props, size_t props_len)
+{
+    bmqp_buf_t a;
+    bmqp_buf_init(&a);
+    bmqp_buf_put_u16(&a, code);
+    bmqp_buf_put_shortstr(&a, text);
+    bmqp_buf_put_shortstr(&a, exchange);
+    bmqp_buf_put_shortstr(&a, routing_key);
+    send_method(p, channel, BMQP_CLASS_BASIC, BMQP_BASIC_RETURN, &a);
+    bmqp_buf_free(&a);
+    /* send_method closes the connection on failure; protocol_send_content is a
+     * no-op on a closing connection, so this stays safe either way. */
+    protocol_send_content(p->conn, channel, BMQP_CLASS_BASIC, body, body_len,
+                          props, props_len, p->conn->frame_max);
+}
+
 static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
                              size_t body_len)
 {
@@ -2022,11 +2050,27 @@ static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
             proto_fatal(p, "out of memory building published message");
             return;
         }
-        broker_route(srv->broker, p->vhost, msg);
+        int routed = broker_route(srv->broker, p->vhost, msg);
         message_unref(msg);
-        /* Transient publish: nothing to wait for, confirm right away. */
+        /* Transient publish: nothing to wait for, confirm right away. A
+         * resource error (every target queue full or OOM) means the message was
+         * NOT accepted anywhere, so it must be Nack'd - the old code sent a
+         * positive Basic.Ack unconditionally, telling the publisher a dropped
+         * message was safely handled. Unroutable (routed == 0, no matching
+         * queue) is still an Ack, matching RabbitMQ: the broker accepted it,
+         * there was simply nowhere to route it (mandatory handling is separate).
+         */
         if (confirm)
-            send_publish_confirm(p, p->pub_channel, ++pubch->confirm_seq, 0);
+            send_publish_confirm(p, p->pub_channel, ++pubch->confirm_seq,
+                                 routed == ROUTE_RESOURCE_ERROR /* nack */);
+        /* mandatory: a message that matched no queue is handed back to the
+         * publisher (Basic.Return + content) instead of vanishing silently. A
+         * resource error is a different failure (already Nack'd above under
+         * confirms) and is not a NO_ROUTE. */
+        if (p->pub_mandatory && routed == ROUTE_UNROUTABLE)
+            send_basic_return(p, p->pub_channel, 312, "NO_ROUTE",
+                              p->pub_exchange, p->pub_routing_key,
+                              body, body_len, p->pub_props, p->pub_props_len);
     }
     proto_advance(p, BMQP_STATE_ACTIVE);
     /* Hot path: keep at DEBUG so high-throughput publishing isn't throttled by
