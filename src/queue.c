@@ -24,6 +24,19 @@
 static uint64_t g_queue_max_length = 0;
 static uint64_t g_queue_max_bytes  = 0;
 
+/* Broker-wide producer flow control ("flow alarm"): the number of queues that
+ * are currently congested (at/above their high-water mark and not yet drained
+ * back below the low-water mark). While this is > 0, publishers are paused via
+ * TCP backpressure (uv_read_stop) so they cannot outrun the consumers - the same
+ * shape as RabbitMQ's global memory-alarm flow control. A queue only counts if
+ * it has an effective length/byte limit (otherwise there is no ratio to watch). */
+static _Atomic uint64_t g_flow_alarm_count = 0;
+
+int queue_flow_alarm_active(void)
+{
+    return atomic_load_explicit(&g_flow_alarm_count, memory_order_relaxed) > 0;
+}
+
 void queue_set_default_limits(uint64_t max_length, uint64_t max_bytes)
 {
     g_queue_max_length = max_length;
@@ -41,6 +54,7 @@ struct beaver_queue {
     uint64_t           max_length;    /* 0 = use g_queue_max_length */
     uint64_t           max_bytes;     /* 0 = use g_queue_max_bytes */
     queue_overflow_t   overflow;      /* default REJECT_PUBLISH (0) */
+    int                congested;     /* contributes to the flow alarm (hysteresis) */
 
     /* Dead-letter target (set once at declare; read-only afterwards). The
      * callback is the broker's re-router; dl_exchange NULL/"" means no DLX. */
@@ -131,6 +145,10 @@ void queue_unref(beaver_queue_t *q)
     if (!q)
         return;
     if (atomic_fetch_sub_explicit(&q->refcount, 1, memory_order_acq_rel) == 1) {
+        /* If this queue was counted in the broker-wide flow alarm, release its
+         * slot so a deleted congested queue doesn't pin producers paused. */
+        if (q->congested)
+            atomic_fetch_sub_explicit(&g_flow_alarm_count, 1, memory_order_relaxed);
         /* Last reference: drop any messages still buffered. */
         for (size_t i = 0; i < q->count; i++)
             message_unref(q->slots[(q->head + i) % q->cap]);
@@ -242,6 +260,30 @@ static int queue_would_overflow(const beaver_queue_t *q, size_t body_len)
            (max_bytes && q->total_bytes + body_len > max_bytes);
 }
 
+/* Re-evaluate this queue's flow-control state after its depth/bytes changed and
+ * adjust the broker-wide flow-alarm counter. Hysteresis: a queue becomes
+ * congested at >= 90% of an effective limit and only clears once it drains back
+ * to <= 50%, so producers are not flapped on and off around the threshold.
+ * Caller must hold q->lock. */
+static void queue_update_congestion(beaver_queue_t *q)
+{
+    uint64_t max_len   = q->max_length ? q->max_length : g_queue_max_length;
+    uint64_t max_bytes = q->max_bytes  ? q->max_bytes  : g_queue_max_bytes;
+
+    int over_high = (max_len   && q->count       >= max_len   - max_len   / 10) ||
+                    (max_bytes && q->total_bytes >= max_bytes - max_bytes / 10);
+    int under_low = (!max_len   || q->count       <= max_len   / 2) &&
+                    (!max_bytes || q->total_bytes <= max_bytes / 2);
+
+    if (!q->congested && over_high) {
+        q->congested = 1;
+        atomic_fetch_add_explicit(&g_flow_alarm_count, 1, memory_order_relaxed);
+    } else if (q->congested && under_low) {
+        q->congested = 0;
+        atomic_fetch_sub_explicit(&g_flow_alarm_count, 1, memory_order_relaxed);
+    }
+}
+
 int queue_enqueue(beaver_queue_t *q, beaver_message_t *msg)
 {
     /* Messages evicted by drop-head are dead-lettered AFTER the lock is released
@@ -307,6 +349,7 @@ int queue_enqueue(beaver_queue_t *q, beaver_message_t *msg)
         q->count++;
         atomic_fetch_add_explicit(&q->total_enqueued, 1, memory_order_relaxed);
         q->total_bytes += msg->body_len;
+        queue_update_congestion(q);
     }
     pthread_mutex_unlock(&q->lock);
 
@@ -340,6 +383,7 @@ int queue_requeue_internal(beaver_queue_t *q, beaver_message_t *msg)
     q->count++;
     atomic_fetch_add_explicit(&q->total_enqueued, 1, memory_order_relaxed);
     q->total_bytes += msg->body_len;
+    queue_update_congestion(q);
     pthread_mutex_unlock(&q->lock);
     return 0;
 }
@@ -355,6 +399,7 @@ beaver_message_t *queue_dequeue(beaver_queue_t *q)
         q->count--;
         atomic_fetch_add_explicit(&q->total_dequeued, 1, memory_order_relaxed);
         q->total_bytes -= msg->body_len;
+        queue_update_congestion(q);
     }
     pthread_mutex_unlock(&q->lock);
     return msg; /* reference transferred to caller */
@@ -508,6 +553,8 @@ size_t queue_drain_consumed(beaver_queue_t *q, uint64_t watermark)
         message_unref(m);
         drained++;
     }
+    if (drained)
+        queue_update_congestion(q);
     pthread_mutex_unlock(&q->lock);
     return drained;
 }
@@ -548,6 +595,7 @@ size_t queue_purge(beaver_queue_t *q)
      * this, leaving management stats undercounting how many messages actually
      * left the queue. */
     atomic_fetch_add_explicit(&q->total_dequeued, purged, memory_order_relaxed);
+    queue_update_congestion(q);
     pthread_mutex_unlock(&q->lock);
     return purged;
 }

@@ -285,6 +285,46 @@ static void test_queue_dead_letter_drop_head(void)
     queue_unref(q);
 }
 
+/* Flow alarm: a queue trips the broker-wide producer flow alarm at its
+ * high-water mark (90% of the limit) and only clears it after draining back to
+ * the low-water mark (50%) - hysteresis, so producers are not flapped. */
+static void test_queue_flow_alarm(void)
+{
+    TEST_SECTION("flow alarm sets at high-water, clears after draining below low-water (hysteresis)");
+    queue_set_default_limits(0, 0);
+    CHECK(!queue_flow_alarm_active()); /* nothing congested to start */
+
+    beaver_queue_t *q = queue_new("qflow", 0);
+    queue_set_limits(q, 10, 0, QUEUE_OVERFLOW_REJECT_PUBLISH); /* high=9, low=5 */
+
+    for (int i = 0; i < 8; i++) {         /* depth 8: below high-water */
+        beaver_message_t *m = message_new("", "", "x", 1);
+        CHECK_EQ(queue_enqueue(q, m), 0);
+        message_unref(m);
+    }
+    CHECK(!queue_flow_alarm_active());
+
+    beaver_message_t *m = message_new("", "", "x", 1);
+    queue_enqueue(q, m); message_unref(m);   /* depth 9: trips the alarm */
+    CHECK(queue_flow_alarm_active());
+
+    for (int i = 0; i < 3; i++) {            /* drain to depth 6: still > low */
+        beaver_message_t *d = queue_dequeue(q);
+        message_unref(d);
+    }
+    CHECK(queue_flow_alarm_active());
+
+    beaver_message_t *d = queue_dequeue(q);  /* depth 5 == low-water: clears */
+    message_unref(d);
+    CHECK(!queue_flow_alarm_active());
+
+    while ((d = queue_dequeue(q)) != NULL)
+        message_unref(d);
+    queue_unref(q);
+    CHECK(!queue_flow_alarm_active());
+    queue_set_default_limits(0, 0);
+}
+
 /* Regression: an internal requeue (nack/reject/disconnect) must never be
  * dropped just because the queue hit its publisher-facing limit - otherwise a
  * full queue silently loses in-flight messages on requeue (audit 2.2). */
@@ -538,6 +578,7 @@ int main(void)
     test_queue_overflow_reject_publish();
     test_queue_overflow_drop_head_lone_big();
     test_queue_dead_letter_drop_head();
+    test_queue_flow_alarm();
     test_queue_requeue_bypasses_limits();
     test_exchange_type_name_roundtrip();
     test_exchange_direct_routing();

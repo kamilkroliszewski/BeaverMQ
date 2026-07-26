@@ -26,6 +26,7 @@
 
 #include <uv.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -61,6 +62,12 @@ static void h_setup(harness_t *h)
      * the loop). */
     h->server.dispatcher = dispatcher_new(&h->loop, h->broker);
     CHECK(h->server.dispatcher != NULL);
+    /* The producer-flow-control path (beaver_conn_throttle_read) touches the
+     * server's connection lock and per-server throttle timer, so initialize
+     * them exactly as beaver_server_init would. */
+    pthread_mutex_init(&h->server.conns_lock, NULL);
+    uv_timer_init(&h->loop, &h->server.throttle_timer);
+    h->server.throttle_timer.data = &h->server;
 
     int fds[2];
     /* AF_UNIX stream pair; libuv drives it as a stream via uv_tcp_open (we never
@@ -88,12 +95,16 @@ static void h_teardown(harness_t *h)
     /* Mirror the real shutdown order: request_close (closes the dispatcher's uv
      * handles), drain the loop so those closes complete, then free. */
     dispatcher_request_close(h->server.dispatcher);
+    uv_timer_stop(&h->server.throttle_timer);
+    if (!uv_is_closing((uv_handle_t *)&h->server.throttle_timer))
+        uv_close((uv_handle_t *)&h->server.throttle_timer, NULL);
     if (!uv_is_closing((uv_handle_t *)&h->conn.handle))
         uv_close((uv_handle_t *)&h->conn.handle, NULL);
     for (int i = 0; i < 32; i++)
         uv_run(&h->loop, UV_RUN_NOWAIT);
     dispatcher_free(h->server.dispatcher);
     uv_loop_close(&h->loop);
+    pthread_mutex_destroy(&h->server.conns_lock);
     close(h->cli_fd);
     broker_free(h->broker);
 }
@@ -754,6 +765,50 @@ static void test_dead_letter_on_nack(void)
     h_teardown(&h);
 }
 
+/* Producer flow control: publishing past a queue's high-water mark trips the
+ * broker-wide flow alarm, which pauses the producer connection's reads (TCP
+ * backpressure) so it cannot outrun the (here, absent) consumer into OOM. */
+static void test_producer_backpressure(void)
+{
+    TEST_SECTION("publishing past a queue's high-water mark pauses the producer's reads");
+    harness_t h;
+    h_setup(&h);
+    h_handshake(&h);
+    uint8_t buf[4096];
+
+    /* Queue capped at 10 messages -> high-water mark at 9. */
+    bmqp_buf_t tbl;
+    bmqp_buf_init(&tbl);
+    bmqp_buf_put_shortstr(&tbl, "x-max-length");
+    bmqp_buf_put_u8(&tbl, 'l');
+    bmqp_buf_put_u64(&tbl, 10);
+    bmqp_buf_t req;
+    bmqp_buf_init(&req);
+    put_queue_declare(&req, 1, "bp", 0, tbl.data, tbl.len);
+    h_send(&h, req.data, req.len);
+    bmqp_buf_free(&req);
+    bmqp_buf_free(&tbl);
+    h_collect(&h, buf, sizeof buf);
+
+    CHECK(!h.conn.read_paused);
+    CHECK(!queue_flow_alarm_active());
+
+    /* Publish 9 messages (no consumer) -> depth reaches the high-water mark. */
+    for (int i = 0; i < 9; i++) {
+        bmqp_buf_init(&req);
+        put_publish(&req, 1, "", "bp", 0, "x");
+        h_send(&h, req.data, req.len);
+        bmqp_buf_free(&req);
+        h_collect(&h, buf, sizeof buf);
+    }
+
+    CHECK(queue_flow_alarm_active());
+    CHECK_EQ(h.conn.read_paused, 1); /* producer throttled */
+
+    h_teardown(&h); /* frees the queue -> clears the alarm for later tests */
+    CHECK(!queue_flow_alarm_active());
+}
+
 int main(void)
 {
     test_handshake_sequence();
@@ -763,5 +818,6 @@ int main(void)
     test_consume_deliver_ack();
     test_consume_no_ack();
     test_dead_letter_on_nack();
+    test_producer_backpressure();
     return test_summary("test_protocol");
 }

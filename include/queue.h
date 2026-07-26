@@ -51,6 +51,12 @@ void        queue_set_vhost(beaver_queue_t *q, const char *vhost);
  * respects max_message_size. Set once at startup. */
 void queue_set_default_limits(uint64_t max_length, uint64_t max_bytes);
 
+/* Broker-wide producer flow control. Returns non-zero while at least one queue
+ * is congested (has crossed its high-water mark and not yet drained below the
+ * low-water mark). Publishers pause their socket reads (TCP backpressure) while
+ * this holds, so they cannot outrun the consumers into an out-of-memory queue. */
+int queue_flow_alarm_active(void);
+
 /* What a queue does when a publish would exceed its length/byte limit. */
 typedef enum {
     QUEUE_OVERFLOW_REJECT_PUBLISH = 0, /* default: reject the new message (QUEUE_FULL) */

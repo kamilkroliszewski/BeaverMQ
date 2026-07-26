@@ -2225,6 +2225,13 @@ static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
                               body, body_len, p->pub_props, p->pub_props_len);
     }
     proto_advance(p, BMQP_STATE_ACTIVE);
+    /* Local producer flow control: if any queue is over its high-water mark,
+     * pause this producer's reads (TCP backpressure) so it cannot outrun the
+     * consumers. The per-server throttle timer resumes reads once the broker-wide
+     * flow alarm clears (see on_throttle_timer / beaver_conn_throttle_read). This
+     * complements the cluster-congestion throttle on the replicated path above. */
+    if (queue_flow_alarm_active())
+        beaver_conn_throttle_read(p->conn);
     /* Hot path: keep at DEBUG so high-throughput publishing isn't throttled by
      * synchronous logging (the LOG_DEBUG macro is a no-op when filtered). */
     LOG_DEBUG("conn #%" PRIu64 " ch=%u: Basic.Publish exchange='%s' key='%s' "
