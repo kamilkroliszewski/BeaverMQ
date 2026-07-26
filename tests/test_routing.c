@@ -168,6 +168,82 @@ static void test_queue_drain_frees_bytes(void)
     queue_set_default_limits(0, 0);
 }
 
+/* Per-queue overflow = drop-head: when full, the OLDEST message is evicted to
+ * make room for the newcomer, so the newest data always survives and depth stays
+ * capped. Uses a per-queue max_length override (no global default). */
+static void test_queue_overflow_drop_head(void)
+{
+    TEST_SECTION("overflow drop-head evicts the oldest to admit the newest, depth stays capped");
+    queue_set_default_limits(0, 0); /* rely on the per-queue override only */
+    beaver_queue_t *q = queue_new("qdrop", 0);
+    queue_set_limits(q, 2 /* max_length */, 0, QUEUE_OVERFLOW_DROP_HEAD);
+
+    beaver_message_t *m1 = message_new("", "", "1", 1);
+    beaver_message_t *m2 = message_new("", "", "2", 1);
+    beaver_message_t *m3 = message_new("", "", "3", 1);
+    CHECK_EQ(queue_enqueue(q, m1), 0);
+    CHECK_EQ(queue_enqueue(q, m2), 0);
+    /* Third enqueue exceeds max_length=2: drop-head evicts m1 rather than
+     * rejecting m3, so it still returns success and depth remains 2. */
+    CHECK_EQ(queue_enqueue(q, m3), 0);
+    CHECK_EQ(queue_depth(q), 2);
+    CHECK_EQ(queue_total_dropped(q), 1);
+
+    /* The survivors, oldest-first, must be m2 then m3 (m1 was the one dropped). */
+    beaver_message_t *a = queue_dequeue(q);
+    beaver_message_t *b = queue_dequeue(q);
+    CHECK(a && a->body_len == 1 && ((const char *)a->body)[0] == '2');
+    CHECK(b && b->body_len == 1 && ((const char *)b->body)[0] == '3');
+    message_unref(a); message_unref(b);
+
+    message_unref(m1); message_unref(m2); message_unref(m3);
+    queue_unref(q);
+}
+
+/* Per-queue overflow = reject-publish (the default) with a per-queue override:
+ * a full queue rejects the newcomer with QUEUE_FULL and keeps the oldest. */
+static void test_queue_overflow_reject_publish(void)
+{
+    TEST_SECTION("overflow reject-publish keeps the oldest and rejects the newcomer");
+    queue_set_default_limits(0, 0);
+    beaver_queue_t *q = queue_new("qreject", 0);
+    queue_set_limits(q, 2, 0, QUEUE_OVERFLOW_REJECT_PUBLISH);
+
+    beaver_message_t *m1 = message_new("", "", "1", 1);
+    beaver_message_t *m2 = message_new("", "", "2", 1);
+    beaver_message_t *m3 = message_new("", "", "3", 1);
+    CHECK_EQ(queue_enqueue(q, m1), 0);
+    CHECK_EQ(queue_enqueue(q, m2), 0);
+    CHECK_EQ(queue_enqueue(q, m3), QUEUE_FULL);
+    CHECK_EQ(queue_depth(q), 2);
+    CHECK_EQ(queue_total_dropped(q), 0); /* nothing evicted under reject-publish */
+
+    beaver_message_t *a = queue_dequeue(q); /* oldest survives: m1 */
+    CHECK(a && a->body_len == 1 && ((const char *)a->body)[0] == '1');
+    message_unref(a);
+
+    message_unref(m1); message_unref(m2); message_unref(m3);
+    queue_unref(q);
+}
+
+/* drop-head must admit a lone message larger than max_bytes (never drop the only
+ * message), matching RabbitMQ - the eviction loop stops at an empty queue. */
+static void test_queue_overflow_drop_head_lone_big(void)
+{
+    TEST_SECTION("overflow drop-head still admits a lone over-size message");
+    queue_set_default_limits(0, 0);
+    beaver_queue_t *q = queue_new("qbig", 0);
+    queue_set_limits(q, 0, 4 /* max_bytes */, QUEUE_OVERFLOW_DROP_HEAD);
+
+    beaver_message_t *big = message_new("", "", "abcdefgh", 8); /* > 4-byte cap */
+    CHECK_EQ(queue_enqueue(q, big), 0);   /* admitted: it is the only message */
+    CHECK_EQ(queue_depth(q), 1);
+    CHECK_EQ(queue_total_dropped(q), 0);
+
+    message_unref(big);
+    queue_unref(q);
+}
+
 /* Regression: an internal requeue (nack/reject/disconnect) must never be
  * dropped just because the queue hit its publisher-facing limit - otherwise a
  * full queue silently loses in-flight messages on requeue (audit 2.2). */
@@ -417,6 +493,9 @@ int main(void)
     test_queue_purge();
     test_queue_default_limits();
     test_queue_drain_frees_bytes();
+    test_queue_overflow_drop_head();
+    test_queue_overflow_reject_publish();
+    test_queue_overflow_drop_head_lone_big();
     test_queue_requeue_bypasses_limits();
     test_exchange_type_name_roundtrip();
     test_exchange_direct_routing();

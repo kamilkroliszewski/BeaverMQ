@@ -190,6 +190,80 @@ static int name_ok(const char *s)
     return 1;
 }
 
+/* ---- Queue.Declare argument parsing (x-overflow / x-max-length[-bytes]) --- */
+
+typedef struct {
+    int      has_overflow;
+    char     overflow[32];
+    int      has_max_length;
+    uint64_t max_length;
+    int      has_max_bytes;
+    uint64_t max_bytes;
+} queue_args_t;
+
+/* Consume one AMQP field-table value of the given type, yielding its integer
+ * value in *ival for numeric types (0 otherwise). Returns 1 on success, 0 if
+ * the type is unknown - after which the reader can no longer be trusted (its
+ * width is unknown), so the caller must stop walking the table. */
+static int read_field_value(bmqp_reader_t *r, uint8_t type, uint64_t *ival)
+{
+    size_t n;
+    *ival = 0;
+    switch (type) {
+    case 't': case 'b': case 'B': *ival = bmqp_read_u8(r);  return !r->error;
+    case 's': case 'u': case 'U': *ival = bmqp_read_u16(r); return !r->error;
+    case 'I': case 'i': case 'f': *ival = bmqp_read_u32(r); return !r->error;
+    case 'l': case 'L': case 'T':
+    case 'd':                     *ival = bmqp_read_u64(r); return !r->error;
+    case 'D': bmqp_read_u8(r); bmqp_read_u32(r); return !r->error; /* decimal */
+    case 'V': return !r->error;                                    /* void */
+    case 'S': case 'x': case 'A': case 'F':                        /* len-prefixed */
+        bmqp_read_longstr(r, &n); return !r->error;
+    default:
+        r->error = 1; return 0;   /* unknown type: cannot know its width */
+    }
+}
+
+/* Walk the Queue.Declare arguments field table, pulling out the queue-policy
+ * keys we honor. Unknown fields are skipped by type; a value type we don't
+ * recognize stops the walk (rather than risk desyncing). Best-effort: anything
+ * malformed just leaves the corresponding has_* flag unset. */
+static void parse_queue_args(const uint8_t *tbl, size_t len, queue_args_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!tbl || len == 0)
+        return;
+    bmqp_reader_t r;
+    bmqp_reader_init(&r, tbl, len);
+    while (!r.error && bmqp_reader_remaining(&r) > 0) {
+        size_t nlen;
+        const char *name = bmqp_read_shortstr(&r, &nlen);
+        uint8_t type = bmqp_read_u8(&r);
+        if (r.error || !name)
+            break;
+        /* x-overflow is a string value: capture it before consuming. */
+        if (type == 'S' && nlen == 10 && memcmp(name, "x-overflow", 10) == 0) {
+            size_t vlen;
+            const char *v = bmqp_read_longstr(&r, &vlen);
+            if (r.error)
+                break;
+            out->has_overflow = 1;
+            copy_str(out->overflow, sizeof out->overflow, v, vlen);
+            continue;
+        }
+        uint64_t ival;
+        if (!read_field_value(&r, type, &ival))
+            break;
+        if (nlen == 12 && memcmp(name, "x-max-length", 12) == 0) {
+            out->has_max_length = 1;
+            out->max_length = ival;
+        } else if (nlen == 18 && memcmp(name, "x-max-length-bytes", 18) == 0) {
+            out->has_max_bytes = 1;
+            out->max_bytes = ival;
+        }
+    }
+}
+
 /* ---- input buffer management --------------------------------------------- */
 
 static int inbuf_append(beaver_proto_t *p, const uint8_t *data, size_t len)
@@ -1301,7 +1375,7 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         size_t qn, tbl;
         const char *q = bmqp_read_shortstr(r, &qn);
         uint8_t bits  = bmqp_read_u8(r);        /* passive,durable,exclusive,auto-del,no-wait */
-        bmqp_read_longstr(r, &tbl);             /* arguments (field table) */
+        const char *args = bmqp_read_longstr(r, &tbl); /* arguments (field table) */
         if (r->error) {
             proto_fatal(p, "malformed Queue.Declare");
             return;
@@ -1342,6 +1416,43 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         LOG_INFO("conn #%" PRIu64 " ch=%u: Queue.Declare '%s' (%s, depth=%u)",
                  p->conn->id, channel, qname,
                  created ? "created" : "exists", depth);
+
+        /* Apply per-queue overflow/limit policy from the declare arguments
+         * (x-overflow / x-max-length / x-max-length-bytes). Only on create: an
+         * existing queue keeps the policy it was declared with, matching the
+         * flag-mismatch rule above. */
+        if (created) {
+            queue_args_t qa;
+            parse_queue_args((const uint8_t *)args, tbl, &qa);
+            if (qa.has_overflow || qa.has_max_length || qa.has_max_bytes) {
+                beaver_queue_t *lq = broker_get_queue(p->conn->server->broker,
+                                                      p->vhost, qname);
+                if (lq) {
+                    queue_set_limits(lq,
+                                     qa.has_max_length ? qa.max_length : 0,
+                                     qa.has_max_bytes  ? qa.max_bytes  : 0,
+                                     (qa.has_overflow &&
+                                      strcmp(qa.overflow, "drop-head") == 0)
+                                         ? QUEUE_OVERFLOW_DROP_HEAD
+                                         : QUEUE_OVERFLOW_REJECT_PUBLISH);
+                    if (qa.has_overflow &&
+                        strcmp(qa.overflow, "drop-head") != 0 &&
+                        strcmp(qa.overflow, "reject-publish") != 0)
+                        LOG_WARN("conn #%" PRIu64 ": unsupported x-overflow '%s' "
+                                 "on queue '%s'; using reject-publish",
+                                 p->conn->id, qa.overflow, qname);
+                    LOG_INFO("conn #%" PRIu64 ": queue '%s' limits "
+                             "max_length=%" PRIu64 " max_bytes=%" PRIu64
+                             " overflow=%s", p->conn->id, qname,
+                             qa.has_max_length ? qa.max_length : 0,
+                             qa.has_max_bytes ? qa.max_bytes : 0,
+                             (qa.has_overflow &&
+                              strcmp(qa.overflow, "drop-head") == 0)
+                                 ? "drop-head" : "reject-publish");
+                    queue_unref(lq);
+                }
+            }
+        }
 
         /* Exclusive queues: the first declarer owns the queue; a declare from
          * any OTHER connection is refused (AMQP RESOURCE_LOCKED). The owner is
