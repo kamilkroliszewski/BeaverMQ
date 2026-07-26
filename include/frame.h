@@ -106,6 +106,10 @@ typedef struct {
 void bmqp_buf_init(bmqp_buf_t *b);
 void bmqp_buf_free(bmqp_buf_t *b);
 void bmqp_buf_reset(bmqp_buf_t *b);
+/* Ensure room for `extra` more bytes up front, so a large known-size append is
+ * one allocation rather than a geometric realloc/copy sequence. Sets ->error on
+ * OOM (sticky). Purely an optimization: writers still grow on demand. */
+void bmqp_buf_reserve(bmqp_buf_t *b, size_t extra);
 
 void bmqp_buf_put_u8(bmqp_buf_t *b, uint8_t v);
 void bmqp_buf_put_u16(bmqp_buf_t *b, uint16_t v);

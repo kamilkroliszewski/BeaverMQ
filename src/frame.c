@@ -152,6 +152,14 @@ static int buf_reserve(bmqp_buf_t *b, size_t extra)
     return 1;
 }
 
+void bmqp_buf_reserve(bmqp_buf_t *b, size_t extra)
+{
+    /* Pre-size the buffer so a known-large append happens in ONE allocation
+     * instead of the geometric realloc-and-copy sequence buf_reserve would
+     * otherwise perform. On OOM ->error is set (sticky), same as every writer. */
+    buf_reserve(b, extra);
+}
+
 void bmqp_buf_put_u8(bmqp_buf_t *b, uint8_t v)
 {
     if (!buf_reserve(b, 1))
