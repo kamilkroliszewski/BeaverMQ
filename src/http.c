@@ -25,7 +25,9 @@
 #include <jansson.h>
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <strings.h>
@@ -900,20 +902,36 @@ static int mgmt_name_ok(const char *s)
 }
 
 /* URL-decode in place (handles %XX and '+'); returns the new length. */
-static size_t url_decode(char *s)
+static int hexnib(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    c |= 0x20;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+/* Percent-decode `s` in place. Returns 0 on success, -1 if a '%' is not
+ * followed by two hex digits (malformed / truncated escape) - the old code
+ * decoded '%zz' or a trailing '%' into a garbage byte instead of rejecting it. */
+static int url_decode(char *s)
 {
     char *o = s;
     for (char *p = s; *p; p++) {
-        if (*p == '%' && p[1] && p[2]) {
-            int hi = p[1], lo = p[2];
-            hi = (hi>='0'&&hi<='9')?hi-'0':(hi|32)-'a'+10;
-            lo = (lo>='0'&&lo<='9')?lo-'0':(lo|32)-'a'+10;
-            *o++ = (char)((hi<<4)|lo); p += 2;
-        } else if (*p == '+') *o++ = ' ';
-        else *o++ = *p;
+        if (*p == '%') {
+            int hi = hexnib((unsigned char)p[1]);
+            int lo = p[1] ? hexnib((unsigned char)p[2]) : -1;
+            if (hi < 0 || lo < 0)
+                return -1;
+            *o++ = (char)((hi << 4) | lo);
+            p += 2;
+        } else if (*p == '+') {
+            *o++ = ' ';
+        } else {
+            *o++ = *p;
+        }
     }
     *o = '\0';
-    return (size_t)(o - s);
+    return 0;
 }
 
 /* Parse a comma/space/semicolon separated tag list, matching each token
@@ -1004,13 +1022,19 @@ static int handle_mgmt(http_conn_t *c, const char *method, const char *path,
         return 1;
     }
     if (is_del && strncmp(path, "/api/vhosts/", 12) == 0) {
-        char name[256]; snprintf(name, sizeof name, "%s", path + 12); url_decode(name);
+        char name[256]; snprintf(name, sizeof name, "%s", path + 12);
+        if (url_decode(name) != 0) {
+            http_respond_error(c, 400, "Bad Request", "malformed percent-escape"); return 1;
+        }
         respond_cfg_result(c, cfg_apply(h, CFG_DEL_VHOST, name, "", "", "", "", 0),
                            "delete failed");
         return 1;
     }
     if (is_del && strncmp(path, "/api/users/", 11) == 0) {
-        char name[256]; snprintf(name, sizeof name, "%s", path + 11); url_decode(name);
+        char name[256]; snprintf(name, sizeof name, "%s", path + 11);
+        if (url_decode(name) != 0) {
+            http_respond_error(c, 400, "Bad Request", "malformed percent-escape"); return 1;
+        }
         respond_cfg_result(c, cfg_apply(h, CFG_DEL_USER, name, "", "", "", "", 0),
                            "delete failed");
         return 1;
@@ -1022,8 +1046,11 @@ static int handle_mgmt(http_conn_t *c, const char *method, const char *path,
         if (!slash) { http_respond_error(c, 400, "Bad Request", "need user/vhost"); return 1; }
         *slash = '\0';
         char user[256], vh[256];
-        snprintf(user, sizeof user, "%s", rest); url_decode(user);
-        snprintf(vh, sizeof vh, "%s", slash + 1); url_decode(vh);
+        snprintf(user, sizeof user, "%s", rest);
+        snprintf(vh, sizeof vh, "%s", slash + 1);
+        if (url_decode(user) != 0 || url_decode(vh) != 0) {
+            http_respond_error(c, 400, "Bad Request", "malformed percent-escape"); return 1;
+        }
         respond_cfg_result(c, cfg_apply(h, CFG_CLEAR_PERM, user, vh, "", "", "", 0),
                            "delete failed");
         return 1;
@@ -1191,10 +1218,15 @@ static void handle_request(http_conn_t *c)
 
 static int inbuf_append(http_conn_t *c, const char *data, size_t len)
 {
-    if (c->inbuf_len + len > c->inbuf_cap) {
+    size_t need = c->inbuf_len + len;
+    if (need < c->inbuf_len)
+        return 0; /* size_t overflow */
+    if (need > c->inbuf_cap) {
         size_t nc = c->inbuf_cap ? c->inbuf_cap : 1024;
-        while (nc < c->inbuf_len + len)
+        while (nc < need) {
+            if (nc > SIZE_MAX / 2) { nc = need; break; }
             nc *= 2;
+        }
         char *nb = realloc(c->inbuf, nc);
         if (!nb)
             return 0;
@@ -1219,17 +1251,36 @@ static char *http_header_end(http_conn_t *c)
     return memmem(c->inbuf, c->inbuf_len, "\r\n\r\n", 4);
 }
 
-static size_t http_content_length(http_conn_t *c, const char *he)
+/* Extract the request body length. Returns 0 and writes *out (0 if absent) on
+ * success; returns -1 on a malformed value or on TWO Content-Length headers
+ * that disagree - a classic request-smuggling vector, which the old "take the
+ * first, ignore the rest, never validate the digits" parser accepted silently. */
+static int http_content_length(http_conn_t *c, const char *he, size_t *out)
 {
-    size_t clen = 0;
+    *out = 0;
+    int seen = 0;
     for (char *p = c->inbuf; p + 15 < he; p++) {
-        if ((p == c->inbuf || p[-1] == '\n') &&
-            strncasecmp(p, "Content-Length:", 15) == 0) {
-            clen = (size_t)strtoul(p + 15, NULL, 10);
-            break;
-        }
+        if ((p != c->inbuf && p[-1] != '\n') ||
+            strncasecmp(p, "Content-Length:", 15) != 0)
+            continue;
+        const char *v = p + 15;
+        while (*v == ' ' || *v == '\t') v++;
+        if (*v < '0' || *v > '9')
+            return -1;                    /* missing / non-numeric value */
+        errno = 0;
+        char *endp = NULL;
+        unsigned long val = strtoul(v, &endp, 10);
+        if (errno != 0)
+            return -1;                    /* overflow */
+        while (*endp == ' ' || *endp == '\t') endp++;
+        if (*endp != '\r' && *endp != '\n')
+            return -1;                    /* trailing junk in the value */
+        if (seen && (size_t)val != *out)
+            return -1;                    /* conflicting duplicate header */
+        *out = (size_t)val;
+        seen = 1;
     }
-    return clen;
+    return 0;
 }
 
 static void on_http_conn_timeout(uv_timer_t *t)
@@ -1265,7 +1316,13 @@ static void on_http_read(uv_stream_t *stream, ssize_t nread,
             return;
         }
         if (he) {
-            size_t clen = http_content_length(c, he);
+            size_t clen = 0;
+            if (http_content_length(c, he, &clen) != 0) {
+                http_respond_error(c, 400, "Bad Request",
+                                   "invalid or conflicting Content-Length");
+                free(buf->base);
+                return;
+            }
             if (clen > c->server->max_body_bytes) {
                 http_respond_error(c, 413, "Payload Too Large",
                                    "request body too large");

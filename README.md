@@ -301,7 +301,11 @@ completely unmodified), and:
   supervisor then exits with a non‑zero code instead of looping silently).
 - **Detects a frozen (not crashed) event loop** via a heartbeat the worker
   writes every couple of seconds; a missed heartbeat is treated the same as
-  a crash.
+  a crash. The heartbeat is gated on **every** critical loop staying fresh —
+  each AMQP worker loop, the management loop and the cluster/Raft loop stamps
+  its own liveness slot (monotonic clock), and if *any* one stalls the worker
+  withholds the heartbeat and gets respawned. So a freeze in a background loop
+  is caught even while worker 0's loop keeps ticking.
 - **Forwards `SIGTERM`/`SIGINT`** to the worker and waits (default 5 s) for a
   graceful shutdown before falling back to `SIGKILL`.
 - Writes `supervisor.pid` and `worker.pid` under `data_dir` (see below), and
@@ -546,7 +550,7 @@ Implemented classes/methods (official AMQP 0‑9‑1 ids):
 | Exchange (40)    | Declare/DeclareOk                                         |
 | Queue (50)       | Declare/DeclareOk, Bind/BindOk, Delete/DeleteOk           |
 | Basic (60)       | Qos/QosOk, Consume/ConsumeOk, Cancel/CancelOk, Publish,    |
-|                  | Deliver, Get/GetOk/GetEmpty, Ack, Nack, Reject             |
+|                  | Return, Deliver, Get/GetOk/GetEmpty, Ack, Nack, Reject     |
 | Confirm (85)     | Select/SelectOk (publisher confirms)                      |
 
 The handshake authenticates with SASL `PLAIN` against the replicated user
@@ -565,8 +569,10 @@ queue replicates through Raft.
 
 - `Basic.Qos` honours `prefetch-count`, but not `prefetch-size` or the `global`
   flag.
-- The `mandatory` / `immediate` publish flags are parsed but do **not** produce
-  `Basic.Return` for unroutable messages.
+- `mandatory` returns an unroutable message to the publisher via `Basic.Return`
+  (312 NO_ROUTE) for locally-routed publishes; the `immediate` flag is parsed
+  but not acted on. (A persistent publish routed asynchronously through the
+  cluster is not returned - the routing result is not known at publish time.)
 - No transactions (`Tx` class), and no coordinated exactly‑once delivery across
   cluster replicas (a replicated message is consumed independently per node).
 
@@ -627,6 +633,9 @@ now refuses to reproduce.
   a user survives a restart, `authstore.db` is `0600`, and the first‑boot
   bootstrap window stays closed once any user has existed — even after the last
   user is deleted (`make persistence-test`)
+- `test_health.sh` — per‑loop health aggregation: a frozen background loop
+  makes the supervisor respawn the worker, while a healthy run is left alone
+  (`make health-test`)
 
 ### Integration tests (live broker)
 
@@ -636,8 +645,9 @@ now refuses to reproduce.
   auth, `Queue.Declare`, a publish→`Basic.Get` round‑trip, **publisher confirms**
   (`Confirm.Select` → two `Basic.Ack`s), and ordered `Basic.Consume` delivery.
 - `tests/integration/test_management.py` — stdlib only: `healthz` is open,
-  the API demands credentials (401), correct ones work (200), and a wrong‑login
-  burst from one IP is rate‑limited (429).
+  the API demands credentials (401), correct ones work (200), a wrong‑login
+  burst from one IP is rate‑limited (429), and the custom HTTP parser survives
+  200 random/malformed requests.
 
 It installs `pika` into a throwaway venv, or SKIPs the AMQP client test with a
 clear message when offline; the stdlib management test always runs.
@@ -652,6 +662,7 @@ make fuzz && ./build/fuzz_frame -max_total_time=60   # libFuzzer (clang)
 make integration   # live AMQP + management API tests
 make fault-test    # storage-layer fault injection (WAL/snapshot fail-stop)
 make persistence-test           # standalone persistence + durable bootstrap
+make health-test                # per-loop health -> supervisor respawn
 bash tests/test_cluster.sh      # 3-node Raft election + failover
 ```
 

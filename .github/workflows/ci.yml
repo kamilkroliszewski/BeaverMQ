@@ -83,6 +83,8 @@ jobs:
         run: make fault-test
       - name: Standalone persistence + durable bootstrap
         run: make persistence-test
+      - name: Per-loop health aggregation (frozen loop -> respawn)
+        run: make health-test
 
   integration:
     name: AMQP + management integration

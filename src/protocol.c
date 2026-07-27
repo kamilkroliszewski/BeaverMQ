@@ -295,10 +295,15 @@ static int inbuf_append(beaver_proto_t *p, const uint8_t *data, size_t len)
         p->inbuf_len = rem;
         p->inbuf_pos = 0;
     }
-    if (p->inbuf_len + len > p->inbuf_cap) {
+    size_t need = p->inbuf_len + len;
+    if (need < p->inbuf_len)
+        return 0; /* size_t overflow: reject rather than under-allocate */
+    if (need > p->inbuf_cap) {
         size_t newcap = p->inbuf_cap ? p->inbuf_cap : 256;
-        while (newcap < p->inbuf_len + len)
+        while (newcap < need) {
+            if (newcap > SIZE_MAX / 2) { newcap = need; break; }
             newcap *= 2;
+        }
         uint8_t *nb = realloc(p->inbuf, newcap);
         if (!nb)
             return 0;
@@ -557,6 +562,28 @@ static void send_publish_confirm(beaver_proto_t *p, uint16_t channel,
     send_method(p, channel, BMQP_CLASS_BASIC,
                 nack ? BMQP_BASIC_NACK : BMQP_BASIC_ACK, &a);
     bmqp_buf_free(&a);
+}
+
+/* Return an unroutable `mandatory` message to the publisher: a Basic.Return
+ * method frame (312 NO_ROUTE) followed by the message's content header + body,
+ * exactly as a delivery is framed. */
+static void send_basic_return(beaver_proto_t *p, uint16_t channel,
+                              const char *exchange, const char *routing_key,
+                              const void *body, size_t body_len,
+                              const void *props, size_t props_len)
+{
+    bmqp_buf_t a;
+    bmqp_buf_init(&a);
+    bmqp_buf_put_u16(&a, 312);                 /* reply-code: NO_ROUTE */
+    bmqp_buf_put_shortstr(&a, "NO_ROUTE");     /* reply-text */
+    bmqp_buf_put_shortstr(&a, exchange);
+    bmqp_buf_put_shortstr(&a, routing_key);
+    send_method(p, channel, BMQP_CLASS_BASIC, BMQP_BASIC_RETURN, &a);
+    bmqp_buf_free(&a);
+
+    uint32_t fmax = p->conn->frame_max ? p->conn->frame_max : AMQP_DEFAULT_FRAME_MAX;
+    protocol_send_content(p->conn, channel, BMQP_CLASS_BASIC, body, body_len,
+                          props_len ? props : NULL, props_len, fmax);
 }
 
 static void pending_op_timer_cb(uv_timer_t *t)

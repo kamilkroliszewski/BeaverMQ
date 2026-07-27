@@ -50,6 +50,21 @@ def main() -> int:
     assert got == [b"c1", b"c2"], f"consume order/content mismatch: {got!r}"
     print("OK: Basic.Consume delivered both messages in order")
 
+    # mandatory: an unroutable publish must come back via Basic.Return. On a
+    # confirm-mode channel pika surfaces the return by raising UnroutableError
+    # (deterministic, no polling); a routable mandatory publish does not raise.
+    mch = conn.channel()
+    mch.confirm_delivery()
+    try:
+        mch.basic_publish(exchange="", routing_key="no.such.queue",
+                          body=b"orphan", mandatory=True)
+        raise AssertionError("unroutable mandatory publish was not returned")
+    except pika.exceptions.UnroutableError:
+        pass  # the broker returned it (Basic.Return), as required
+    mch.basic_publish(exchange="", routing_key=q, body=b"routable", mandatory=True)
+    mch.basic_get(queue=q, auto_ack=True)  # routable: not returned; drain it
+    print("OK: mandatory publish returns only when unroutable (Basic.Return)")
+
     conn.close()
     print("PASS: AMQP integration")
     return 0

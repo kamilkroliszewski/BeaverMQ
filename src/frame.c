@@ -130,17 +130,30 @@ void bmqp_buf_reset(bmqp_buf_t *b)
     /* keep error sticky until explicitly re-init'd */
 }
 
-/* Ensure room for `extra` more bytes; sets ->error on OOM. */
+/* Ensure room for `extra` more bytes; sets ->error on OOM or size overflow. */
 static int buf_reserve(bmqp_buf_t *b, size_t extra)
 {
     if (b->error)
         return 0;
-    if (b->len + extra <= b->cap)
+    /* Guard the addition: if len + extra wraps around size_t it would look
+     * smaller than cap and we'd "reserve" nothing, then a caller writing `extra`
+     * bytes would run off the end of the buffer (heap overflow). */
+    size_t need = b->len + extra;
+    if (need < b->len) {
+        b->error = 1;
+        return 0;
+    }
+    if (need <= b->cap)
         return 1;
 
     size_t newcap = b->cap ? b->cap : 64;
-    while (newcap < b->len + extra)
+    while (newcap < need) {
+        if (newcap > SIZE_MAX / 2) { /* doubling would overflow: jump to need */
+            newcap = need;
+            break;
+        }
         newcap *= 2;
+    }
 
     uint8_t *p = realloc(b->data, newcap);
     if (!p) {
@@ -277,6 +290,12 @@ void bmqp_frame_finish(bmqp_buf_t *out, size_t payload_start)
     if (out->error)
         return; /* a reserve failed somewhere; caller checks ->error */
     size_t payload_len = out->len - payload_start;
+    if (payload_len > 0xFFFFFFFFu) {
+        /* The length field is a u32; a payload past that would be silently
+         * truncated into a frame the peer then misparses. Refuse to build it. */
+        out->error = 1;
+        return;
+    }
     size_t lp = payload_start - 4; /* the u32 length field precedes the payload */
     out->data[lp]     = (uint8_t)(payload_len >> 24);
     out->data[lp + 1] = (uint8_t)(payload_len >> 16);
