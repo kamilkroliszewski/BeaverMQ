@@ -301,7 +301,11 @@ completely unmodified), and:
   supervisor then exits with a non‑zero code instead of looping silently).
 - **Detects a frozen (not crashed) event loop** via a heartbeat the worker
   writes every couple of seconds; a missed heartbeat is treated the same as
-  a crash.
+  a crash. The heartbeat is gated on **every** critical loop staying fresh —
+  each AMQP worker loop, the management loop and the cluster/Raft loop stamps
+  its own liveness slot (monotonic clock), and if *any* one stalls the worker
+  withholds the heartbeat and gets respawned. So a freeze in a background loop
+  is caught even while worker 0's loop keeps ticking.
 - **Forwards `SIGTERM`/`SIGINT`** to the worker and waits (default 5 s) for a
   graceful shutdown before falling back to `SIGKILL`.
 - Writes `supervisor.pid` and `worker.pid` under `data_dir` (see below), and
@@ -627,6 +631,9 @@ now refuses to reproduce.
   a user survives a restart, `authstore.db` is `0600`, and the first‑boot
   bootstrap window stays closed once any user has existed — even after the last
   user is deleted (`make persistence-test`)
+- `test_health.sh` — per‑loop health aggregation: a frozen background loop
+  makes the supervisor respawn the worker, while a healthy run is left alone
+  (`make health-test`)
 
 ### Integration tests (live broker)
 
@@ -653,6 +660,7 @@ make fuzz && ./build/fuzz_frame -max_total_time=60   # libFuzzer (clang)
 make integration   # live AMQP + management API tests
 make fault-test    # storage-layer fault injection (WAL/snapshot fail-stop)
 make persistence-test           # standalone persistence + durable bootstrap
+make health-test                # per-loop health -> supervisor respawn
 bash tests/test_cluster.sh      # 3-node Raft election + failover
 ```
 

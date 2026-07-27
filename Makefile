@@ -139,6 +139,11 @@ fault-test: $(BIN)
 persistence-test: $(BIN)
 	@bash $(TEST_DIR)/test_persistence.sh
 
+# Per-loop health: a frozen non-main loop must make the supervisor respawn.
+.PHONY: health-test
+health-test: $(BIN)
+	@bash $(TEST_DIR)/test_health.sh
+
 debug: OPT := -O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer
 debug: LDFLAGS += -fsanitize=address,undefined
 debug: clean all

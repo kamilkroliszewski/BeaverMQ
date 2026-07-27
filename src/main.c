@@ -50,6 +50,7 @@ typedef struct {
     beaver_server_t      server;
     beaver_dispatcher_t *dispatcher;
     uv_thread_t          thread;     /* unused for worker 0 (the main thread) */
+    uv_timer_t           health_timer; /* per-loop liveness (see loop_health_*) */
 } worker_t;
 
 typedef struct {
@@ -64,12 +65,14 @@ typedef struct {
     beaver_http_server_t *http;
     uv_loop_t             mgmt_loop;
     uv_thread_t           mgmt_thread;
+    uv_timer_t            mgmt_health_timer;
     int                   mgmt_started;
     /* Cluster control plane (optional): its OWN loop/thread, like the mgmt
      * server, so Raft is never starved by AMQP load and needs no locks. */
     cluster_node_t       *cluster;
     uv_loop_t             cluster_loop;
     uv_thread_t           cluster_thread;
+    uv_timer_t            cluster_health_timer;
     int                   cluster_started;
 } app_t;
 
@@ -113,9 +116,12 @@ static int resolve_web_root(const beaver_config_t *cfg, char *out, size_t outsz)
 
 /* ---- worker lifecycle ---------------------------------------------------- */
 
+static void loop_health_arm(uv_loop_t *loop, uv_timer_t *timer); /* fwd */
+
 static void worker_thread_main(void *arg)
 {
     worker_t *w = arg;
+    loop_health_arm(&w->loop, &w->health_timer);
     uv_run(&w->loop, UV_RUN_DEFAULT);
 }
 
@@ -151,15 +157,32 @@ static int worker_init(app_t *app, worker_t *w, int id)
     return 0;
 }
 
+/* TEST-ONLY: freeze the loop this fires on, to exercise the per-loop health
+ * gating (a stalled non-main loop must make the supervisor respawn us). Armed
+ * only when BEAVERMQ_TEST_FREEZE_MGMT_LOOP is set - a no-op in normal use. */
+static void test_freeze_loop_cb(uv_timer_t *t)
+{
+    (void)t;
+    LOG_ERROR("TEST: freezing the management loop (BEAVERMQ_TEST_FREEZE_MGMT_LOOP)");
+    for (;;) sleep(3600);
+}
+
 static void mgmt_thread_main(void *arg)
 {
     app_t *app = arg;
+    loop_health_arm(&app->mgmt_loop, &app->mgmt_health_timer);
+    if (getenv("BEAVERMQ_TEST_FREEZE_MGMT_LOOP")) {
+        static uv_timer_t frz;
+        uv_timer_init(&app->mgmt_loop, &frz);
+        uv_timer_start(&frz, test_freeze_loop_cb, 800, 0);
+    }
     uv_run(&app->mgmt_loop, UV_RUN_DEFAULT);
 }
 
 static void cluster_thread_main(void *arg)
 {
     app_t *app = arg;
+    loop_health_arm(&app->cluster_loop, &app->cluster_health_timer);
     uv_run(&app->cluster_loop, UV_RUN_DEFAULT);
 }
 
@@ -531,13 +554,85 @@ static int cli_add_user(int argc, char **argv)
     return 0;
 }
 
+/* ---- per-loop health aggregation -------------------------------------------
+ * The heartbeat below proves ONE loop is alive. But the broker runs several
+ * independent loops on their own threads (each AMQP worker, the management
+ * server, the cluster/Raft plane); any of them could freeze while worker 0's
+ * loop keeps ticking, and the supervisor would see a "healthy" process. So each
+ * critical loop stamps its own slot from a repeating timer, and the heartbeat
+ * writer only emits a beat when EVERY registered loop is fresh - a frozen loop
+ * withholds the heartbeat and the supervisor respawns the whole process.
+ *
+ * Timestamps use uv_hrtime() (a real monotonic clock, not a loop's cached
+ * time), so a frozen loop's stamp genuinely stops advancing. Only active under
+ * the supervisor (see install_heartbeat_writer). */
+#define LOOP_HEALTH_MAX 128
+static _Atomic uint64_t g_loop_hb[LOOP_HEALTH_MAX];
+static _Atomic int      g_loop_health_n;
+static uint64_t         g_loop_stale_ns;
+static uint64_t         g_loop_tick_ms;
+static int              g_loop_health_active;
+
+static void loop_health_init(uint64_t heartbeat_interval_ms)
+{
+    uint64_t now = uv_hrtime();
+    for (int i = 0; i < LOOP_HEALTH_MAX; i++)
+        atomic_store_explicit(&g_loop_hb[i], now, memory_order_relaxed);
+    atomic_store(&g_loop_health_n, 0);
+    g_loop_tick_ms  = heartbeat_interval_ms;
+    /* A loop that misses ~3 ticks is considered stalled - loose enough to
+     * tolerate a briefly busy loop, tight enough that a real freeze is caught
+     * well before the supervisor's own heartbeat timeout. */
+    g_loop_stale_ns = heartbeat_interval_ms * 3ull * 1000000ull;
+    g_loop_health_active = 1;
+}
+
+static void loop_health_tick_cb(uv_timer_t *t)
+{
+    int idx = (int)(intptr_t)t->data;
+    atomic_store_explicit(&g_loop_hb[idx], uv_hrtime(), memory_order_relaxed);
+}
+
+/* Register + arm a per-loop health timer. MUST be called on the loop's own
+ * thread, before uv_run(). No-op when health aggregation is inactive. */
+static void loop_health_arm(uv_loop_t *loop, uv_timer_t *timer)
+{
+    if (!g_loop_health_active)
+        return;
+    int idx = atomic_fetch_add(&g_loop_health_n, 1);
+    if (idx >= LOOP_HEALTH_MAX)
+        return; /* more loops than slots (shouldn't happen): just don't track it */
+    atomic_store_explicit(&g_loop_hb[idx], uv_hrtime(), memory_order_relaxed);
+    timer->data = (void *)(intptr_t)idx;
+    uv_timer_init(loop, timer);
+    uv_timer_start(timer, loop_health_tick_cb, g_loop_tick_ms, g_loop_tick_ms);
+    uv_unref((uv_handle_t *)timer); /* never keep a loop alive just for health */
+}
+
+/* 0 if every registered loop is fresh; otherwise the 1-based index of a stale
+ * loop. Safe to call from any thread. */
+static int loop_health_stale_idx(void)
+{
+    if (!g_loop_health_active)
+        return 0;
+    uint64_t now = uv_hrtime();
+    int n = atomic_load(&g_loop_health_n);
+    for (int i = 0; i < n; i++) {
+        uint64_t last = atomic_load_explicit(&g_loop_hb[i], memory_order_relaxed);
+        if (now > last && now - last > g_loop_stale_ns)
+            return i + 1;
+    }
+    return 0;
+}
+
 /* ---- supervisor heartbeat writer -------------------------------------------
  * Active only when this process was fork+exec'd by the supervisor
  * (BEAVERMQ_HEARTBEAT_FD set - see supervisor.c). Writes 1 byte every
  * BEAVERMQ_SUPERVISOR_HEARTBEAT_MS (the SAME env var the supervisor reads, so
- * there is one definition of the default interval) to prove this process's
- * main loop is still alive. A complete no-op when the env var is absent -
- * i.e. every normal, non-supervised startup, unchanged from today. */
+ * there is one definition of the default interval) to prove the process is
+ * alive - but only when EVERY critical loop is fresh (see loop health above).
+ * A complete no-op when the env var is absent - i.e. every normal,
+ * non-supervised startup, unchanged from today. */
 
 static uv_timer_t g_heartbeat_timer;
 static int        g_heartbeat_fd = -1;
@@ -545,6 +640,19 @@ static int        g_heartbeat_fd = -1;
 static void on_heartbeat_tick(uv_timer_t *timer)
 {
     (void)timer;
+    /* Only report liveness if EVERY critical loop is still ticking. A frozen
+     * worker/mgmt/cluster loop withholds the beat, so the supervisor's timeout
+     * fires and it respawns the process instead of trusting a half-dead one. */
+    int stale = loop_health_stale_idx();
+    if (stale) {
+        static int warned = 0;
+        if (!warned) {
+            LOG_ERROR("heartbeat: loop #%d appears stalled; withholding heartbeat "
+                      "so the supervisor respawns this process", stale - 1);
+            warned = 1;
+        }
+        return;
+    }
     uint8_t byte = 0;
     ssize_t n = write(g_heartbeat_fd, &byte, 1);
     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -590,9 +698,11 @@ static void install_heartbeat_writer(uv_loop_t *loop)
         if (iend != interval_str && *iend == '\0' && v > 0)
             interval_ms = (uint64_t)v;
     }
+    loop_health_init(interval_ms); /* enable per-loop freshness gating */
     uv_timer_init(loop, &g_heartbeat_timer);
     uv_timer_start(&g_heartbeat_timer, on_heartbeat_tick, interval_ms, interval_ms);
-    LOG_INFO("heartbeat: reporting liveness to supervisor every %llums",
+    LOG_INFO("heartbeat: reporting liveness to supervisor every %llums "
+            "(gated on every worker/mgmt/cluster loop staying fresh)",
             (unsigned long long)interval_ms);
 }
 
@@ -840,6 +950,7 @@ int main(int argc, char **argv)
              app.config.bind_addr, app.config.amqp_port, app.nworkers,
              app.nworkers == 1 ? "" : "s");
 
+    loop_health_arm(&w0->loop, &w0->health_timer); /* worker 0 runs here */
     uv_run(&w0->loop, UV_RUN_DEFAULT);
 
     /* Worker 0's loop exited (shutdown). Join the other workers + mgmt thread. */
