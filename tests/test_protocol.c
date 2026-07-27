@@ -766,11 +766,15 @@ static void test_dead_letter_on_nack(void)
 }
 
 /* Producer flow control: publishing past a queue's high-water mark trips the
- * broker-wide flow alarm, which pauses the producer connection's reads (TCP
- * backpressure) so it cannot outrun the (here, absent) consumer into OOM. */
+ * broker-wide flow alarm (an observable congestion signal), but it must NOT
+ * pause the connection's reads. The queue's own limit already bounds memory
+ * (an over-limit publish is rejected or drop-head'd), whereas pausing the
+ * socket stops reading EVERYTHING on it - including consumer ACKs - which
+ * wedged connections that both publish and consume and made throughput swing
+ * in multi-second stop/go cycles. */
 static void test_producer_backpressure(void)
 {
-    TEST_SECTION("publishing past a queue's high-water mark pauses the producer's reads");
+    TEST_SECTION("a queue past its high-water mark trips the alarm but never pauses reads");
     harness_t h;
     h_setup(&h);
     h_handshake(&h);
@@ -802,8 +806,8 @@ static void test_producer_backpressure(void)
         h_collect(&h, buf, sizeof buf);
     }
 
-    CHECK(queue_flow_alarm_active());
-    CHECK_EQ(h.conn.read_paused, 1); /* producer throttled */
+    CHECK(queue_flow_alarm_active());   /* congestion is still reported ... */
+    CHECK_EQ(h.conn.read_paused, 0);    /* ... but the socket keeps being read */
 
     h_teardown(&h); /* frees the queue -> clears the alarm for later tests */
     CHECK(!queue_flow_alarm_active());
