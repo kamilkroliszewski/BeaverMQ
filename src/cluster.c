@@ -1068,6 +1068,32 @@ static void push_fwd_ack_pending(cluster_node_t *n, uint64_t log_index,
     n->fwd_ack_pending_tail = a;
 }
 
+/* Origin side of a forwarded proposal: release everything the leader has acked
+ * AND that we have applied locally. Called both when a FORWARD_ACK arrives and
+ * after we apply entries, since either can be the last piece. Reporting an op
+ * done before our own apply would let the client's very next command run
+ * against broker state that does not have it yet. */
+static void resolve_local_fwd_acks(cluster_node_t *n)
+{
+    /* Report acked proposals done only once WE have applied the entry behind
+     * them - the client's next command runs against our local broker state.
+     * Acks are cumulative and seqs monotonic, so this needs no per-proposal
+     * bookkeeping: mark the (fwd_marked_seq, fwd_acked_seq] range. Only the
+     * newest CL_STATUS_TABLE_SIZE entries are distinguishable in the status
+     * ring, so older ones are skipped rather than looped over (a burst can be
+     * millions of seqs wide). */
+    if (n->fwd_acked_seq <= n->fwd_marked_seq ||
+        n->log.applied_index < n->fwd_acked_index)
+        return;
+    uint64_t from = n->fwd_marked_seq + 1;
+    if (n->fwd_acked_seq >= CL_STATUS_TABLE_SIZE &&
+        from < n->fwd_acked_seq - (CL_STATUS_TABLE_SIZE - 1))
+        from = n->fwd_acked_seq - (CL_STATUS_TABLE_SIZE - 1);
+    for (uint64_t s = from; s <= n->fwd_acked_seq; s++)
+        mark_proposal_status(n, s, CL_PROPOSAL_COMMITTED);
+    n->fwd_marked_seq = n->fwd_acked_seq;
+}
+
 /* Drain fwd_ack_pending entries whose log_index is now committed. Local
  * (self-originated) entries resolve the status table directly; forwarded
  * ones are coalesced into at most one CL_FRAME_FORWARD_ACK per origin peer
@@ -1079,6 +1105,7 @@ static void resolve_fwd_acks(cluster_node_t *n)
         return;
     uint64_t commit = atomic_load(&n->log.commit_index);
     uint64_t bump[CLUSTER_MAX_NODES] = {0}; /* 0 = no update this pass (seq is 1-based) */
+    uint64_t bump_idx[CLUSTER_MAX_NODES] = {0}; /* log index behind that seq */
     while (n->fwd_ack_pending_head && n->fwd_ack_pending_head->log_index <= commit) {
         cl_fwd_ack_t *a = n->fwd_ack_pending_head;
         n->fwd_ack_pending_head = a->next;
@@ -1089,6 +1116,7 @@ static void resolve_fwd_acks(cluster_node_t *n)
         } else if (a->origin_node_id >= 0 && a->origin_node_id < CLUSTER_MAX_NODES &&
                   a->seq > bump[a->origin_node_id]) {
             bump[a->origin_node_id] = a->seq;
+            bump_idx[a->origin_node_id] = a->log_index;
         }
         free(a);
     }
@@ -1101,10 +1129,18 @@ static void resolve_fwd_acks(cluster_node_t *n)
          * everything <= this seq in its own fwd_pending list and resends the
          * whole thing on reconnect; the dedup check in CL_FRAME_FORWARD skips
          * whatever we already committed. */
+        if (bump_idx[id] > n->committed_fwd_index[id])
+            n->committed_fwd_index[id] = bump_idx[id];
         cluster_peer_t *peer = find_peer(n, id);
         if (peer && atomic_load(&peer->link_state) == CL_LINK_UP) {
-            uint8_t body[8];
+            /* Carry the LOG INDEX behind that seq as well: the origin must not
+             * report the op done until it has APPLIED the entry locally, not
+             * merely learned that it committed here. Otherwise a client that
+             * declares a queue on a follower and immediately binds it hits
+             * "queue not found" - the Declare-Ok raced its own apply. */
+            uint8_t body[16];
             put_be64(body, n->committed_fwd_seq[id]);
+            put_be64(body + 8, n->committed_fwd_index[id]);
             cl_send(peer->link, CL_FRAME_FORWARD_ACK, 0,
                    (uint32_t)atomic_load(&n->current_term), body, sizeof(body));
         }
@@ -1386,6 +1422,8 @@ static void apply_op(cluster_node_t *n, const cluster_log_entry_t *e)
         LOG_INFO("cluster: applied op %u at index %" PRIu64, e->op_type, e->index);
 }
 
+static void resolve_local_fwd_acks(cluster_node_t *n);
+
 static void apply_committed(cluster_node_t *n)
 {
     uint64_t commit = atomic_load(&n->log.commit_index);
@@ -1396,6 +1434,8 @@ static void apply_committed(cluster_node_t *n)
             apply_op(n, e);
         n->log.applied_index = idx;
     }
+    /* Our apply may be the last piece a forwarded proposal was waiting on. */
+    resolve_local_fwd_acks(n);
 }
 
 /* ---- log compaction (bound RAM) ----------------------------------------- *
@@ -2229,6 +2269,7 @@ static void cl_dispatch(cluster_node_t *n, cluster_peer_t *peer,
             break;
         }
         uint64_t last = atomic_load(&n->log.last_index);
+        atomic_store(&n->leader_commit_seen, leader_commit);
         uint64_t newc = leader_commit < last ? leader_commit : last;
         if (newc > atomic_load(&n->log.commit_index)) {
             atomic_store(&n->log.commit_index, newc);
@@ -2318,11 +2359,23 @@ static void cl_dispatch(cluster_node_t *n, cluster_peer_t *peer,
          * proposal, never a successful cl_send() alone (see fwd_pending). */
         if (h->length >= 8) {
             uint64_t acked = get_be64(payload);
+            /* The leader also tells us the log index behind that seq (16-byte
+             * form). We must not report these ops done until WE have applied
+             * that index: the client's next command (e.g. Queue.Bind right
+             * after Declare-Ok) runs against OUR local broker state. */
+            uint64_t acked_idx = (h->length >= 16) ? get_be64(payload + 8) : 0;
+            if (acked > n->fwd_acked_seq)   n->fwd_acked_seq   = acked;
+            if (acked_idx > n->fwd_acked_index) n->fwd_acked_index = acked_idx;
+            /* Release the retransmission buffer NOW: the entry is committed
+             * cluster-wide, so we will never have to resend it. Holding the
+             * payloads until our own (possibly lagging) apply pinned gigabytes
+             * on a follower that publishes faster than it replicates - measured
+             * 11 GB on a node whose queue was still empty. Client-visible
+             * completion is tracked separately, above, and costs nothing. */
             cl_proposal_t *p = n->fwd_pending_head, *prev = NULL;
             while (p) {
                 cl_proposal_t *next = p->next;
                 if (p->seq <= acked) {
-                    mark_proposal_status(n, p->seq, CL_PROPOSAL_COMMITTED);
                     if (prev) prev->next = next; else n->fwd_pending_head = next;
                     if (p == n->fwd_pending_tail) n->fwd_pending_tail = prev;
                     free(p);
@@ -2331,6 +2384,7 @@ static void cl_dispatch(cluster_node_t *n, cluster_peer_t *peer,
                 }
                 p = next;
             }
+            resolve_local_fwd_acks(n);
         }
         break;
 
@@ -3322,11 +3376,40 @@ cluster_health_t cluster_health(const cluster_node_t *n)
     return (cluster_health_t)atomic_load(&n->health);
 }
 
+/* How far this node's own apply may trail the leader's committed index before
+ * its producers are throttled, and where that clears (hysteresis). */
+/* Narrow band on purpose: a wide one (20k -> 5k) means every pause lasts until
+ * 15k entries have been replayed, which shows up as multi-hundred-ms stop/go
+ * swings. A tight band pauses briefly and often, so the producer settles near
+ * the rate this node can actually apply. */
+#define CL_APPLY_LAG_HIGH 20000u
+#define CL_APPLY_LAG_LOW  15000u
+
 int cluster_should_throttle(const cluster_node_t *n)
 {
-    /* Two sources: the leader's replication-backlog flag (broadcast in
-     * AppendEntries) and this node's own forward-inbox congestion. */
-    return n ? (atomic_load(&n->throttle) || atomic_load(&n->fwd_congested)) : 0;
+    if (!n)
+        return 0;
+    /* Three sources: the leader's replication-backlog flag (broadcast in
+     * AppendEntries), this node's own forward-inbox congestion, and - the one
+     * that matters when a CLIENT publishes through a follower - this node's own
+     * APPLY LAG. A follower used as the entry point does double duty (forward
+     * every publish to the leader AND replay the whole committed stream back),
+     * so it can accept far more than it can replay: measured 690k entries
+     * behind, with its local queue empty and its consumers receiving nothing
+     * while its publishers ran at 200k msg/s. Throttling on our own lag makes
+     * the node self-limit to a rate it can actually apply, which is what keeps
+     * consumers attached to a replica fed. */
+    uint64_t seen = atomic_load(&n->leader_commit_seen);
+    uint64_t applied = n->log.applied_index;
+    uint64_t lag = seen > applied ? seen - applied : 0;
+    int lag_throttle = atomic_load(&n->apply_lag_throttle);
+    if (!lag_throttle && lag > CL_APPLY_LAG_HIGH)
+        atomic_store((_Atomic int *)&n->apply_lag_throttle, (lag_throttle = 1));
+    else if (lag_throttle && lag < CL_APPLY_LAG_LOW)
+        atomic_store((_Atomic int *)&n->apply_lag_throttle, (lag_throttle = 0));
+
+    return atomic_load(&n->throttle) || atomic_load(&n->fwd_congested) ||
+           lag_throttle;
 }
 
 void cluster_get_status(const cluster_node_t *n, cluster_status_t *out)
