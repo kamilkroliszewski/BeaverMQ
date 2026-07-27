@@ -100,6 +100,8 @@ jobs:
         run: make
       - name: Integration suite (pika + management API)
         run: make integration
+      - name: Cluster queue-config replication (pika + 3 nodes)
+        run: make cluster-config-test
 
   fuzz:
     name: Fuzz frame parser (libFuzzer, 60s)

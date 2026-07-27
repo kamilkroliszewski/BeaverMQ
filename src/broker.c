@@ -378,6 +378,17 @@ beaver_queue_t *broker_get_queue(beaver_broker_t *b, const char *vhost,
     return q;
 }
 
+int broker_exchange_exists(beaver_broker_t *b, const char *vhost,
+                           const char *name)
+{
+    char key[512];
+    broker_vkey(key, vhost, name);
+    pthread_rwlock_rdlock(&b->lock);
+    int exists = hashmap_get(b->exchanges, key) != NULL;
+    pthread_rwlock_unlock(&b->lock);
+    return exists;
+}
+
 /* ---- stats / iteration --------------------------------------------------- */
 
 typedef struct {

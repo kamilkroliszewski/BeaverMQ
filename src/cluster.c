@@ -952,16 +952,21 @@ static void persist_load(cluster_node_t *n)
                  loaded, (uint64_t)atomic_load(&n->current_term));
 }
 
-static void persist_init(cluster_node_t *n, const char *dir, int self_id)
+/* Returns 0 on success OR when persistence is intentionally disabled (empty
+ * data_dir = in-memory cluster). Returns -1 when a data_dir WAS configured but
+ * could not be set up (mkdir/open/alloc failed): the caller MUST treat that as
+ * a fatal startup error rather than silently running without the durability the
+ * operator asked for (audit P13). */
+static int persist_init(cluster_node_t *n, const char *dir, int self_id)
 {
-    if (!dir || !dir[0]) return; /* persistence disabled */
+    if (!dir || !dir[0]) return 0; /* persistence intentionally disabled */
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
-        LOG_ERROR("cluster: cannot create data_dir '%s' (%s); persistence off",
+        LOG_ERROR("cluster: cannot create data_dir '%s' (%s)",
                   dir, strerror(errno));
-        return;
+        return -1;
     }
     cl_persist_t *ps = calloc(1, sizeof(*ps));
-    if (!ps) return;
+    if (!ps) return -1;
     ps->log_fd = ps->meta_fd = ps->snap_fd = -1;
     snprintf(ps->dir, sizeof ps->dir, "%s", dir);
     ps->self_id = self_id;
@@ -975,16 +980,18 @@ static void persist_init(cluster_node_t *n, const char *dir, int self_id)
     ps->meta_fd = open(path, O_RDWR | O_CREAT, 0600);
     snprintf(path, sizeof path, "%s/cluster-%d.snap", dir, self_id);
     ps->snap_fd = open(path, O_RDWR | O_CREAT, 0600);
-    if (ps->log_fd < 0 || ps->meta_fd < 0) {
+    if (ps->log_fd < 0 || ps->meta_fd < 0 || ps->snap_fd < 0) {
         LOG_ERROR("cluster: cannot open persistence files in '%s' (%s)",
                   dir, strerror(errno));
         if (ps->log_fd >= 0) close(ps->log_fd);
         if (ps->meta_fd >= 0) close(ps->meta_fd);
+        if (ps->snap_fd >= 0) close(ps->snap_fd);
         free(ps);
-        return;
+        return -1;
     }
     n->persist = ps;
     persist_load(n);
+    return 0;
 }
 
 static void persist_free(cluster_node_t *n)
@@ -1234,8 +1241,31 @@ static void apply_op(cluster_node_t *n, const cluster_log_entry_t *e)
     case CL_OP_DECLARE_QUEUE: {
         uint8_t flags = rd8(&p, end);
         if (rd_str(&p, end, vh, sizeof vh) == 0 &&
-            rd_str(&p, end, a, sizeof a) == 0)
-            broker_declare_queue(n->broker, vh, a, flags, NULL, NULL);
+            rd_str(&p, end, a, sizeof a) == 0) {
+            int created = 0;
+            broker_declare_queue(n->broker, vh, a, flags, NULL, &created);
+            /* Optional trailing per-queue config (overflow | max_length |
+             * max_bytes | dlx | dlx_rkey). Absent in pre-upgrade WALs, so guard
+             * on the remaining length. Apply only on create - the policy is
+             * fixed at declare time, same as the origin node. */
+            if (created && end - p >= 1 + 8 + 8) {
+                uint8_t overflow = rd8(&p, end);
+                uint64_t maxlen  = get_be64(p); p += 8;
+                uint64_t maxbytes = get_be64(p); p += 8;
+                if (rd_str(&p, end, b, sizeof b) == 0 &&
+                    rd_str(&p, end, c, sizeof c) == 0) {
+                    beaver_queue_t *q = broker_get_queue(n->broker, vh, a);
+                    if (q) {
+                        queue_set_limits(q, maxlen, maxbytes,
+                                         overflow == 1 ? QUEUE_OVERFLOW_DROP_HEAD
+                                                       : QUEUE_OVERFLOW_REJECT_PUBLISH);
+                        if (b[0])
+                            broker_set_queue_dead_letter(n->broker, q, b, c);
+                        queue_unref(q);
+                    }
+                }
+            }
+        }
         break;
     }
     case CL_OP_DECLARE_EXCH: {
@@ -1274,11 +1304,19 @@ static void apply_op(cluster_node_t *n, const cluster_log_entry_t *e)
         const uint8_t *body = p;
         if ((uint64_t)(end - p) < bl) break;
         beaver_message_t *m = message_new_full(ex, rk, body, bl, pl ? props : NULL, pl);
-        if (m) {
-            m->cluster_id = e->index;   /* cluster-wide identity = log index */
-            broker_route(n->broker, vh, m);
-            message_unref(m);
+        if (!m) {
+            /* Applying a COMMITTED entry must be deterministic and must never be
+             * skipped: dropping this message would lose data the cluster already
+             * committed (and compaction would later free its log entry, making
+             * the loss permanent). An allocation failure here is node-local and
+             * non-deterministic, so fail-stop this node rather than diverge -
+             * it steps down and stops committing until restarted (audit P3). */
+            storage_write_failed(n, "apply CL_OP_PUBLISH (message allocation)");
+            break;
         }
+        m->cluster_id = e->index;   /* cluster-wide identity = log index */
+        broker_route(n->broker, vh, m);
+        message_unref(m);
         break;
     }
     case CL_OP_ACK: {
@@ -3087,8 +3125,19 @@ cluster_node_t *cluster_node_new(uv_loop_t *loop, const cluster_config_t *cfg,
     pthread_mutex_init(&n->propose_lock, NULL);
 
     /* Open the on-disk log + replay it (no-op if data_dir is empty). This may
-     * override current_term/voted_for/last_index from persisted state. */
-    persist_init(n, cfg->data_dir, cfg->self_id);
+     * override current_term/voted_for/last_index from persisted state. A
+     * configured-but-unusable data_dir is fatal: refuse to start rather than run
+     * a "durable" cluster that silently keeps everything in RAM (audit P13).
+     * persist_init runs before the peer/uv handles are set up, so cleanup here
+     * is just the propose lock + the node allocation. */
+    if (persist_init(n, cfg->data_dir, cfg->self_id) != 0) {
+        LOG_ERROR("cluster: node %d: data_dir '%s' is configured but unusable; "
+                  "refusing to start (fix the path/permissions or unset data_dir "
+                  "for an in-memory cluster)", cfg->self_id, cfg->data_dir);
+        pthread_mutex_destroy(&n->propose_lock);
+        free(n);
+        return NULL;
+    }
 
     /* Build the peer table: every node id except our own. Lower id dials. */
     int k = 0;
@@ -3392,15 +3441,29 @@ cluster_proposal_status_t cluster_proposal_status(cluster_node_t *n, uint64_t se
 }
 
 uint64_t cluster_replicate_declare_queue(cluster_node_t *n, const char *vhost,
-                                         const char *name, uint8_t flags)
+                                         const char *name, uint8_t flags,
+                                         uint8_t overflow, uint64_t max_length,
+                                         uint64_t max_bytes, const char *dlx,
+                                         const char *dlx_rkey)
 {
-    if (strlen(vhost) > 250 || strlen(name) > 250)
+    if (!dlx) dlx = "";
+    if (!dlx_rkey) dlx_rkey = "";
+    if (strlen(vhost) > 250 || strlen(name) > 250 ||
+        strlen(dlx) > 250 || strlen(dlx_rkey) > 250)
         return 0;
-    uint8_t buf[1 + 2 * (2 + 251)];
+    /* flags | vhost | name | overflow | max_length | max_bytes | dlx | dlx_rkey.
+     * The trailing config is new; apply_op treats its absence (old logs) as the
+     * default policy, so this stays backward compatible with existing WALs. */
+    uint8_t buf[1 + 2 * (2 + 251) + 1 + 8 + 8 + 2 * (2 + 251)];
     uint8_t *p = buf;
     wr8(&p, flags);
     wr_str(&p, vhost);
     wr_str(&p, name);
+    wr8(&p, overflow);
+    put_be64(p, max_length); p += 8;
+    put_be64(p, max_bytes);  p += 8;
+    wr_str(&p, dlx);
+    wr_str(&p, dlx_rkey);
     return cluster_propose_tracked(n, CL_OP_DECLARE_QUEUE, buf, (size_t)(p - buf));
 }
 
@@ -3494,16 +3557,19 @@ uint64_t cluster_replicate_publish_tracked(cluster_node_t *n, const char *vhost,
     return seq;
 }
 
-int cluster_replicate_delete_queue(cluster_node_t *n, const char *vhost,
-                                   const char *queue)
+uint64_t cluster_replicate_delete_queue(cluster_node_t *n, const char *vhost,
+                                        const char *queue)
 {
     if (strlen(vhost) > 250 || strlen(queue) > 250)
-        return -1;
+        return 0;
     uint8_t buf[2 * (2 + 251)];
     uint8_t *p = buf;
     wr_str(&p, vhost);
     wr_str(&p, queue);
-    return cluster_propose(n, CL_OP_DELETE_QUEUE, buf, (size_t)(p - buf));
+    /* Tracked so Queue.Delete-Ok is sent only after the delete COMMITS - a
+     * client must never be told a durable queue is gone while a lost quorum /
+     * election leaves it alive on the other replicas. */
+    return cluster_propose_tracked(n, CL_OP_DELETE_QUEUE, buf, (size_t)(p - buf));
 }
 
 int cluster_replicate_consume(cluster_node_t *n, const char *vhost,

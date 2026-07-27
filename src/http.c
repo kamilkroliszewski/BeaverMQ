@@ -208,6 +208,18 @@ static int queue_to_json(beaver_queue_t *q, void *ctx)
                         json_integer((json_int_t)queue_total_dequeued(q)));
     json_object_set_new(o, "durable",
                         json_boolean(queue_flags(q) & BMQP_FLAG_DURABLE));
+    /* Per-queue policy (also lets a cluster test confirm it replicated). */
+    json_object_set_new(o, "max_length",
+                        json_integer((json_int_t)queue_max_length(q)));
+    json_object_set_new(o, "max_bytes",
+                        json_integer((json_int_t)queue_max_bytes(q)));
+    json_object_set_new(o, "overflow",
+                        json_string(queue_overflow(q) == QUEUE_OVERFLOW_DROP_HEAD
+                                    ? "drop-head" : "reject-publish"));
+    char dlx[256], dlrk[256];
+    queue_dead_letter_info(q, dlx, sizeof dlx, dlrk, sizeof dlrk);
+    json_object_set_new(o, "dead_letter_exchange", json_string(dlx));
+    json_object_set_new(o, "dead_letter_routing_key", json_string(dlrk));
     json_array_append_new(arr, o);
     return 0;
 }
