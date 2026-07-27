@@ -564,28 +564,6 @@ static void send_publish_confirm(beaver_proto_t *p, uint16_t channel,
     bmqp_buf_free(&a);
 }
 
-/* Return an unroutable `mandatory` message to the publisher: a Basic.Return
- * method frame (312 NO_ROUTE) followed by the message's content header + body,
- * exactly as a delivery is framed. */
-static void send_basic_return(beaver_proto_t *p, uint16_t channel,
-                              const char *exchange, const char *routing_key,
-                              const void *body, size_t body_len,
-                              const void *props, size_t props_len)
-{
-    bmqp_buf_t a;
-    bmqp_buf_init(&a);
-    bmqp_buf_put_u16(&a, 312);                 /* reply-code: NO_ROUTE */
-    bmqp_buf_put_shortstr(&a, "NO_ROUTE");     /* reply-text */
-    bmqp_buf_put_shortstr(&a, exchange);
-    bmqp_buf_put_shortstr(&a, routing_key);
-    send_method(p, channel, BMQP_CLASS_BASIC, BMQP_BASIC_RETURN, &a);
-    bmqp_buf_free(&a);
-
-    uint32_t fmax = p->conn->frame_max ? p->conn->frame_max : AMQP_DEFAULT_FRAME_MAX;
-    protocol_send_content(p->conn, channel, BMQP_CLASS_BASIC, body, body_len,
-                          props_len ? props : NULL, props_len, fmax);
-}
-
 static void pending_op_timer_cb(uv_timer_t *t)
 {
     pending_cluster_op_t *op = t->data;
