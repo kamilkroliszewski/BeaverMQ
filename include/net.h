@@ -124,7 +124,6 @@ struct beaver_server {
 
     uv_timer_t           throttle_timer; /* polls cluster congestion to resume reads */
     int                  throttle_started;
-    uint64_t             throttle_since_ms; /* when the current pause began (0 = none) */
 
     uv_async_t           shutdown_async; /* request shutdown from any thread */
     int                  shutdown_installed;
