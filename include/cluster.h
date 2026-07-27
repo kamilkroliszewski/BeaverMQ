@@ -336,6 +336,10 @@ typedef struct cluster_node {
     int              log_dirty;      /* unsynced appends pending a batch flush */
     _Atomic int      inbox_depth;    /* queued proposals (for backpressure) */
     _Atomic int      throttle;       /* 1 = leader congested -> pause producers */
+    /* Highest commit index the leader has told us about, and the derived
+     * "our apply is too far behind" throttle (hysteresis). */
+    _Atomic uint64_t leader_commit_seen;
+    _Atomic int      apply_lag_throttle;
 
     /* Cluster view: the leader broadcasts per-node replication progress + state
      * (CL_FRAME_STATUS); followers cache it so the status API/GUI is consistent
@@ -390,6 +394,14 @@ typedef struct cluster_node {
      * retransmitted CL_FRAME_FORWARD batches) and the FIFO of committed-index
      * -> (origin, seq) waiting for its CL_FRAME_FORWARD_ACK to be sent. */
     uint64_t             committed_fwd_seq[CLUSTER_MAX_NODES];
+    /* Log index behind committed_fwd_seq, sent with the ack so the origin can
+     * wait for its OWN apply before reporting the op done. */
+    uint64_t             committed_fwd_index[CLUSTER_MAX_NODES];
+    /* Origin side: highest seq/index the leader has acked for our forwarded
+     * proposals (resolved against our applied_index - see resolve_local_fwd_acks). */
+    uint64_t             fwd_acked_seq;
+    uint64_t             fwd_acked_index;
+    uint64_t             fwd_marked_seq;  /* highest seq already reported committed */
     struct cl_fwd_ack   *fwd_ack_pending_head;
     struct cl_fwd_ack   *fwd_ack_pending_tail;
 

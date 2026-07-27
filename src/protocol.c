@@ -1740,7 +1740,11 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
 
         if (p->conn->server->cluster && durable_q) {
             if (!broker_exchange_exists(p->conn->server->broker, p->vhost, ename)) {
-                proto_fatal(p, "Queue.Bind failed: exchange '%s' not found", ename);
+                char text[600];
+                snprintf(text, sizeof text,
+                         "NOT_FOUND - no exchange '%s' in vhost '%s'", ename, p->vhost);
+                send_channel_close(p, channel, 404, text,
+                                   BMQP_CLASS_QUEUE, BMQP_QUEUE_BIND);
                 return;
             }
             uint64_t seq = cluster_replicate_bind(p->conn->server->cluster,
@@ -1759,8 +1763,15 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         }
 
         if (broker_bind(p->conn->server->broker, p->vhost, qname, ename, key) != 0) {
-            proto_fatal(p, "Queue.Bind failed: queue '%s' or exchange '%s' "
-                        "not found", qname, ename);
+            /* AMQP: a missing queue/exchange is a CHANNEL exception (404), not a
+             * reason to tear down the whole connection - the client recovers the
+             * channel and carries on. */
+            char text[900];
+            snprintf(text, sizeof text,
+                     "NOT_FOUND - no queue '%s' or exchange '%s' in vhost '%s'",
+                     qname, ename, p->vhost);
+            send_channel_close(p, channel, 404, text,
+                               BMQP_CLASS_QUEUE, BMQP_QUEUE_BIND);
             return;
         }
         LOG_INFO("conn #%" PRIu64 " ch=%u: Queue.Bind q='%s' exchange='%s' "
