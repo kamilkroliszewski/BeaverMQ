@@ -81,12 +81,15 @@ echo "== inject write failure on WAL/meta/snap -> fail-stop =="
 run_case "write" failstop FAULT_WRITE_AFTER=0
 
 echo "== a configured-but-unwritable data_dir must be FATAL at startup =="
-uw="$(mktemp -d)"; chmod 000 "$uw"
+# Make the path unusable in a way that works even as root (CI containers run as
+# root, where chmod 000 is ignored): point data_dir UNDER a regular file, so
+# mkdir fails with ENOTDIR for every uid.
+uw="$(mktemp -d)"; : > "$uw/blocker"
 out=$(BEAVERMQ_CLUSTER=on BEAVERMQ_NODE_ID=0 BEAVERMQ_CLUSTER_NODES="127.0.0.1:16099" \
     BEAVERMQ_CLUSTER_SECRET=s BEAVERMQ_AMQP_PORT=25998 BEAVERMQ_HTTP_PORT=25999 \
-    BEAVERMQ_DATA_DIR="$uw/sub" BEAVERMQ_BIND=127.0.0.1 \
+    BEAVERMQ_DATA_DIR="$uw/blocker/sub" BEAVERMQ_BIND=127.0.0.1 \
     timeout 5 "$BIN" 2>&1)
-chmod 755 "$uw"; rm -rf "$uw"
+rm -rf "$uw"
 if echo "$out" | grep -q "refusing to start"; then
     echo "OK: [data_dir-unwritable] cluster refused to start"
 else
