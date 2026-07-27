@@ -124,6 +124,13 @@ static void test_queue_default_limits(void)
     CHECK_EQ(queue_enqueue(q, m2), 0);
     CHECK_EQ(queue_enqueue(q, m3), QUEUE_FULL); /* 3rd exceeds max_length=2 */
     CHECK_EQ(queue_depth(q), 2);
+    /* The refusal must be COUNTED: without publisher confirms this counter is
+     * the only signal that a full queue is discarding publishes (the depth just
+     * stops moving while producers keep sending). */
+    CHECK_EQ(queue_total_rejected(q), 1);
+    CHECK_EQ(queue_enqueue(q, m3), QUEUE_FULL);
+    CHECK_EQ(queue_total_rejected(q), 2);
+    CHECK_EQ(queue_total_dropped(q), 0); /* reject-publish never evicts */
     message_unref(m1); message_unref(m2); message_unref(m3);
     queue_unref(q);
 

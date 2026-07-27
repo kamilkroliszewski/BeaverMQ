@@ -44,6 +44,12 @@ void queue_set_default_limits(uint64_t max_length, uint64_t max_bytes)
     g_queue_max_bytes  = max_bytes;
 }
 
+void queue_get_default_limits(uint64_t *max_length, uint64_t *max_bytes)
+{
+    if (max_length) *max_length = g_queue_max_length;
+    if (max_bytes)  *max_bytes  = g_queue_max_bytes;
+}
+
 struct beaver_queue {
     char              *name;
     char              *vhost;   /* owning virtual host ("" until set) */
@@ -79,6 +85,7 @@ struct beaver_queue {
     _Atomic uint64_t   total_enqueued;
     _Atomic uint64_t   total_dequeued;
     _Atomic uint64_t   total_dropped;  /* evicted by drop-head overflow (metric) */
+    _Atomic uint64_t   total_rejected; /* refused by reject-publish overflow (metric) */
     uint64_t           total_bytes;   /* sum of body_len currently queued (invariant; under lock) */
 
     /* Cluster consume-tracking (guarded by `lock`). The replicated consume
@@ -223,6 +230,11 @@ uint64_t queue_total_dropped(beaver_queue_t *q)
     return atomic_load_explicit(&q->total_dropped, memory_order_relaxed);
 }
 
+uint64_t queue_total_rejected(beaver_queue_t *q)
+{
+    return atomic_load_explicit(&q->total_rejected, memory_order_relaxed);
+}
+
 void queue_set_dead_letter(beaver_queue_t *q, const char *exchange,
                            const char *routing_key,
                            queue_dead_letter_fn fn, void *ctx)
@@ -339,8 +351,13 @@ int queue_enqueue(beaver_queue_t *q, beaver_message_t *msg)
     pthread_mutex_lock(&q->lock);
     if (queue_would_overflow(q, msg->body_len)) {
         if (q->overflow != QUEUE_OVERFLOW_DROP_HEAD) {
+            /* reject-publish (default). Count it: without publisher confirms the
+             * client gets no signal at all, so this counter (exposed as
+             * "rejected" on /api/queues and in the dashboard) is the only way to
+             * see that a full queue is discarding publishes. */
+            atomic_fetch_add_explicit(&q->total_rejected, 1, memory_order_relaxed);
             pthread_mutex_unlock(&q->lock);
-            return QUEUE_FULL; /* reject-publish (default) */
+            return QUEUE_FULL;
         }
         int has_dl = q->dl_fn != NULL;
         /* drop-head: evict the oldest message(s) until the newcomer fits. A lone

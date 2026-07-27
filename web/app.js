@@ -223,7 +223,7 @@ const app = createApp({
                 <tr v-for="q in queuesData.items" :key="q.name" class="click" @click="openDetail('queue', q.name)">
                   <td class="name mono"><app-icon class="chev" name="chevron-right" :size="14" style="vertical-align:-2px"></app-icon>{{ q.name }}</td>
                   <td class="mono muted">{{ q.vhost }}</td>
-                  <td class="tr"><span class="badge" :class="depthClass(q.messages)">{{ fmtInt(q.messages) }}</span></td>
+                  <td class="tr"><span class="badge" :class="depthClass(q.messages)">{{ fmtInt(q.messages) }}</span><span v-if="q.rejected" class="badge" style="margin-left:6px;background:var(--danger);color:#fff" :title="fmtInt(q.rejected) + ' publish(es) discarded - the queue is at its limit'">FULL</span></td>
                   <td class="tr num">{{ q.consumers }}</td>
                   <td class="tr num">{{ compact(q.inRate) }}</td>
                   <td class="tr num">{{ compact(q.outRate) }}</td>
@@ -517,6 +517,11 @@ const app = createApp({
             <div class="item"><div class="k">Outgoing</div><div class="v sm num">{{ rateStr(detailData.outRate) }}</div></div>
             <div class="item"><div class="k">Total enqueued</div><div class="v sm num">{{ fmtInt(detailData.enqueued) }}</div></div>
             <div class="item"><div class="k">Total dequeued</div><div class="v sm num">{{ fmtInt(detailData.dequeued) }}</div></div>
+            <div class="item"><div class="k">Rejected (queue full)</div><div class="v sm num" :style="detailData.rejected ? 'color:var(--danger)' : ''">{{ fmtInt(detailData.rejected) }}</div></div>
+            <div class="item"><div class="k">Dropped (drop-head)</div><div class="v sm num" :style="detailData.dropped ? 'color:var(--danger)' : ''">{{ fmtInt(detailData.dropped) }}</div></div>
+            <div class="item"><div class="k">Limit</div><div class="v sm num">{{ limitStr(detailData) }}</div></div>
+            <div class="item"><div class="k">Overflow</div><div class="v sm">{{ detailData.overflow || '—' }}</div></div>
+            <div class="item full" v-if="detailData.rejected"><div class="k">Note</div><div class="v sm" style="color:var(--danger)">This queue is at its limit and is discarding publishes. Without publisher confirms the sender is not told.</div></div>
             <div class="item full"><div class="k">Durability</div><div class="v sm">{{ detailData.durable ? 'Durable' : 'Transient' }}</div></div>
           </div>
           <div class="section-t">Depth (last {{ (detailData.depths || []).length }} samples)</div>
@@ -727,6 +732,15 @@ const app = createApp({
     stateIcon(s) { return s === 'healthy' ? 'check' : (s === 'no_quorum' ? 'x' : 'refresh'); },
 
     depthClass(m) { return m <= 0 ? 'zero' : (m > 100000 ? 'hot' : 'warm'); },
+    /* Effective per-queue limit, as "<n> msgs / <n> bytes" ("—" when unset:
+     * 0 means the queue falls back to the broker-wide default). */
+    limitStr(q) {
+      if (!q) return '—';
+      const parts = [];
+      if (q.max_length) parts.push(this.fmtInt(q.max_length) + ' msgs');
+      if (q.max_bytes)  parts.push(this.fmtInt(q.max_bytes) + ' bytes');
+      return parts.length ? parts.join(' / ') : 'broker default';
+    },
     exColors(t) {
       const m = { direct: ['--blue', '--blue-weak'], fanout: ['--violet', '--violet-weak'],
                   topic: ['--teal', '--teal-weak'], headers: ['--amber', '--amber-weak'] };

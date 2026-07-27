@@ -571,7 +571,10 @@ nothing is created, and a missing object answers `404`.
 reaches `x-max-length` / `x-max-length-bytes` (or the `queue_max_*` defaults) it
 applies its overflow policy — `reject-publish` (the publish is refused, and
 `Basic.Nack`'ed under publisher confirms) or `drop-head` — and the broker keeps
-reading the connection. It deliberately does **not** pause the socket: that also
+reading the connection. Discarded publishes are counted and
+reported per queue as `rejected` (reject-publish) and `dropped` (drop-head) on
+`GET /api/queues` and in the dashboard, so a capped queue whose depth has
+stopped moving is visibly full rather than silently lossy. It deliberately does **not** pause the socket: that also
 stops the consumer `Basic.Ack`s travelling on the same connection, which used to
 wedge a publish+consume connection permanently and made throughput swing in
 multi‑second stop/go cycles. Only the cluster replication backlog throttles a
