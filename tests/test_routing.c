@@ -168,6 +168,163 @@ static void test_queue_drain_frees_bytes(void)
     queue_set_default_limits(0, 0);
 }
 
+/* Per-queue overflow = drop-head: when full, the OLDEST message is evicted to
+ * make room for the newcomer, so the newest data always survives and depth stays
+ * capped. Uses a per-queue max_length override (no global default). */
+static void test_queue_overflow_drop_head(void)
+{
+    TEST_SECTION("overflow drop-head evicts the oldest to admit the newest, depth stays capped");
+    queue_set_default_limits(0, 0); /* rely on the per-queue override only */
+    beaver_queue_t *q = queue_new("qdrop", 0);
+    queue_set_limits(q, 2 /* max_length */, 0, QUEUE_OVERFLOW_DROP_HEAD);
+
+    beaver_message_t *m1 = message_new("", "", "1", 1);
+    beaver_message_t *m2 = message_new("", "", "2", 1);
+    beaver_message_t *m3 = message_new("", "", "3", 1);
+    CHECK_EQ(queue_enqueue(q, m1), 0);
+    CHECK_EQ(queue_enqueue(q, m2), 0);
+    /* Third enqueue exceeds max_length=2: drop-head evicts m1 rather than
+     * rejecting m3, so it still returns success and depth remains 2. */
+    CHECK_EQ(queue_enqueue(q, m3), 0);
+    CHECK_EQ(queue_depth(q), 2);
+    CHECK_EQ(queue_total_dropped(q), 1);
+
+    /* The survivors, oldest-first, must be m2 then m3 (m1 was the one dropped). */
+    beaver_message_t *a = queue_dequeue(q);
+    beaver_message_t *b = queue_dequeue(q);
+    CHECK(a && a->body_len == 1 && ((const char *)a->body)[0] == '2');
+    CHECK(b && b->body_len == 1 && ((const char *)b->body)[0] == '3');
+    message_unref(a); message_unref(b);
+
+    message_unref(m1); message_unref(m2); message_unref(m3);
+    queue_unref(q);
+}
+
+/* Per-queue overflow = reject-publish (the default) with a per-queue override:
+ * a full queue rejects the newcomer with QUEUE_FULL and keeps the oldest. */
+static void test_queue_overflow_reject_publish(void)
+{
+    TEST_SECTION("overflow reject-publish keeps the oldest and rejects the newcomer");
+    queue_set_default_limits(0, 0);
+    beaver_queue_t *q = queue_new("qreject", 0);
+    queue_set_limits(q, 2, 0, QUEUE_OVERFLOW_REJECT_PUBLISH);
+
+    beaver_message_t *m1 = message_new("", "", "1", 1);
+    beaver_message_t *m2 = message_new("", "", "2", 1);
+    beaver_message_t *m3 = message_new("", "", "3", 1);
+    CHECK_EQ(queue_enqueue(q, m1), 0);
+    CHECK_EQ(queue_enqueue(q, m2), 0);
+    CHECK_EQ(queue_enqueue(q, m3), QUEUE_FULL);
+    CHECK_EQ(queue_depth(q), 2);
+    CHECK_EQ(queue_total_dropped(q), 0); /* nothing evicted under reject-publish */
+
+    beaver_message_t *a = queue_dequeue(q); /* oldest survives: m1 */
+    CHECK(a && a->body_len == 1 && ((const char *)a->body)[0] == '1');
+    message_unref(a);
+
+    message_unref(m1); message_unref(m2); message_unref(m3);
+    queue_unref(q);
+}
+
+/* drop-head must admit a lone message larger than max_bytes (never drop the only
+ * message), matching RabbitMQ - the eviction loop stops at an empty queue. */
+static void test_queue_overflow_drop_head_lone_big(void)
+{
+    TEST_SECTION("overflow drop-head still admits a lone over-size message");
+    queue_set_default_limits(0, 0);
+    beaver_queue_t *q = queue_new("qbig", 0);
+    queue_set_limits(q, 0, 4 /* max_bytes */, QUEUE_OVERFLOW_DROP_HEAD);
+
+    beaver_message_t *big = message_new("", "", "abcdefgh", 8); /* > 4-byte cap */
+    CHECK_EQ(queue_enqueue(q, big), 0);   /* admitted: it is the only message */
+    CHECK_EQ(queue_depth(q), 1);
+    CHECK_EQ(queue_total_dropped(q), 0);
+
+    message_unref(big);
+    queue_unref(q);
+}
+
+/* drop-head evictions are handed to the queue's dead-letter callback (the broker
+ * installs the real re-router; here a stub captures them) rather than silently
+ * dropped, and the callback runs without the queue lock held. */
+static beaver_message_t *g_dl_captured[16];
+static size_t            g_dl_n;
+static void capture_dead_letter(void *ctx, beaver_queue_t *src,
+                                beaver_message_t *msg)
+{
+    (void)ctx; (void)src;
+    if (g_dl_n < 16)
+        g_dl_captured[g_dl_n++] = message_ref(msg);
+}
+
+static void test_queue_dead_letter_drop_head(void)
+{
+    TEST_SECTION("drop-head evictions are handed to the dead-letter callback");
+    queue_set_default_limits(0, 0);
+    g_dl_n = 0;
+    beaver_queue_t *q = queue_new("qdl", 0);
+    queue_set_limits(q, 2, 0, QUEUE_OVERFLOW_DROP_HEAD);
+    queue_set_dead_letter(q, "dlx", "k", capture_dead_letter, NULL);
+    CHECK(queue_has_dead_letter(q));
+
+    beaver_message_t *m1 = message_new("", "", "1", 1);
+    beaver_message_t *m2 = message_new("", "", "2", 1);
+    beaver_message_t *m3 = message_new("", "", "3", 1);
+    CHECK_EQ(queue_enqueue(q, m1), 0);
+    CHECK_EQ(queue_enqueue(q, m2), 0);
+    CHECK_EQ(queue_enqueue(q, m3), 0); /* evicts m1 (the head) */
+    CHECK_EQ(queue_depth(q), 2);
+    CHECK_EQ(queue_total_dropped(q), 1);
+    /* The evicted head (m1) was dead-lettered exactly once. */
+    CHECK_EQ(g_dl_n, 1);
+    CHECK(g_dl_n == 1 && ((const char *)g_dl_captured[0]->body)[0] == '1');
+
+    for (size_t i = 0; i < g_dl_n; i++)
+        message_unref(g_dl_captured[i]);
+    message_unref(m1); message_unref(m2); message_unref(m3);
+    queue_unref(q);
+}
+
+/* Flow alarm: a queue trips the broker-wide producer flow alarm at its
+ * high-water mark (90% of the limit) and only clears it after draining back to
+ * the low-water mark (50%) - hysteresis, so producers are not flapped. */
+static void test_queue_flow_alarm(void)
+{
+    TEST_SECTION("flow alarm sets at high-water, clears after draining below low-water (hysteresis)");
+    queue_set_default_limits(0, 0);
+    CHECK(!queue_flow_alarm_active()); /* nothing congested to start */
+
+    beaver_queue_t *q = queue_new("qflow", 0);
+    queue_set_limits(q, 10, 0, QUEUE_OVERFLOW_REJECT_PUBLISH); /* high=9, low=5 */
+
+    for (int i = 0; i < 8; i++) {         /* depth 8: below high-water */
+        beaver_message_t *m = message_new("", "", "x", 1);
+        CHECK_EQ(queue_enqueue(q, m), 0);
+        message_unref(m);
+    }
+    CHECK(!queue_flow_alarm_active());
+
+    beaver_message_t *m = message_new("", "", "x", 1);
+    queue_enqueue(q, m); message_unref(m);   /* depth 9: trips the alarm */
+    CHECK(queue_flow_alarm_active());
+
+    for (int i = 0; i < 3; i++) {            /* drain to depth 6: still > low */
+        beaver_message_t *d = queue_dequeue(q);
+        message_unref(d);
+    }
+    CHECK(queue_flow_alarm_active());
+
+    beaver_message_t *d = queue_dequeue(q);  /* depth 5 == low-water: clears */
+    message_unref(d);
+    CHECK(!queue_flow_alarm_active());
+
+    while ((d = queue_dequeue(q)) != NULL)
+        message_unref(d);
+    queue_unref(q);
+    CHECK(!queue_flow_alarm_active());
+    queue_set_default_limits(0, 0);
+}
+
 /* Regression: an internal requeue (nack/reject/disconnect) must never be
  * dropped just because the queue hit its publisher-facing limit - otherwise a
  * full queue silently loses in-flight messages on requeue (audit 2.2). */
@@ -417,6 +574,11 @@ int main(void)
     test_queue_purge();
     test_queue_default_limits();
     test_queue_drain_frees_bytes();
+    test_queue_overflow_drop_head();
+    test_queue_overflow_reject_publish();
+    test_queue_overflow_drop_head_lone_big();
+    test_queue_dead_letter_drop_head();
+    test_queue_flow_alarm();
     test_queue_requeue_bypasses_limits();
     test_exchange_type_name_roundtrip();
     test_exchange_direct_routing();

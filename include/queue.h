@@ -51,6 +51,56 @@ void        queue_set_vhost(beaver_queue_t *q, const char *vhost);
  * respects max_message_size. Set once at startup. */
 void queue_set_default_limits(uint64_t max_length, uint64_t max_bytes);
 
+/* Broker-wide producer flow control. Returns non-zero while at least one queue
+ * is congested (has crossed its high-water mark and not yet drained below the
+ * low-water mark). Publishers pause their socket reads (TCP backpressure) while
+ * this holds, so they cannot outrun the consumers into an out-of-memory queue. */
+int queue_flow_alarm_active(void);
+
+/* What a queue does when a publish would exceed its length/byte limit. */
+typedef enum {
+    QUEUE_OVERFLOW_REJECT_PUBLISH = 0, /* default: reject the new message (QUEUE_FULL) */
+    QUEUE_OVERFLOW_DROP_HEAD      = 1, /* evict oldest message(s) to make room */
+} queue_overflow_t;
+
+/* Per-queue limit/overflow overrides (from the AMQP Queue.Declare arguments:
+ * x-max-length, x-max-length-bytes, x-overflow). A 0 length/bytes value means
+ * "fall back to the global default"; overflow selects the full-queue behavior.
+ * Typically set once, right after the queue is created. */
+void queue_set_limits(beaver_queue_t *q, uint64_t max_length, uint64_t max_bytes,
+                      queue_overflow_t overflow);
+
+/* Messages evicted by the drop-head overflow policy (management metric). */
+uint64_t queue_total_dropped(beaver_queue_t *q);
+
+/* ---- dead-lettering ------------------------------------------------------ *
+ * A queue may have a dead-letter target: when a message leaves the queue as a
+ * "dead letter" (rejected/nacked without requeue, or evicted by drop-head), it
+ * is re-routed to another exchange instead of being discarded. Because the queue
+ * layer does not know about the broker, the actual re-route is a callback the
+ * broker installs; the queue just stores the target and invokes the callback. */
+typedef void (*queue_dead_letter_fn)(void *ctx, beaver_queue_t *src,
+                                     beaver_message_t *msg);
+
+/* Configure (or clear, with exchange == NULL) the dead-letter target and the
+ * broker callback that performs the re-route. routing_key may be NULL/"" to
+ * reuse each message's original routing key. Set once at declare time. */
+void queue_set_dead_letter(beaver_queue_t *q, const char *exchange,
+                           const char *routing_key,
+                           queue_dead_letter_fn fn, void *ctx);
+
+/* 1 if the queue has a dead-letter target configured. */
+int queue_has_dead_letter(beaver_queue_t *q);
+
+/* Dead-letter target accessors (valid for the queue's lifetime; may be ""). */
+const char *queue_dl_exchange(beaver_queue_t *q);
+const char *queue_dl_routing_key(beaver_queue_t *q);
+
+/* Re-route `msg` to this queue's dead-letter target via the installed callback
+ * (no-op if none). Must be called WITHOUT holding the queue lock. Does not take
+ * ownership of `msg` (the caller keeps its reference). */
+void queue_dead_letter(beaver_queue_t *q, beaver_message_t *msg);
+
 /* Returned by queue_enqueue() when a configured limit (see
  * queue_set_default_limits) would be exceeded - distinct from -1 (OOM) so
  * callers can tell "queue is full" apart from "allocation failed". */

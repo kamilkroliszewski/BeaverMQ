@@ -32,6 +32,11 @@ typedef struct beaver_message {
      * unchanged in Basic.Deliver. NULL means "no properties". */
     uint8_t     *props;
     size_t       props_len;
+    /* Dead-letter hop count: how many times this message has been dead-lettered.
+     * Each dead-letter creates a fresh copy with dl_hops incremented; routing
+     * stops once it exceeds a small cap, breaking dead-letter cycles. Set only
+     * at creation time (before the message is shared), so no atomicity needed. */
+    uint8_t      dl_hops;
     _Atomic int  refcount;     /* use message_ref/message_unref only */
 } beaver_message_t;
 

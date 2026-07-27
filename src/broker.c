@@ -307,6 +307,51 @@ int broker_route(beaver_broker_t *b, const char *vhost, beaver_message_t *msg)
     return routed;
 }
 
+/* Cap on dead-letter re-routing hops: breaks cycles (a DLX topology that would
+ * route a message back to a queue it already left) without tracking full paths. */
+#define BROKER_DL_MAX_HOPS 8
+
+/* queue_dead_letter_fn: re-route `msg` to `src`'s configured dead-letter
+ * exchange. Runs off any queue lock (see queue_dead_letter). A fresh message is
+ * built (dead-lettering is a re-publish) with the hop count advanced, so cycles
+ * terminate. Does not consume the caller's reference to `msg`. */
+static void broker_dead_letter_cb(void *ctx, beaver_queue_t *src,
+                                  beaver_message_t *msg)
+{
+    beaver_broker_t *b = ctx;
+    if (msg->dl_hops >= BROKER_DL_MAX_HOPS) {
+        LOG_WARN("dead-letter: dropping message after %u hops (cycle guard) "
+                 "from queue '%s'", msg->dl_hops, queue_name(src));
+        return;
+    }
+    const char *dlx = queue_dl_exchange(src);
+    if (!dlx[0])
+        return; /* no target (shouldn't happen: callback only set with one) */
+    const char *rkey = queue_dl_routing_key(src);
+    if (!rkey[0])
+        rkey = msg->routing_key ? msg->routing_key : ""; /* reuse original key */
+
+    beaver_message_t *dm = message_new_full(dlx, rkey, msg->body, msg->body_len,
+                                            msg->props, msg->props_len);
+    if (!dm) {
+        LOG_ERROR("dead-letter: OOM copying message from queue '%s'; dropped",
+                  queue_name(src));
+        return;
+    }
+    dm->dl_hops = (uint8_t)(msg->dl_hops + 1);
+    int routed = broker_route(b, queue_vhost(src), dm);
+    message_unref(dm);
+    if (routed <= 0)
+        LOG_DEBUG("dead-letter from '%s' to exchange '%s' key '%s' routed nowhere",
+                  queue_name(src), dlx, rkey);
+}
+
+void broker_set_queue_dead_letter(beaver_broker_t *b, beaver_queue_t *q,
+                                  const char *dlx, const char *dl_rkey)
+{
+    queue_set_dead_letter(q, dlx, dl_rkey, broker_dead_letter_cb, b);
+}
+
 int broker_publish(beaver_broker_t *b, const char *vhost, const char *exchange,
                    const char *routing_key, const void *body, size_t body_len)
 {

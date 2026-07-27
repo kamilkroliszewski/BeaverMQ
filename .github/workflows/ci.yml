@@ -10,6 +10,9 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   # Base packages every job needs: git + certs so actions/checkout works in the
   # container; the build toolchain and library headers; and curl + procps

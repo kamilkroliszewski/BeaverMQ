@@ -97,7 +97,7 @@ struct beaver_proto {
     /* ---- in-progress content assembly (Basic.Publish) ---- */
     int            pub_active;        /* a publish awaits its content frames */
     int            pub_have_header;   /* content header received */
-    int            pub_mandatory;     /* Basic.Publish mandatory flag */
+    int            pub_mandatory;     /* mandatory bit: Basic.Return if unroutable */
     uint16_t       pub_channel;
     char           pub_exchange[256];
     char           pub_routing_key[256];
@@ -188,6 +188,99 @@ static int name_ok(const char *s)
         if ((unsigned char)*s < 0x20 || (unsigned char)*s == 0x7f)
             return 0;
     return 1;
+}
+
+/* ---- Queue.Declare argument parsing (x-overflow / x-max-length[-bytes]) --- */
+
+typedef struct {
+    int      has_overflow;
+    char     overflow[32];
+    int      has_max_length;
+    uint64_t max_length;
+    int      has_max_bytes;
+    uint64_t max_bytes;
+    int      has_dlx;
+    char     dlx[256];
+    char     dlx_rkey[256];
+} queue_args_t;
+
+/* Consume one AMQP field-table value of the given type, yielding its integer
+ * value in *ival for numeric types (0 otherwise). Returns 1 on success, 0 if
+ * the type is unknown - after which the reader can no longer be trusted (its
+ * width is unknown), so the caller must stop walking the table. */
+static int read_field_value(bmqp_reader_t *r, uint8_t type, uint64_t *ival)
+{
+    size_t n;
+    *ival = 0;
+    switch (type) {
+    case 't': case 'b': case 'B': *ival = bmqp_read_u8(r);  return !r->error;
+    case 's': case 'u': case 'U': *ival = bmqp_read_u16(r); return !r->error;
+    case 'I': case 'i': case 'f': *ival = bmqp_read_u32(r); return !r->error;
+    case 'l': case 'L': case 'T':
+    case 'd':                     *ival = bmqp_read_u64(r); return !r->error;
+    case 'D': bmqp_read_u8(r); bmqp_read_u32(r); return !r->error; /* decimal */
+    case 'V': return !r->error;                                    /* void */
+    case 'S': case 'x': case 'A': case 'F':                        /* len-prefixed */
+        bmqp_read_longstr(r, &n); return !r->error;
+    default:
+        r->error = 1; return 0;   /* unknown type: cannot know its width */
+    }
+}
+
+/* Walk the Queue.Declare arguments field table, pulling out the queue-policy
+ * keys we honor. Unknown fields are skipped by type; a value type we don't
+ * recognize stops the walk (rather than risk desyncing). Best-effort: anything
+ * malformed just leaves the corresponding has_* flag unset. */
+static void parse_queue_args(const uint8_t *tbl, size_t len, queue_args_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!tbl || len == 0)
+        return;
+    bmqp_reader_t r;
+    bmqp_reader_init(&r, tbl, len);
+    while (!r.error && bmqp_reader_remaining(&r) > 0) {
+        size_t nlen;
+        const char *name = bmqp_read_shortstr(&r, &nlen);
+        uint8_t type = bmqp_read_u8(&r);
+        if (r.error || !name)
+            break;
+        /* String-valued keys we care about: capture in place before consuming. */
+        if (type == 'S') {
+            if (nlen == 10 && memcmp(name, "x-overflow", 10) == 0) {
+                size_t vlen;
+                const char *v = bmqp_read_longstr(&r, &vlen);
+                if (r.error) break;
+                out->has_overflow = 1;
+                copy_str(out->overflow, sizeof out->overflow, v, vlen);
+                continue;
+            }
+            if (nlen == 22 && memcmp(name, "x-dead-letter-exchange", 22) == 0) {
+                size_t vlen;
+                const char *v = bmqp_read_longstr(&r, &vlen);
+                if (r.error) break;
+                out->has_dlx = 1;
+                copy_str(out->dlx, sizeof out->dlx, v, vlen);
+                continue;
+            }
+            if (nlen == 25 && memcmp(name, "x-dead-letter-routing-key", 25) == 0) {
+                size_t vlen;
+                const char *v = bmqp_read_longstr(&r, &vlen);
+                if (r.error) break;
+                copy_str(out->dlx_rkey, sizeof out->dlx_rkey, v, vlen);
+                continue;
+            }
+        }
+        uint64_t ival;
+        if (!read_field_value(&r, type, &ival))
+            break;
+        if (nlen == 12 && memcmp(name, "x-max-length", 12) == 0) {
+            out->has_max_length = 1;
+            out->max_length = ival;
+        } else if (nlen == 18 && memcmp(name, "x-max-length-bytes", 18) == 0) {
+            out->has_max_bytes = 1;
+            out->max_bytes = ival;
+        }
+    }
 }
 
 /* ---- input buffer management --------------------------------------------- */
@@ -314,7 +407,7 @@ static int chan_get_unacked_add(proto_chan_t *pc, uint64_t tag,
  * if delivery_tag == 0, matching dispatch.c's settle_unacked semantics).
  * Returns the number settled. */
 static size_t chan_get_unacked_settle(proto_chan_t *pc, uint64_t delivery_tag,
-                                      int multiple, int requeue)
+                                      int multiple, int requeue, int rejected)
 {
     size_t settled = 0;
     for (size_t i = 0; i < pc->n_get_unacked; ) {
@@ -332,8 +425,13 @@ static size_t chan_get_unacked_settle(proto_chan_t *pc, uint64_t delivery_tag,
             if (queue_requeue_internal(g.queue, g.msg) != 0)
                 LOG_ERROR("OOM requeuing rejected Basic.Get message "
                           "(queue=%s): message dropped", queue_name(g.queue));
-        } else
+        } else {
+            /* Reject/nack without requeue dead-letters (if a DLX is set); a
+             * positive ack (rejected == 0) is just consumed-and-gone. */
+            if (rejected)
+                queue_dead_letter(g.queue, g.msg);
             queue_consume_on_ack(g.queue, g.msg->cluster_id);
+        }
         message_unref(g.msg);
         queue_unref(g.queue);
         pc->get_unacked[i] = pc->get_unacked[--pc->n_get_unacked];
@@ -1328,7 +1426,7 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         size_t qn, tbl;
         const char *q = bmqp_read_shortstr(r, &qn);
         uint8_t bits  = bmqp_read_u8(r);        /* passive,durable,exclusive,auto-del,no-wait */
-        bmqp_read_longstr(r, &tbl);             /* arguments (field table) */
+        const char *args = bmqp_read_longstr(r, &tbl); /* arguments (field table) */
         if (r->error) {
             proto_fatal(p, "malformed Queue.Declare");
             return;
@@ -1369,6 +1467,58 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         LOG_INFO("conn #%" PRIu64 " ch=%u: Queue.Declare '%s' (%s, depth=%u)",
                  p->conn->id, channel, qname,
                  created ? "created" : "exists", depth);
+
+        /* Apply per-queue overflow/limit policy from the declare arguments
+         * (x-overflow / x-max-length / x-max-length-bytes). Only on create: an
+         * existing queue keeps the policy it was declared with, matching the
+         * flag-mismatch rule above. */
+        if (created) {
+            queue_args_t qa;
+            parse_queue_args((const uint8_t *)args, tbl, &qa);
+            if (qa.has_overflow || qa.has_max_length || qa.has_max_bytes ||
+                qa.has_dlx) {
+                beaver_queue_t *lq = broker_get_queue(p->conn->server->broker,
+                                                      p->vhost, qname);
+                if (lq) {
+                    queue_set_limits(lq,
+                                     qa.has_max_length ? qa.max_length : 0,
+                                     qa.has_max_bytes  ? qa.max_bytes  : 0,
+                                     (qa.has_overflow &&
+                                      strcmp(qa.overflow, "drop-head") == 0)
+                                         ? QUEUE_OVERFLOW_DROP_HEAD
+                                         : QUEUE_OVERFLOW_REJECT_PUBLISH);
+                    if (qa.has_overflow &&
+                        strcmp(qa.overflow, "drop-head") != 0 &&
+                        strcmp(qa.overflow, "reject-publish") != 0)
+                        LOG_WARN("conn #%" PRIu64 ": unsupported x-overflow '%s' "
+                                 "on queue '%s'; using reject-publish",
+                                 p->conn->id, qa.overflow, qname);
+                    if (qa.has_dlx) {
+                        /* Illegal exchange name in a DLX arg would be silently
+                         * unroutable; reject it up front. */
+                        if (!name_ok(qa.dlx)) {
+                            queue_unref(lq);
+                            send_channel_close(p, channel, 406,
+                                "PRECONDITION_FAILED - illegal x-dead-letter-exchange",
+                                BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE);
+                            return;
+                        }
+                        broker_set_queue_dead_letter(p->conn->server->broker, lq,
+                                                     qa.dlx, qa.dlx_rkey);
+                    }
+                    LOG_INFO("conn #%" PRIu64 ": queue '%s' limits "
+                             "max_length=%" PRIu64 " max_bytes=%" PRIu64
+                             " overflow=%s dlx='%s'", p->conn->id, qname,
+                             qa.has_max_length ? qa.max_length : 0,
+                             qa.has_max_bytes ? qa.max_bytes : 0,
+                             (qa.has_overflow &&
+                              strcmp(qa.overflow, "drop-head") == 0)
+                                 ? "drop-head" : "reject-publish",
+                             qa.has_dlx ? qa.dlx : "");
+                    queue_unref(lq);
+                }
+            }
+        }
 
         /* Exclusive queues: the first declarer owns the queue; a declare from
          * any OTHER connection is refused (AMQP RESOURCE_LOCKED). The owner is
@@ -1652,7 +1802,7 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
         publish_reset(p);
         p->pub_active    = 1;
         p->pub_mandatory = (pubbits & 0x01) != 0;
-        p->pub_channel = channel;
+        p->pub_channel   = channel;
         copy_str(p->pub_exchange, sizeof(p->pub_exchange), e, en);
         copy_str(p->pub_routing_key, sizeof(p->pub_routing_key), k, kn);
         if (!name_ok(p->pub_exchange)) {
@@ -1820,7 +1970,7 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
          * both; for a single tag, only try the dispatcher if it wasn't a
          * tracked Basic.Get delivery (avoids a spurious "unknown tag" log). */
         proto_chan_t *pc = channel_find(p, channel);
-        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, multiple, 0) : 0;
+        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, multiple, 0, 0) : 0;
         if (multiple || got == 0)
             dispatcher_ack(p->conn->server->dispatcher, p->conn, channel,
                           delivery_tag, multiple);
@@ -1837,7 +1987,8 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
             return;
         }
         proto_chan_t *pc = channel_find(p, channel);
-        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, 0, requeue) : 0;
+        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, 0, requeue,
+                                                  !requeue) : 0;
         if (got == 0)
             dispatcher_nack(p->conn->server->dispatcher, p->conn, channel,
                            delivery_tag, 0 /* multiple */, requeue);
@@ -1857,7 +2008,8 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
         int multiple = (bits & 0x01) != 0;
         int requeue2 = (bits & 0x02) != 0;
         proto_chan_t *pc = channel_find(p, channel);
-        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, multiple, requeue2) : 0;
+        size_t got = pc ? chan_get_unacked_settle(pc, delivery_tag, multiple,
+                                                  requeue2, !requeue2) : 0;
         if (multiple || got == 0)
             dispatcher_nack(p->conn->server->dispatcher, p->conn, channel,
                            delivery_tag, multiple, requeue2);
@@ -1981,6 +2133,31 @@ static int props_is_persistent(const uint8_t *props, size_t len)
     return !r.error && dm == 2;
 }
 
+/* Return an unroutable `mandatory` publish to its sender: a Basic.Return method
+ * frame (reply-code + text + the original exchange/routing-key) followed by the
+ * message's content header and body, exactly as a delivery carries them. Without
+ * this a mandatory publish that matched no queue was dropped silently, which is
+ * precisely the case the mandatory flag exists to surface. */
+static void send_basic_return(beaver_proto_t *p, uint16_t channel,
+                              uint16_t code, const char *text,
+                              const char *exchange, const char *routing_key,
+                              const uint8_t *body, size_t body_len,
+                              const uint8_t *props, size_t props_len)
+{
+    bmqp_buf_t a;
+    bmqp_buf_init(&a);
+    bmqp_buf_put_u16(&a, code);
+    bmqp_buf_put_shortstr(&a, text);
+    bmqp_buf_put_shortstr(&a, exchange);
+    bmqp_buf_put_shortstr(&a, routing_key);
+    send_method(p, channel, BMQP_CLASS_BASIC, BMQP_BASIC_RETURN, &a);
+    bmqp_buf_free(&a);
+    /* send_method closes the connection on failure; protocol_send_content is a
+     * no-op on a closing connection, so this stays safe either way. */
+    protocol_send_content(p->conn, channel, BMQP_CLASS_BASIC, body, body_len,
+                          props, props_len, p->conn->frame_max);
+}
+
 static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
                              size_t body_len)
 {
@@ -2053,19 +2230,35 @@ static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
             return;
         }
         int routed = broker_route(srv->broker, p->vhost, msg);
-        /* mandatory: an unroutable message (no matching queue) must come back to
-         * the publisher via Basic.Return rather than vanishing silently. */
-        if (p->pub_mandatory && routed == ROUTE_UNROUTABLE)
-            send_basic_return(p, p->pub_channel, p->pub_exchange,
-                              p->pub_routing_key, body, body_len,
-                              p->pub_props, p->pub_props_len);
         message_unref(msg);
-        /* Transient publish: nothing to wait for, confirm right away. A returned
-         * message is still confirmed (mandatory return is not a nack). */
+        /* Transient publish: nothing to wait for, confirm right away. A
+         * resource error (every target queue full or OOM) means the message was
+         * NOT accepted anywhere, so it must be Nack'd - the old code sent a
+         * positive Basic.Ack unconditionally, telling the publisher a dropped
+         * message was safely handled. Unroutable (routed == 0, no matching
+         * queue) is still an Ack, matching RabbitMQ: the broker accepted it,
+         * there was simply nowhere to route it (mandatory handling is separate).
+         */
         if (confirm)
-            send_publish_confirm(p, p->pub_channel, ++pubch->confirm_seq, 0);
+            send_publish_confirm(p, p->pub_channel, ++pubch->confirm_seq,
+                                 routed == ROUTE_RESOURCE_ERROR /* nack */);
+        /* mandatory: a message that matched no queue is handed back to the
+         * publisher (Basic.Return + content) instead of vanishing silently. A
+         * resource error is a different failure (already Nack'd above under
+         * confirms) and is not a NO_ROUTE. */
+        if (p->pub_mandatory && routed == ROUTE_UNROUTABLE)
+            send_basic_return(p, p->pub_channel, 312, "NO_ROUTE",
+                              p->pub_exchange, p->pub_routing_key,
+                              body, body_len, p->pub_props, p->pub_props_len);
     }
     proto_advance(p, BMQP_STATE_ACTIVE);
+    /* Local producer flow control: if any queue is over its high-water mark,
+     * pause this producer's reads (TCP backpressure) so it cannot outrun the
+     * consumers. The per-server throttle timer resumes reads once the broker-wide
+     * flow alarm clears (see on_throttle_timer / beaver_conn_throttle_read). This
+     * complements the cluster-congestion throttle on the replicated path above. */
+    if (queue_flow_alarm_active())
+        beaver_conn_throttle_read(p->conn);
     /* Hot path: keep at DEBUG so high-throughput publishing isn't throttled by
      * synchronous logging (the LOG_DEBUG macro is a no-op when filtered). */
     LOG_DEBUG("conn #%" PRIu64 " ch=%u: Basic.Publish exchange='%s' key='%s' "
