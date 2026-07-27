@@ -27,6 +27,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <strings.h>
@@ -1217,10 +1218,15 @@ static void handle_request(http_conn_t *c)
 
 static int inbuf_append(http_conn_t *c, const char *data, size_t len)
 {
-    if (c->inbuf_len + len > c->inbuf_cap) {
+    size_t need = c->inbuf_len + len;
+    if (need < c->inbuf_len)
+        return 0; /* size_t overflow */
+    if (need > c->inbuf_cap) {
         size_t nc = c->inbuf_cap ? c->inbuf_cap : 1024;
-        while (nc < c->inbuf_len + len)
+        while (nc < need) {
+            if (nc > SIZE_MAX / 2) { nc = need; break; }
             nc *= 2;
+        }
         char *nb = realloc(c->inbuf, nc);
         if (!nb)
             return 0;

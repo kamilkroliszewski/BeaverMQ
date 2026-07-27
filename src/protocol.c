@@ -201,10 +201,15 @@ static int inbuf_append(beaver_proto_t *p, const uint8_t *data, size_t len)
         p->inbuf_len = rem;
         p->inbuf_pos = 0;
     }
-    if (p->inbuf_len + len > p->inbuf_cap) {
+    size_t need = p->inbuf_len + len;
+    if (need < p->inbuf_len)
+        return 0; /* size_t overflow: reject rather than under-allocate */
+    if (need > p->inbuf_cap) {
         size_t newcap = p->inbuf_cap ? p->inbuf_cap : 256;
-        while (newcap < p->inbuf_len + len)
+        while (newcap < need) {
+            if (newcap > SIZE_MAX / 2) { newcap = need; break; }
             newcap *= 2;
+        }
         uint8_t *nb = realloc(p->inbuf, newcap);
         if (!nb)
             return 0;
