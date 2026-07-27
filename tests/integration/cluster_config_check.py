@@ -87,7 +87,25 @@ def main() -> int:
               f"(max_length={q['max_length']}, overflow={q['overflow']}, "
               f"dlx={q['dead_letter_exchange']})")
 
-    print("PASS: queue configuration replicated identically to every node")
+    # P5: a replicated Queue.Delete must remove the queue from EVERY node (not
+    # just the one it was issued on - otherwise it "resurrects" after failover).
+    conn = pika.BlockingConnection(params)
+    conn.channel().queue_delete(queue=QNAME)
+    conn.close()
+    print(f"OK: Queue.Delete '{QNAME}' issued on node :{amqp}")
+    for port in http_ports:
+        gone = False
+        for _ in range(50):
+            if get_queue(port, user, pw) is None:
+                gone = True
+                break
+            time.sleep(0.1)
+        if not gone:
+            print(f"FAIL: queue still present on node :{port} after delete")
+            return 1
+        print(f"OK: node :{port} no longer has the queue")
+
+    print("PASS: queue configuration + deletion replicated to every node")
     return 0
 
 

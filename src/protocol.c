@@ -495,6 +495,7 @@ typedef enum {
     PENDING_EXCHANGE_DECLARE_OK,
     PENDING_QUEUE_DECLARE_OK,
     PENDING_QUEUE_BIND_OK,
+    PENDING_QUEUE_DELETE_OK,  /* Queue.Delete-Ok (message-count in op->depth) */
     PENDING_PUBLISH_CONFIRM,  /* publisher confirm: Basic.Ack on commit, Nack on fail */
 } pending_kind_t;
 
@@ -595,10 +596,18 @@ static void pending_op_timer_cb(uv_timer_t *t)
                        BMQP_EXCHANGE_DECLARE_OK, NULL);
             break;
         case PENDING_QUEUE_DECLARE_OK: {
+            /* Report the queue's real depth: for a replicated declare the queue
+             * was created by apply_op at commit (not locally beforehand), so
+             * read it from the broker now. Falls back to op->depth if the local
+             * apply hasn't landed yet (a fresh queue is 0 anyway). */
+            uint32_t depth = op->depth;
+            beaver_queue_t *dq = broker_get_queue(p->conn->server->broker,
+                                                  p->vhost, op->qname);
+            if (dq) { depth = (uint32_t)queue_depth(dq); queue_unref(dq); }
             bmqp_buf_t a;
             bmqp_buf_init(&a);
             bmqp_buf_put_shortstr_n(&a, op->qname, strlen(op->qname));
-            bmqp_buf_put_u32(&a, op->depth); /* message-count */
+            bmqp_buf_put_u32(&a, depth);     /* message-count */
             bmqp_buf_put_u32(&a, 0);         /* consumer-count */
             send_method(p, channel, BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE_OK, &a);
             bmqp_buf_free(&a);
@@ -607,6 +616,14 @@ static void pending_op_timer_cb(uv_timer_t *t)
         case PENDING_QUEUE_BIND_OK:
             send_method(p, channel, BMQP_CLASS_QUEUE, BMQP_QUEUE_BIND_OK, NULL);
             break;
+        case PENDING_QUEUE_DELETE_OK: {
+            bmqp_buf_t a;
+            bmqp_buf_init(&a);
+            bmqp_buf_put_u32(&a, op->depth); /* message-count purged (pre-delete) */
+            send_method(p, channel, BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE_OK, &a);
+            bmqp_buf_free(&a);
+            break;
+        }
         case PENDING_PUBLISH_CONFIRM:
             break; /* handled above */
         }
@@ -1339,28 +1356,13 @@ static void handle_exchange(beaver_proto_t *p, uint16_t channel,
             return;
         }
 
-        int created = 0;
-        int drc = broker_declare_exchange(p->conn->server->broker, p->vhost,
-                                          ename, xtype, bits & 0x0E, &created);
-        if (drc == -2) {
-            send_channel_close(p, channel, 406,
-                               "PRECONDITION_FAILED - exchange already "
-                               "declared with different type/flags",
-                               BMQP_CLASS_EXCHANGE, BMQP_EXCHANGE_DECLARE);
-            return;
-        }
-        if (drc != 0) {
-            proto_fatal(p, "failed to declare exchange '%s'", ename);
-            return;
-        }
-        LOG_INFO("conn #%" PRIu64 " ch=%u: Exchange.Declare '%s' type=%s (%s)",
-                 p->conn->id, channel, ename, exchange_type_name(xtype),
-                 created ? "created" : "exists");
-        /* Replicate only DURABLE topology: durable objects are clustered (HA +
-         * survive restart); transient ones stay node-local and fast. Do NOT
-         * send Declare-Ok until this actually COMMITS - the client must never
-         * see success when there was no leader/quorum or the propose itself
-         * failed (see await_cluster_commit). */
+        /* Cluster + durable == replicated topology: propose, wait for the Raft
+         * commit, and let apply_op create it on EVERY node. No local mutation
+         * before commit - otherwise a failed op (election / lost quorum) would
+         * leave an orphan exchange on this node while the client saw an error.
+         * (A redeclare with a different type in a cluster is not rejected
+         * pre-commit here - apply_op is idempotent; the local path below keeps
+         * the -2 precondition for standalone/transient exchanges.) */
         if (p->conn->server->cluster && (bits & BMQP_FLAG_DURABLE)) {
             uint64_t seq = cluster_replicate_declare_exchange(
                 p->conn->server->cluster, p->vhost, ename, (int)xtype, bits & 0x0E);
@@ -1378,6 +1380,24 @@ static void handle_exchange(beaver_proto_t *p, uint16_t channel,
                                  PENDING_EXCHANGE_DECLARE_OK, NULL, 0);
             break;
         }
+
+        int created = 0;
+        int drc = broker_declare_exchange(p->conn->server->broker, p->vhost,
+                                          ename, xtype, bits & 0x0E, &created);
+        if (drc == -2) {
+            send_channel_close(p, channel, 406,
+                               "PRECONDITION_FAILED - exchange already "
+                               "declared with different type/flags",
+                               BMQP_CLASS_EXCHANGE, BMQP_EXCHANGE_DECLARE);
+            return;
+        }
+        if (drc != 0) {
+            proto_fatal(p, "failed to declare exchange '%s'", ename);
+            return;
+        }
+        LOG_INFO("conn #%" PRIu64 " ch=%u: Exchange.Declare '%s' type=%s (%s)",
+                 p->conn->id, channel, ename, exchange_type_name(xtype),
+                 created ? "created" : "exists");
         if (!no_wait)
             send_method(p, channel, BMQP_CLASS_EXCHANGE,
                         BMQP_EXCHANGE_DECLARE_OK, NULL);
@@ -1436,6 +1456,57 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         uint64_t qa_maxlen = qa.has_max_length ? qa.max_length : 0;
         uint64_t qa_maxbytes = qa.has_max_bytes ? qa.max_bytes : 0;
 
+        /* A declared dead-letter exchange with an illegal name would make
+         * dead-lettering silently unroutable; reject it before doing anything
+         * (checked here so it applies to both the local and cluster paths). */
+        if (qa.has_dlx && !name_ok(qa.dlx)) {
+            send_channel_close(p, channel, 406,
+                "PRECONDITION_FAILED - illegal x-dead-letter-exchange",
+                BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE);
+            return;
+        }
+
+        /* Cluster + durable + non-exclusive == replicated topology: do NOT touch
+         * the local broker here. Propose the declare, wait for the Raft commit,
+         * and let apply_op create it on EVERY node (including this one). Mutating
+         * locally first would leave an orphan queue on this node if the op never
+         * commits (election / lost quorum). Exclusive queues are connection-
+         * scoped and never replicated, so they fall through to the local path. */
+        if (p->conn->server->cluster && (bits & BMQP_FLAG_DURABLE) &&
+            !(bits & BMQP_FLAG_EXCLUSIVE)) {
+            /* Read-only precondition: reject a redeclare with different flags
+             * (the local path's broker_declare_queue -2 rule) without mutating. */
+            beaver_queue_t *ex = broker_get_queue(p->conn->server->broker,
+                                                  p->vhost, qname);
+            if (ex) {
+                int mismatch = queue_flags(ex) != (bits & 0x0E);
+                queue_unref(ex);
+                if (mismatch) {
+                    send_channel_close(p, channel, 406,
+                        "PRECONDITION_FAILED - queue already declared with "
+                        "different flags", BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE);
+                    return;
+                }
+            }
+            uint64_t seq = cluster_replicate_declare_queue(
+                p->conn->server->cluster, p->vhost, qname, bits & 0x0E,
+                qa_overflow, qa_maxlen, qa_maxbytes,
+                qa.has_dlx ? qa.dlx : "", qa.has_dlx ? qa.dlx_rkey : "");
+            if (no_wait)
+                break;
+            if (seq == 0) {
+                send_channel_close(p, channel, 541,
+                                   "INTERNAL_ERROR - failed to replicate "
+                                   "Queue.Declare", BMQP_CLASS_QUEUE,
+                                   BMQP_QUEUE_DECLARE);
+                break;
+            }
+            await_cluster_commit(p, channel, seq, BMQP_CLASS_QUEUE,
+                                 BMQP_QUEUE_DECLARE, PENDING_QUEUE_DECLARE_OK,
+                                 qname, 0 /* real depth read from broker at reply */);
+            break;
+        }
+
         uint32_t depth = 0;
         int created = 0;
         /* passive/durable/exclusive/auto-delete bits map 1:1 to our flags. */
@@ -1479,19 +1550,9 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
                         LOG_WARN("conn #%" PRIu64 ": unsupported x-overflow '%s' "
                                  "on queue '%s'; using reject-publish",
                                  p->conn->id, qa.overflow, qname);
-                    if (qa.has_dlx) {
-                        /* Illegal exchange name in a DLX arg would be silently
-                         * unroutable; reject it up front. */
-                        if (!name_ok(qa.dlx)) {
-                            queue_unref(lq);
-                            send_channel_close(p, channel, 406,
-                                "PRECONDITION_FAILED - illegal x-dead-letter-exchange",
-                                BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE);
-                            return;
-                        }
+                    if (qa.has_dlx) /* name already validated above */
                         broker_set_queue_dead_letter(p->conn->server->broker, lq,
                                                      qa.dlx, qa.dlx_rkey);
-                    }
                     LOG_INFO("conn #%" PRIu64 ": queue '%s' limits "
                              "max_length=%" PRIu64 " max_bytes=%" PRIu64
                              " overflow=%s dlx='%s'", p->conn->id, qname,
@@ -1526,26 +1587,6 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
                 queue_unref(eq);
                 track_exclusive_queue(p, qname);
             }
-        }
-
-        if (p->conn->server->cluster && (bits & BMQP_FLAG_DURABLE)) {
-            uint64_t seq = cluster_replicate_declare_queue(
-                p->conn->server->cluster, p->vhost, qname, bits & 0x0E,
-                qa_overflow, qa_maxlen, qa_maxbytes,
-                qa.has_dlx ? qa.dlx : "", qa.has_dlx ? qa.dlx_rkey : "");
-            if (no_wait)
-                break;
-            if (seq == 0) {
-                send_channel_close(p, channel, 541,
-                                   "INTERNAL_ERROR - failed to replicate "
-                                   "Queue.Declare", BMQP_CLASS_QUEUE,
-                                   BMQP_QUEUE_DECLARE);
-                break;
-            }
-            await_cluster_commit(p, channel, seq, BMQP_CLASS_QUEUE,
-                                 BMQP_QUEUE_DECLARE, PENDING_QUEUE_DECLARE_OK,
-                                 qname, depth);
-            break;
         }
 
         if (!no_wait) {
@@ -1588,6 +1629,37 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
             !require_perm(p, channel, AUTH_READ, qname,
                           BMQP_CLASS_QUEUE, BMQP_QUEUE_BIND))
             return;
+        /* A bind on a DURABLE queue is replicated topology: do NOT bind locally
+         * first (an orphan binding would survive a failed op). Decide durability
+         * read-only, verify both endpoints exist, propose, and let apply_op bind
+         * on every node at commit. A non-durable queue binds locally (node-local
+         * and fast), matching the transient-topology policy. */
+        beaver_queue_t *bq = broker_get_queue(p->conn->server->broker,
+                                              p->vhost, qname);
+        int durable_q = bq && (queue_flags(bq) & BMQP_FLAG_DURABLE);
+        if (bq)
+            queue_unref(bq);
+
+        if (p->conn->server->cluster && durable_q) {
+            if (!broker_exchange_exists(p->conn->server->broker, p->vhost, ename)) {
+                proto_fatal(p, "Queue.Bind failed: exchange '%s' not found", ename);
+                return;
+            }
+            uint64_t seq = cluster_replicate_bind(p->conn->server->cluster,
+                                                  p->vhost, qname, ename, key);
+            if (no_wait & 0x01)
+                break;
+            if (seq == 0) {
+                send_channel_close(p, channel, 541,
+                                   "INTERNAL_ERROR - failed to replicate "
+                                   "Queue.Bind", BMQP_CLASS_QUEUE, BMQP_QUEUE_BIND);
+                break;
+            }
+            await_cluster_commit(p, channel, seq, BMQP_CLASS_QUEUE,
+                                 BMQP_QUEUE_BIND, PENDING_QUEUE_BIND_OK, NULL, 0);
+            break;
+        }
+
         if (broker_bind(p->conn->server->broker, p->vhost, qname, ename, key) != 0) {
             proto_fatal(p, "Queue.Bind failed: queue '%s' or exchange '%s' "
                         "not found", qname, ename);
@@ -1595,32 +1667,6 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         }
         LOG_INFO("conn #%" PRIu64 " ch=%u: Queue.Bind q='%s' exchange='%s' "
                  "key='%s'", p->conn->id, channel, qname, ename, key);
-        /* Replicate a bind only when its queue is durable (so the clustered
-         * topology stays consistent with the durable queue/exchange set). */
-        if (p->conn->server->cluster) {
-            beaver_queue_t *bq = broker_get_queue(p->conn->server->broker,
-                                                  p->vhost, qname);
-            int durable_q = bq && (queue_flags(bq) & BMQP_FLAG_DURABLE);
-            uint64_t seq = 0;
-            if (durable_q)
-                seq = cluster_replicate_bind(p->conn->server->cluster, p->vhost,
-                                             qname, ename, key);
-            if (bq)
-                queue_unref(bq);
-            if (durable_q && !(no_wait & 0x01)) {
-                if (seq == 0) {
-                    send_channel_close(p, channel, 541,
-                                       "INTERNAL_ERROR - failed to replicate "
-                                       "Queue.Bind", BMQP_CLASS_QUEUE,
-                                       BMQP_QUEUE_BIND);
-                } else {
-                    await_cluster_commit(p, channel, seq, BMQP_CLASS_QUEUE,
-                                         BMQP_QUEUE_BIND, PENDING_QUEUE_BIND_OK,
-                                         NULL, 0);
-                }
-                break;
-            }
-        }
         if (!(no_wait & 0x01))
             send_method(p, channel, BMQP_CLASS_QUEUE, BMQP_QUEUE_BIND_OK, NULL);
         break;
@@ -1651,44 +1697,65 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
                           BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE))
             return;
 
-        /* Refuse to delete another connection's exclusive queue; note whether
-         * it is durable (for cluster replication) before it is gone. */
-        int was_durable = 0;
-        beaver_queue_t *eq = broker_get_queue(p->conn->server->broker,
+        /* Inspect the queue read-only: existence (404), exclusive owner (405),
+         * durability, message count, and the if-unused / if-empty preconditions
+         * (406). Doing this WITHOUT mutating lets the cluster path propose the
+         * delete and have apply_op remove it on every node - deleting locally
+         * first would drop this node's copy (and its messages) even if the op
+         * never commits, leaving the queue "resurrected" on the other replicas. */
+        beaver_queue_t *dq = broker_get_queue(p->conn->server->broker,
                                               p->vhost, qname);
-        if (eq) {
-            uint64_t owner = queue_exclusive_owner(eq);
-            was_durable = (queue_flags(eq) & BMQP_FLAG_DURABLE) != 0;
-            queue_unref(eq);
-            if (owner != 0 && owner != p->conn->id) {
-                send_channel_close(p, channel, 405,
-                    "RESOURCE_LOCKED - queue is exclusive to another connection",
-                    BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
-                return;
-            }
+        if (!dq) {
+            send_channel_close(p, channel, 404, "NOT_FOUND - no such queue",
+                               BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
+            return;
+        }
+        uint64_t owner = queue_exclusive_owner(dq);
+        int was_durable = (queue_flags(dq) & BMQP_FLAG_DURABLE) != 0;
+        uint32_t msgcount = (uint32_t)queue_depth(dq);
+        int has_consumers = queue_consumer_count(dq) > 0;
+        queue_unref(dq);
+        if (owner != 0 && owner != p->conn->id) {
+            send_channel_close(p, channel, 405,
+                "RESOURCE_LOCKED - queue is exclusive to another connection",
+                BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
+            return;
+        }
+        if (if_unused && has_consumers) {
+            send_channel_close(p, channel, 406,
+                "PRECONDITION_FAILED - queue in use (has consumers)",
+                BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
+            return;
+        }
+        if (if_empty && msgcount > 0) {
+            send_channel_close(p, channel, 406,
+                "PRECONDITION_FAILED - queue not empty",
+                BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
+            return;
         }
 
-        uint32_t msgcount = 0;
-        int drc = broker_delete_queue(p->conn->server->broker, p->vhost, qname,
-                                      if_unused, if_empty, &msgcount);
-        if (drc == -1) {
-            send_channel_close(p, channel, 404,
-                               "NOT_FOUND - no such queue",
-                               BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
-            return;
+        if (p->conn->server->cluster && was_durable) {
+            /* Replicated delete: tracked proposal, apply-only, confirmed after
+             * commit (Delete-Ok carries the pre-delete message count). */
+            uint64_t seq = cluster_replicate_delete_queue(p->conn->server->cluster,
+                                                          p->vhost, qname);
+            if (no_wait)
+                break;
+            if (seq == 0) {
+                send_channel_close(p, channel, 541,
+                                   "INTERNAL_ERROR - failed to replicate "
+                                   "Queue.Delete", BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
+                break;
+            }
+            await_cluster_commit(p, channel, seq, BMQP_CLASS_QUEUE,
+                                 BMQP_QUEUE_DELETE, PENDING_QUEUE_DELETE_OK,
+                                 NULL, msgcount);
+            break;
         }
-        if (drc == -2) {
-            send_channel_close(p, channel, 406,
-                               "PRECONDITION_FAILED - queue in use (has consumers)",
-                               BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
-            return;
-        }
-        if (drc == -3) {
-            send_channel_close(p, channel, 406,
-                               "PRECONDITION_FAILED - queue not empty",
-                               BMQP_CLASS_QUEUE, BMQP_QUEUE_DELETE);
-            return;
-        }
+
+        /* Local path (standalone, or a non-durable queue). */
+        broker_delete_queue(p->conn->server->broker, p->vhost, qname,
+                            if_unused, if_empty, &msgcount);
         /* Forget it from our exclusive-cleanup list (it's already gone). */
         for (size_t i = 0; i < p->n_excl; i++) {
             if (strcmp(p->excl_queues[i], qname) == 0) {
@@ -1699,11 +1766,6 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         }
         LOG_INFO("conn #%" PRIu64 " ch=%u: Queue.Delete '%s' (%u message(s))",
                  p->conn->id, channel, qname, msgcount);
-        /* Replicate the delete of a durable queue so the clustered topology
-         * stays consistent (idempotent apply on every node, incl. this one). */
-        if (p->conn->server->cluster && was_durable)
-            cluster_replicate_delete_queue(p->conn->server->cluster,
-                                           p->vhost, qname);
         if (!no_wait) {
             bmqp_buf_t a;
             bmqp_buf_init(&a);

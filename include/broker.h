@@ -136,6 +136,11 @@ void broker_set_queue_dead_letter(beaver_broker_t *b, beaver_queue_t *q,
 beaver_queue_t *broker_get_queue(beaver_broker_t *b, const char *vhost,
                                  const char *name);
 
+/* 1 if an exchange named `name` exists in `vhost` (read-only existence check,
+ * e.g. to validate a bind before replicating it). */
+int broker_exchange_exists(beaver_broker_t *b, const char *vhost,
+                           const char *name);
+
 /* Build the composite registry key "vhost \x01 name" (shared with the consumer
  * dispatcher, which keys its per-queue groups the same way). */
 static inline void broker_vkey(char out[512], const char *vhost, const char *name)

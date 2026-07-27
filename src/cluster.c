@@ -3531,16 +3531,19 @@ uint64_t cluster_replicate_publish_tracked(cluster_node_t *n, const char *vhost,
     return seq;
 }
 
-int cluster_replicate_delete_queue(cluster_node_t *n, const char *vhost,
-                                   const char *queue)
+uint64_t cluster_replicate_delete_queue(cluster_node_t *n, const char *vhost,
+                                        const char *queue)
 {
     if (strlen(vhost) > 250 || strlen(queue) > 250)
-        return -1;
+        return 0;
     uint8_t buf[2 * (2 + 251)];
     uint8_t *p = buf;
     wr_str(&p, vhost);
     wr_str(&p, queue);
-    return cluster_propose(n, CL_OP_DELETE_QUEUE, buf, (size_t)(p - buf));
+    /* Tracked so Queue.Delete-Ok is sent only after the delete COMMITS - a
+     * client must never be told a durable queue is gone while a lost quorum /
+     * election leaves it alive on the other replicas. */
+    return cluster_propose_tracked(n, CL_OP_DELETE_QUEUE, buf, (size_t)(p - buf));
 }
 
 int cluster_replicate_consume(cluster_node_t *n, const char *vhost,

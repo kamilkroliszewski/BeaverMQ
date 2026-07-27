@@ -532,8 +532,10 @@ uint64_t cluster_replicate_publish_tracked(cluster_node_t *n, const char *vhost,
 
 /* Replicate a durable queue deletion so every node drops it (idempotent apply,
  * carried in the topology snapshot). Returns 0 if accepted. */
-int cluster_replicate_delete_queue(cluster_node_t *n, const char *vhost,
-                                   const char *queue);
+/* Returns a nonzero tracked `seq` (poll with cluster_proposal_status) so the
+ * caller confirms Queue.Delete only after the delete commits, or 0 on failure. */
+uint64_t cluster_replicate_delete_queue(cluster_node_t *n, const char *vhost,
+                                        const char *queue);
 
 /* Replicate a queue's consume watermark so every node drains its replica copies
  * of messages with cluster_id <= watermark. Returns 0 if accepted. */
