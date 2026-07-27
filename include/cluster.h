@@ -495,9 +495,15 @@ cluster_proposal_status_t cluster_proposal_status(cluster_node_t *n, uint64_t se
  * Each returns a nonzero `seq` to poll with cluster_proposal_status(), or 0 on
  * outright failure (OOM). The committed op is applied to the broker on EVERY
  * node. */
+/* Replicates the FULL queue configuration - flags AND the per-queue policy
+ * (overflow: 0=reject-publish, 1=drop-head; max_length/max_bytes, 0=unlimited;
+ * dead-letter exchange + routing key, "" = none) - so every node's copy of the
+ * queue behaves identically. `dlx`/`dlx_rkey` may be NULL (treated as ""). */
 uint64_t cluster_replicate_declare_queue(cluster_node_t *n, const char *vhost,
-                                         const char *name,
-                                         uint8_t flags);
+                                         const char *name, uint8_t flags,
+                                         uint8_t overflow, uint64_t max_length,
+                                         uint64_t max_bytes, const char *dlx,
+                                         const char *dlx_rkey);
 uint64_t cluster_replicate_declare_exchange(cluster_node_t *n, const char *vhost,
                                             const char *name, int type,
                                             uint8_t flags);

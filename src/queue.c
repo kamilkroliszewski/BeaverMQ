@@ -12,6 +12,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -180,6 +181,40 @@ void queue_set_limits(beaver_queue_t *q, uint64_t max_length, uint64_t max_bytes
     q->max_length = max_length;
     q->max_bytes  = max_bytes;
     q->overflow   = overflow;
+    pthread_mutex_unlock(&q->lock);
+}
+
+uint64_t queue_max_length(beaver_queue_t *q)
+{
+    pthread_mutex_lock(&q->lock);
+    uint64_t v = q->max_length;
+    pthread_mutex_unlock(&q->lock);
+    return v;
+}
+uint64_t queue_max_bytes(beaver_queue_t *q)
+{
+    pthread_mutex_lock(&q->lock);
+    uint64_t v = q->max_bytes;
+    pthread_mutex_unlock(&q->lock);
+    return v;
+}
+queue_overflow_t queue_overflow(beaver_queue_t *q)
+{
+    pthread_mutex_lock(&q->lock);
+    queue_overflow_t v = q->overflow;
+    pthread_mutex_unlock(&q->lock);
+    return v;
+}
+/* Copy the dead-letter exchange + routing key into caller buffers ("" if
+ * unset). Either out pointer may be NULL to skip it. */
+void queue_dead_letter_info(beaver_queue_t *q, char *ex_out, size_t ex_cap,
+                            char *rk_out, size_t rk_cap)
+{
+    pthread_mutex_lock(&q->lock);
+    if (ex_out && ex_cap)
+        snprintf(ex_out, ex_cap, "%s", q->dl_exchange ? q->dl_exchange : "");
+    if (rk_out && rk_cap)
+        snprintf(rk_out, rk_cap, "%s", q->dl_routing_key ? q->dl_routing_key : "");
     pthread_mutex_unlock(&q->lock);
 }
 

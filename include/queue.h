@@ -69,6 +69,12 @@ typedef enum {
  * Typically set once, right after the queue is created. */
 void queue_set_limits(beaver_queue_t *q, uint64_t max_length, uint64_t max_bytes,
                       queue_overflow_t overflow);
+/* Read back the per-queue policy (for the management API + cluster tests). */
+uint64_t         queue_max_length(beaver_queue_t *q);
+uint64_t         queue_max_bytes(beaver_queue_t *q);
+queue_overflow_t queue_overflow(beaver_queue_t *q);
+void             queue_dead_letter_info(beaver_queue_t *q, char *ex_out,
+                                        size_t ex_cap, char *rk_out, size_t rk_cap);
 
 /* Messages evicted by the drop-head overflow policy (management metric). */
 uint64_t queue_total_dropped(beaver_queue_t *q);

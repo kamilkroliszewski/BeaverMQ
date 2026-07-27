@@ -1234,8 +1234,31 @@ static void apply_op(cluster_node_t *n, const cluster_log_entry_t *e)
     case CL_OP_DECLARE_QUEUE: {
         uint8_t flags = rd8(&p, end);
         if (rd_str(&p, end, vh, sizeof vh) == 0 &&
-            rd_str(&p, end, a, sizeof a) == 0)
-            broker_declare_queue(n->broker, vh, a, flags, NULL, NULL);
+            rd_str(&p, end, a, sizeof a) == 0) {
+            int created = 0;
+            broker_declare_queue(n->broker, vh, a, flags, NULL, &created);
+            /* Optional trailing per-queue config (overflow | max_length |
+             * max_bytes | dlx | dlx_rkey). Absent in pre-upgrade WALs, so guard
+             * on the remaining length. Apply only on create - the policy is
+             * fixed at declare time, same as the origin node. */
+            if (created && end - p >= 1 + 8 + 8) {
+                uint8_t overflow = rd8(&p, end);
+                uint64_t maxlen  = get_be64(p); p += 8;
+                uint64_t maxbytes = get_be64(p); p += 8;
+                if (rd_str(&p, end, b, sizeof b) == 0 &&
+                    rd_str(&p, end, c, sizeof c) == 0) {
+                    beaver_queue_t *q = broker_get_queue(n->broker, vh, a);
+                    if (q) {
+                        queue_set_limits(q, maxlen, maxbytes,
+                                         overflow == 1 ? QUEUE_OVERFLOW_DROP_HEAD
+                                                       : QUEUE_OVERFLOW_REJECT_PUBLISH);
+                        if (b[0])
+                            broker_set_queue_dead_letter(n->broker, q, b, c);
+                        queue_unref(q);
+                    }
+                }
+            }
+        }
         break;
     }
     case CL_OP_DECLARE_EXCH: {
@@ -3392,15 +3415,29 @@ cluster_proposal_status_t cluster_proposal_status(cluster_node_t *n, uint64_t se
 }
 
 uint64_t cluster_replicate_declare_queue(cluster_node_t *n, const char *vhost,
-                                         const char *name, uint8_t flags)
+                                         const char *name, uint8_t flags,
+                                         uint8_t overflow, uint64_t max_length,
+                                         uint64_t max_bytes, const char *dlx,
+                                         const char *dlx_rkey)
 {
-    if (strlen(vhost) > 250 || strlen(name) > 250)
+    if (!dlx) dlx = "";
+    if (!dlx_rkey) dlx_rkey = "";
+    if (strlen(vhost) > 250 || strlen(name) > 250 ||
+        strlen(dlx) > 250 || strlen(dlx_rkey) > 250)
         return 0;
-    uint8_t buf[1 + 2 * (2 + 251)];
+    /* flags | vhost | name | overflow | max_length | max_bytes | dlx | dlx_rkey.
+     * The trailing config is new; apply_op treats its absence (old logs) as the
+     * default policy, so this stays backward compatible with existing WALs. */
+    uint8_t buf[1 + 2 * (2 + 251) + 1 + 8 + 8 + 2 * (2 + 251)];
     uint8_t *p = buf;
     wr8(&p, flags);
     wr_str(&p, vhost);
     wr_str(&p, name);
+    wr8(&p, overflow);
+    put_be64(p, max_length); p += 8;
+    put_be64(p, max_bytes);  p += 8;
+    wr_str(&p, dlx);
+    wr_str(&p, dlx_rkey);
     return cluster_propose_tracked(n, CL_OP_DECLARE_QUEUE, buf, (size_t)(p - buf));
 }
 

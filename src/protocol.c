@@ -1426,6 +1426,16 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
                           BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE))
             return;
 
+        /* Parse the per-queue policy args once, up front: needed both to apply
+         * locally (on create) and to carry in the replicated op so every node's
+         * copy gets the same limits/overflow/DLX. */
+        queue_args_t qa;
+        parse_queue_args((const uint8_t *)args, tbl, &qa);
+        uint8_t qa_overflow = (qa.has_overflow &&
+                               strcmp(qa.overflow, "drop-head") == 0) ? 1 : 0;
+        uint64_t qa_maxlen = qa.has_max_length ? qa.max_length : 0;
+        uint64_t qa_maxbytes = qa.has_max_bytes ? qa.max_bytes : 0;
+
         uint32_t depth = 0;
         int created = 0;
         /* passive/durable/exclusive/auto-delete bits map 1:1 to our flags. */
@@ -1451,8 +1461,6 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
          * existing queue keeps the policy it was declared with, matching the
          * flag-mismatch rule above. */
         if (created) {
-            queue_args_t qa;
-            parse_queue_args((const uint8_t *)args, tbl, &qa);
             if (qa.has_overflow || qa.has_max_length || qa.has_max_bytes ||
                 qa.has_dlx) {
                 beaver_queue_t *lq = broker_get_queue(p->conn->server->broker,
@@ -1522,7 +1530,9 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
 
         if (p->conn->server->cluster && (bits & BMQP_FLAG_DURABLE)) {
             uint64_t seq = cluster_replicate_declare_queue(
-                p->conn->server->cluster, p->vhost, qname, bits & 0x0E);
+                p->conn->server->cluster, p->vhost, qname, bits & 0x0E,
+                qa_overflow, qa_maxlen, qa_maxbytes,
+                qa.has_dlx ? qa.dlx : "", qa.has_dlx ? qa.dlx_rkey : "");
             if (no_wait)
                 break;
             if (seq == 0) {

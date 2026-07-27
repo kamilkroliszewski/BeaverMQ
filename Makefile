@@ -144,6 +144,11 @@ persistence-test: $(BIN)
 health-test: $(BIN)
 	@bash $(TEST_DIR)/test_health.sh
 
+# Cluster: full queue configuration (limits/overflow/DLX) replicates to all nodes.
+.PHONY: cluster-config-test
+cluster-config-test: $(BIN)
+	@bash $(TEST_DIR)/test_cluster_config.sh
+
 debug: OPT := -O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer
 debug: LDFLAGS += -fsanitize=address,undefined
 debug: clean all
