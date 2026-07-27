@@ -305,10 +305,17 @@ static void queue_update_congestion(beaver_queue_t *q)
     uint64_t max_len   = q->max_length ? q->max_length : g_queue_max_length;
     uint64_t max_bytes = q->max_bytes  ? q->max_bytes  : g_queue_max_bytes;
 
+    /* Congested at >= 90% of an effective limit, clear at <= 75%. The band has
+     * to be wide enough not to flap per message, but NOT so wide that clearing
+     * it means draining half the queue: with a 256 MiB default limit a 90%->50%
+     * band stalls every producer for as long as it takes consumers to drain
+     * ~128 MiB, which showed up as multi-second stop/go swings in throughput
+     * (perf-test saw 160k msg/s alternating with 50k). A 15% band keeps the
+     * pauses short, so the producers settle near the drain rate instead. */
     int over_high = (max_len   && q->count       >= max_len   - max_len   / 10) ||
                     (max_bytes && q->total_bytes >= max_bytes - max_bytes / 10);
-    int under_low = (!max_len   || q->count       <= max_len   / 2) &&
-                    (!max_bytes || q->total_bytes <= max_bytes / 2);
+    int under_low = (!max_len   || q->count       <= max_len   - max_len   / 4) &&
+                    (!max_bytes || q->total_bytes <= max_bytes - max_bytes / 4);
 
     if (!q->congested && over_high) {
         q->congested = 1;

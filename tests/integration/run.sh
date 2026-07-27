@@ -86,6 +86,8 @@ else
     "$PYBIN" "$SCRIPT_DIR/test_amqp.py" 127.0.0.1 "$AMQP_PORT" "$USER" "$PASS" || FAILED=1
     echo "== AMQP queue lifecycle test (pika) =="
     "$PYBIN" "$SCRIPT_DIR/test_queue_lifecycle.py" 127.0.0.1 "$AMQP_PORT" "$HTTP_PORT" "$USER" "$PASS" || FAILED=1
+    echo "== flow control + passive declare test (pika) =="
+    "$PYBIN" "$SCRIPT_DIR/test_flow_control.py" 127.0.0.1 "$AMQP_PORT" "$USER" "$PASS" || FAILED=1
 fi
 
 echo "== management API test (stdlib) =="

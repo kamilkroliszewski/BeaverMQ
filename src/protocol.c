@@ -859,6 +859,18 @@ static void send_channel_close(beaver_proto_t *p, uint16_t channel,
     bmqp_buf_put_u16(&a, method_id);
     send_method(p, channel, BMQP_CLASS_CHANNEL, BMQP_CHANNEL_CLOSE, &a);
     bmqp_buf_free(&a);
+
+    /* A channel exception CLOSES the channel: release its state here, exactly
+     * like a client-initiated Channel.Close does. Without this the channel
+     * stayed registered, so the standard client recovery - reopen a channel
+     * with the same number - was answered with "channel already open" and we
+     * killed the whole connection (this is what made RabbitMQ's perf-test die
+     * after its first passive-declare probe). The client still owes us a
+     * Channel.Close-Ok, which is accepted and ignored. */
+    cancel_pending_ops(p, (int)channel);
+    if (p->conn->server->dispatcher)
+        dispatcher_remove_channel(p->conn->server->dispatcher, p->conn, channel);
+    channel_remove(p, channel);
 }
 
 /* Permission gate: 1 if the connection's user may `kind` access to `object` in
@@ -1342,6 +1354,31 @@ static void handle_exchange(beaver_proto_t *p, uint16_t channel,
                           BMQP_CLASS_EXCHANGE, BMQP_EXCHANGE_DECLARE))
             return;
 
+        /* passive = "does this exchange exist?" - never create, and IGNORE the
+         * type/durable/auto-delete/arguments fields entirely (clients send an
+         * EMPTY type here: RabbitMQ's exchangeDeclarePassive does exactly that,
+         * and validating it as a real type used to fail the call with
+         * COMMAND_INVALID). Answer Declare-Ok if it exists, 404 if it does not.
+         * The default exchange ("") always exists. */
+        if (bits & BMQP_FLAG_PASSIVE) {
+            int exists = (ename[0] == '\0') ||
+                         broker_exchange_exists(p->conn->server->broker,
+                                                p->vhost, ename);
+            if (!exists) {
+                char text[600];
+                snprintf(text, sizeof text,
+                         "NOT_FOUND - no exchange '%s' in vhost '%s'",
+                         ename, p->vhost);
+                send_channel_close(p, channel, 404, text,
+                                   BMQP_CLASS_EXCHANGE, BMQP_EXCHANGE_DECLARE);
+                return;
+            }
+            if (!no_wait)
+                send_method(p, channel, BMQP_CLASS_EXCHANGE,
+                            BMQP_EXCHANGE_DECLARE_OK, NULL);
+            break;
+        }
+
         exchange_type_t xtype;
         if (exchange_type_from_name(etype, &xtype) != 0) {
             /* An unknown exchange type must be a channel exception, not a
@@ -1445,6 +1482,35 @@ static void handle_queue(beaver_proto_t *p, uint16_t channel,
         if (!require_perm(p, channel, AUTH_CONFIGURE, qname,
                           BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE))
             return;
+
+        /* passive = "does this queue exist?" - never create, and ignore the
+         * flags/arguments (AMQP: a passive declare only probes). Declare-Ok with
+         * the live counts if it exists, 404 if it does not. */
+        if (bits & BMQP_FLAG_PASSIVE) {
+            beaver_queue_t *pq = broker_get_queue(p->conn->server->broker,
+                                                  p->vhost, qname);
+            if (!pq) {
+                char text[600];
+                snprintf(text, sizeof text,
+                         "NOT_FOUND - no queue '%s' in vhost '%s'", qname, p->vhost);
+                send_channel_close(p, channel, 404, text,
+                                   BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE);
+                return;
+            }
+            uint32_t pdepth = (uint32_t)queue_depth(pq);
+            uint32_t pcons  = (uint32_t)queue_consumer_count(pq);
+            queue_unref(pq);
+            if (!no_wait) {
+                bmqp_buf_t a;
+                bmqp_buf_init(&a);
+                bmqp_buf_put_shortstr_n(&a, qname, strlen(qname));
+                bmqp_buf_put_u32(&a, pdepth);
+                bmqp_buf_put_u32(&a, pcons);
+                send_method(p, channel, BMQP_CLASS_QUEUE, BMQP_QUEUE_DECLARE_OK, &a);
+                bmqp_buf_free(&a);
+            }
+            break;
+        }
 
         /* Parse the per-queue policy args once, up front: needed both to apply
          * locally (on create) and to carry in the replicated op so every node's
@@ -2307,8 +2373,17 @@ static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
      * consumers. The per-server throttle timer resumes reads once the broker-wide
      * flow alarm clears (see on_throttle_timer / beaver_conn_throttle_read). This
      * complements the cluster-congestion throttle on the replicated path above. */
-    if (queue_flow_alarm_active())
-        beaver_conn_throttle_read(p->conn);
+    /* NOTE: a queue at its length/byte limit does NOT pause the connection. The
+     * limit is itself the memory bound - an over-limit publish is rejected
+     * (QUEUE_FULL -> nack under confirms) or drop-head'd, so reading the client
+     * costs nothing extra. Pausing the socket here was actively harmful: it
+     * stops reading the WHOLE connection, so consumer ACKs queued behind the
+     * publishes could not be read either. The prefetch window then never freed,
+     * deliveries stopped, the queue never drained and the alarm never cleared -
+     * a permanently wedged connection (and, with consumers on separate
+     * connections, multi-second stop/go throughput swings). Backpressure that
+     * genuinely needs to slow a producer down - cluster replication backlog -
+     * still throttles above, and is bounded in time by the throttle timer. */
     /* Hot path: keep at DEBUG so high-throughput publishing isn't throttled by
      * synchronous logging (the LOG_DEBUG macro is a no-op when filtered). */
     LOG_DEBUG("conn #%" PRIu64 " ch=%u: Basic.Publish exchange='%s' key='%s' "

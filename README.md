@@ -563,7 +563,19 @@ are rate‑limited per client IP. Field tables (client capabilities, method
 `if-unused` / `if-empty`), an **exclusive** queue is locked to its declaring
 connection and deleted when that connection closes, and an **auto‑delete** queue
 is removed once its last consumer goes away. In a cluster, deleting a durable
-queue replicates through Raft.
+queue replicates through Raft. A **passive** declare (`Exchange`/`Queue.Declare`
+with the passive bit) is an existence probe: type/flags/arguments are ignored,
+nothing is created, and a missing object answers `404`.
+
+**Queue limits are the memory bound, not connection backpressure.** When a queue
+reaches `x-max-length` / `x-max-length-bytes` (or the `queue_max_*` defaults) it
+applies its overflow policy — `reject-publish` (the publish is refused, and
+`Basic.Nack`'ed under publisher confirms) or `drop-head` — and the broker keeps
+reading the connection. It deliberately does **not** pause the socket: that also
+stops the consumer `Basic.Ack`s travelling on the same connection, which used to
+wedge a publish+consume connection permanently and made throughput swing in
+multi‑second stop/go cycles. Only the cluster replication backlog throttles a
+producer, and that pause is bounded in time.
 
 **Not implemented / partial** (so clients don't assume more than is there):
 

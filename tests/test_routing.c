@@ -287,17 +287,18 @@ static void test_queue_dead_letter_drop_head(void)
 
 /* Flow alarm: a queue trips the broker-wide producer flow alarm at its
  * high-water mark (90% of the limit) and only clears it after draining back to
- * the low-water mark (50%) - hysteresis, so producers are not flapped. */
+ * the low-water mark (75%) - hysteresis, so producers are not flapped. */
 static void test_queue_flow_alarm(void)
 {
     TEST_SECTION("flow alarm sets at high-water, clears after draining below low-water (hysteresis)");
     queue_set_default_limits(0, 0);
     CHECK(!queue_flow_alarm_active()); /* nothing congested to start */
 
+    /* limit 100 -> high-water = 90 (90%), low-water = 75 (75%). */
     beaver_queue_t *q = queue_new("qflow", 0);
-    queue_set_limits(q, 10, 0, QUEUE_OVERFLOW_REJECT_PUBLISH); /* high=9, low=5 */
+    queue_set_limits(q, 100, 0, QUEUE_OVERFLOW_REJECT_PUBLISH);
 
-    for (int i = 0; i < 8; i++) {         /* depth 8: below high-water */
+    for (int i = 0; i < 89; i++) {        /* depth 89: below high-water */
         beaver_message_t *m = message_new("", "", "x", 1);
         CHECK_EQ(queue_enqueue(q, m), 0);
         message_unref(m);
@@ -305,16 +306,18 @@ static void test_queue_flow_alarm(void)
     CHECK(!queue_flow_alarm_active());
 
     beaver_message_t *m = message_new("", "", "x", 1);
-    queue_enqueue(q, m); message_unref(m);   /* depth 9: trips the alarm */
+    queue_enqueue(q, m); message_unref(m);   /* depth 90: trips the alarm */
     CHECK(queue_flow_alarm_active());
 
-    for (int i = 0; i < 3; i++) {            /* drain to depth 6: still > low */
+    for (int i = 0; i < 13; i++) {           /* drain to depth 77: still > low */
         beaver_message_t *d = queue_dequeue(q);
         message_unref(d);
     }
     CHECK(queue_flow_alarm_active());
 
-    beaver_message_t *d = queue_dequeue(q);  /* depth 5 == low-water: clears */
+    beaver_message_t *d = queue_dequeue(q);  /* 76 */
+    message_unref(d);
+    d = queue_dequeue(q);                    /* depth 75 == low-water: clears */
     message_unref(d);
     CHECK(!queue_flow_alarm_active());
 

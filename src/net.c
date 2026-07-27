@@ -517,15 +517,32 @@ static void on_shutdown_async(uv_async_t *handle)
 
 /* While any producer is paused, this per-server timer polls the cluster's
  * congestion flag and resumes reads once it clears. */
+/* Longest a producer may stay paused before we let it run again even though the
+ * congestion signal is still on. A pause stops reading the WHOLE connection,
+ * which also stops any consumer ACKs travelling on it - and those acks are what
+ * frees the prefetch window so deliveries can drain the queue that raised the
+ * alarm. An unbounded pause therefore deadlocks a connection that both publishes
+ * and consumes: acks can never arrive, the queue never drains, the alarm never
+ * clears. Bounding the pause turns hard backpressure into a duty cycle: the
+ * producer is still throttled to roughly the drain rate, but progress (and the
+ * acks) is always possible. */
+#define BEAVER_MAX_THROTTLE_PAUSE_MS 50
+
 static void on_throttle_timer(uv_timer_t *timer)
 {
     beaver_server_t *server = timer->data;
-    /* Keep producers paused while EITHER the cluster is congested (durable
-     * replication backpressure) OR any local queue is over its high-water mark
-     * (the broker-wide flow alarm). Resume only once both have cleared. */
-    if (!server->shutting_down &&
-        ((server->cluster && cluster_should_throttle(server->cluster)) ||
-         queue_flow_alarm_active()))
+    /* Keep producers paused while the cluster is congested (durable replication
+     * backlog - the one signal with no other bound), but never for longer than
+     * BEAVER_MAX_THROTTLE_PAUSE_MS in one stretch (see above). A still-congested
+     * broker simply re-pauses the producer on its next publish.
+     * A full local queue deliberately does NOT hold producers paused: the queue
+     * limit already bounds memory by rejecting/evicting, and pausing the socket
+     * also blocked the consumer ACKs travelling on it (see protocol.c). */
+    uint64_t now = uv_now(server->loop);
+    int congested = server->cluster && cluster_should_throttle(server->cluster);
+    if (!server->shutting_down && congested &&
+        (server->throttle_since_ms == 0 ||
+         now - server->throttle_since_ms < BEAVER_MAX_THROTTLE_PAUSE_MS))
         return;
 
     pthread_mutex_lock(&server->conns_lock);
@@ -537,7 +554,8 @@ static void on_throttle_timer(uv_timer_t *timer)
     }
     pthread_mutex_unlock(&server->conns_lock);
     uv_timer_stop(timer);
-    server->throttle_started = 0;
+    server->throttle_started   = 0;
+    server->throttle_since_ms  = 0;
 }
 
 void beaver_conn_throttle_read(beaver_conn_t *conn)
@@ -548,7 +566,8 @@ void beaver_conn_throttle_read(beaver_conn_t *conn)
     uv_read_stop((uv_stream_t *)&conn->handle);
     conn->read_paused = 1;
     if (!server->throttle_started) {
-        server->throttle_started = 1;
+        server->throttle_started  = 1;
+        server->throttle_since_ms = uv_now(server->loop); /* bounds this pause */
         uv_timer_start(&server->throttle_timer, on_throttle_timer, 4, 4);
     }
 }
