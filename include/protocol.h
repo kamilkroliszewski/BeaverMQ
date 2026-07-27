@@ -78,6 +78,7 @@ typedef struct beaver_proto beaver_proto_t;
 #define BMQP_BASIC_CANCEL      30  /* C->S */
 #define BMQP_BASIC_CANCEL_OK   31  /* S->C */
 #define BMQP_BASIC_PUBLISH     40  /* C->S */
+#define BMQP_BASIC_RETURN      50  /* S->C (unroutable mandatory message) */
 #define BMQP_BASIC_DELIVER     60  /* S->C */
 #define BMQP_BASIC_GET         70  /* C->S */
 #define BMQP_BASIC_GET_OK      71  /* S->C */

@@ -550,7 +550,7 @@ Implemented classes/methods (official AMQP 0‑9‑1 ids):
 | Exchange (40)    | Declare/DeclareOk                                         |
 | Queue (50)       | Declare/DeclareOk, Bind/BindOk, Delete/DeleteOk           |
 | Basic (60)       | Qos/QosOk, Consume/ConsumeOk, Cancel/CancelOk, Publish,    |
-|                  | Deliver, Get/GetOk/GetEmpty, Ack, Nack, Reject             |
+|                  | Return, Deliver, Get/GetOk/GetEmpty, Ack, Nack, Reject     |
 | Confirm (85)     | Select/SelectOk (publisher confirms)                      |
 
 The handshake authenticates with SASL `PLAIN` against the replicated user
@@ -569,8 +569,10 @@ queue replicates through Raft.
 
 - `Basic.Qos` honours `prefetch-count`, but not `prefetch-size` or the `global`
   flag.
-- The `mandatory` / `immediate` publish flags are parsed but do **not** produce
-  `Basic.Return` for unroutable messages.
+- `mandatory` returns an unroutable message to the publisher via `Basic.Return`
+  (312 NO_ROUTE) for locally-routed publishes; the `immediate` flag is parsed
+  but not acted on. (A persistent publish routed asynchronously through the
+  cluster is not returned - the routing result is not known at publish time.)
 - No transactions (`Tx` class), and no coordinated exactly‑once delivery across
   cluster replicas (a replicated message is consumed independently per node).
 

@@ -97,6 +97,7 @@ struct beaver_proto {
     /* ---- in-progress content assembly (Basic.Publish) ---- */
     int            pub_active;        /* a publish awaits its content frames */
     int            pub_have_header;   /* content header received */
+    int            pub_mandatory;     /* Basic.Publish mandatory flag */
     uint16_t       pub_channel;
     char           pub_exchange[256];
     char           pub_routing_key[256];
@@ -465,6 +466,28 @@ static void send_publish_confirm(beaver_proto_t *p, uint16_t channel,
     bmqp_buf_free(&a);
 }
 
+/* Return an unroutable `mandatory` message to the publisher: a Basic.Return
+ * method frame (312 NO_ROUTE) followed by the message's content header + body,
+ * exactly as a delivery is framed. */
+static void send_basic_return(beaver_proto_t *p, uint16_t channel,
+                              const char *exchange, const char *routing_key,
+                              const void *body, size_t body_len,
+                              const void *props, size_t props_len)
+{
+    bmqp_buf_t a;
+    bmqp_buf_init(&a);
+    bmqp_buf_put_u16(&a, 312);                 /* reply-code: NO_ROUTE */
+    bmqp_buf_put_shortstr(&a, "NO_ROUTE");     /* reply-text */
+    bmqp_buf_put_shortstr(&a, exchange);
+    bmqp_buf_put_shortstr(&a, routing_key);
+    send_method(p, channel, BMQP_CLASS_BASIC, BMQP_BASIC_RETURN, &a);
+    bmqp_buf_free(&a);
+
+    uint32_t fmax = p->conn->frame_max ? p->conn->frame_max : AMQP_DEFAULT_FRAME_MAX;
+    protocol_send_content(p->conn, channel, BMQP_CLASS_BASIC, body, body_len,
+                          props_len ? props : NULL, props_len, fmax);
+}
+
 static void pending_op_timer_cb(uv_timer_t *t)
 {
     pending_cluster_op_t *op = t->data;
@@ -591,6 +614,7 @@ static void publish_reset(beaver_proto_t *p)
     p->pub_props         = NULL;
     p->pub_active        = 0;
     p->pub_have_header   = 0;
+    p->pub_mandatory     = 0;
     p->pub_body_size     = 0;
     p->pub_body_received = 0;
     p->pub_props_len     = 0;
@@ -1619,14 +1643,15 @@ static void handle_basic(beaver_proto_t *p, uint16_t channel,
         size_t en, kn;
         const char *e = bmqp_read_shortstr(r, &en);
         const char *k = bmqp_read_shortstr(r, &kn);
-        bmqp_read_u8(r);                        /* mandatory, immediate bits */
+        uint8_t pubbits = bmqp_read_u8(r);      /* bit0 mandatory, bit1 immediate */
         if (r->error) {
             proto_fatal(p, "malformed Basic.Publish");
             return;
         }
         /* Begin content assembly; the content header + body frames follow. */
         publish_reset(p);
-        p->pub_active  = 1;
+        p->pub_active    = 1;
+        p->pub_mandatory = (pubbits & 0x01) != 0;
         p->pub_channel = channel;
         copy_str(p->pub_exchange, sizeof(p->pub_exchange), e, en);
         copy_str(p->pub_routing_key, sizeof(p->pub_routing_key), k, kn);
@@ -2027,9 +2052,16 @@ static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
             proto_fatal(p, "out of memory building published message");
             return;
         }
-        broker_route(srv->broker, p->vhost, msg);
+        int routed = broker_route(srv->broker, p->vhost, msg);
+        /* mandatory: an unroutable message (no matching queue) must come back to
+         * the publisher via Basic.Return rather than vanishing silently. */
+        if (p->pub_mandatory && routed == ROUTE_UNROUTABLE)
+            send_basic_return(p, p->pub_channel, p->pub_exchange,
+                              p->pub_routing_key, body, body_len,
+                              p->pub_props, p->pub_props_len);
         message_unref(msg);
-        /* Transient publish: nothing to wait for, confirm right away. */
+        /* Transient publish: nothing to wait for, confirm right away. A returned
+         * message is still confirmed (mandatory return is not a nack). */
         if (confirm)
             send_publish_confirm(p, p->pub_channel, ++pubch->confirm_seq, 0);
     }
