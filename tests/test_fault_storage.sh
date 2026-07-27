@@ -80,6 +80,20 @@ run_case "fsync" failstop FAULT_FSYNC_AFTER=0
 echo "== inject write failure on WAL/meta/snap -> fail-stop =="
 run_case "write" failstop FAULT_WRITE_AFTER=0
 
+echo "== a configured-but-unwritable data_dir must be FATAL at startup =="
+uw="$(mktemp -d)"; chmod 000 "$uw"
+out=$(BEAVERMQ_CLUSTER=on BEAVERMQ_NODE_ID=0 BEAVERMQ_CLUSTER_NODES="127.0.0.1:16099" \
+    BEAVERMQ_CLUSTER_SECRET=s BEAVERMQ_AMQP_PORT=25998 BEAVERMQ_HTTP_PORT=25999 \
+    BEAVERMQ_DATA_DIR="$uw/sub" BEAVERMQ_BIND=127.0.0.1 \
+    timeout 5 "$BIN" 2>&1)
+chmod 755 "$uw"; rm -rf "$uw"
+if echo "$out" | grep -q "refusing to start"; then
+    echo "OK: [data_dir-unwritable] cluster refused to start"
+else
+    echo "FAIL: [data_dir-unwritable] cluster did not refuse a broken data_dir"
+    echo "$out" | tail -4; FAILED=1
+fi
+
 echo
 if [ "$FAILED" -eq 0 ]; then
     echo "PASS: storage fault injection - fail-stop verified, control clean"

@@ -952,16 +952,21 @@ static void persist_load(cluster_node_t *n)
                  loaded, (uint64_t)atomic_load(&n->current_term));
 }
 
-static void persist_init(cluster_node_t *n, const char *dir, int self_id)
+/* Returns 0 on success OR when persistence is intentionally disabled (empty
+ * data_dir = in-memory cluster). Returns -1 when a data_dir WAS configured but
+ * could not be set up (mkdir/open/alloc failed): the caller MUST treat that as
+ * a fatal startup error rather than silently running without the durability the
+ * operator asked for (audit P13). */
+static int persist_init(cluster_node_t *n, const char *dir, int self_id)
 {
-    if (!dir || !dir[0]) return; /* persistence disabled */
+    if (!dir || !dir[0]) return 0; /* persistence intentionally disabled */
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
-        LOG_ERROR("cluster: cannot create data_dir '%s' (%s); persistence off",
+        LOG_ERROR("cluster: cannot create data_dir '%s' (%s)",
                   dir, strerror(errno));
-        return;
+        return -1;
     }
     cl_persist_t *ps = calloc(1, sizeof(*ps));
-    if (!ps) return;
+    if (!ps) return -1;
     ps->log_fd = ps->meta_fd = ps->snap_fd = -1;
     snprintf(ps->dir, sizeof ps->dir, "%s", dir);
     ps->self_id = self_id;
@@ -975,16 +980,18 @@ static void persist_init(cluster_node_t *n, const char *dir, int self_id)
     ps->meta_fd = open(path, O_RDWR | O_CREAT, 0600);
     snprintf(path, sizeof path, "%s/cluster-%d.snap", dir, self_id);
     ps->snap_fd = open(path, O_RDWR | O_CREAT, 0600);
-    if (ps->log_fd < 0 || ps->meta_fd < 0) {
+    if (ps->log_fd < 0 || ps->meta_fd < 0 || ps->snap_fd < 0) {
         LOG_ERROR("cluster: cannot open persistence files in '%s' (%s)",
                   dir, strerror(errno));
         if (ps->log_fd >= 0) close(ps->log_fd);
         if (ps->meta_fd >= 0) close(ps->meta_fd);
+        if (ps->snap_fd >= 0) close(ps->snap_fd);
         free(ps);
-        return;
+        return -1;
     }
     n->persist = ps;
     persist_load(n);
+    return 0;
 }
 
 static void persist_free(cluster_node_t *n)
@@ -3110,8 +3117,19 @@ cluster_node_t *cluster_node_new(uv_loop_t *loop, const cluster_config_t *cfg,
     pthread_mutex_init(&n->propose_lock, NULL);
 
     /* Open the on-disk log + replay it (no-op if data_dir is empty). This may
-     * override current_term/voted_for/last_index from persisted state. */
-    persist_init(n, cfg->data_dir, cfg->self_id);
+     * override current_term/voted_for/last_index from persisted state. A
+     * configured-but-unusable data_dir is fatal: refuse to start rather than run
+     * a "durable" cluster that silently keeps everything in RAM (audit P13).
+     * persist_init runs before the peer/uv handles are set up, so cleanup here
+     * is just the propose lock + the node allocation. */
+    if (persist_init(n, cfg->data_dir, cfg->self_id) != 0) {
+        LOG_ERROR("cluster: node %d: data_dir '%s' is configured but unusable; "
+                  "refusing to start (fix the path/permissions or unset data_dir "
+                  "for an in-memory cluster)", cfg->self_id, cfg->data_dir);
+        pthread_mutex_destroy(&n->propose_lock);
+        free(n);
+        return NULL;
+    }
 
     /* Build the peer table: every node id except our own. Lower id dials. */
     int k = 0;
