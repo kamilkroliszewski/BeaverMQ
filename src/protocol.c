@@ -113,6 +113,7 @@ struct beaver_proto {
 
     struct pending_cluster_op *pending_ops; /* in-flight deferred cluster-commit
                                              * responses (see await_cluster_commit) */
+    int            conn_blocked;    /* Connection.Blocked sent, awaiting unblock */
     struct amqp_auth_work *pending_auth;    /* in-flight off-loop SASL password
                                              * verification (see auth_work_*) */
 
@@ -135,6 +136,7 @@ static void send_method(beaver_proto_t *p, uint16_t channel,
 static void send_channel_close(beaver_proto_t *p, uint16_t channel,
                                uint16_t code, const char *text,
                                uint16_t class_id, uint16_t method_id);
+static void send_connection_blocked(beaver_proto_t *p, const char *reason);
 
 /* ========================================================================= */
 /* small helpers                                                              */
@@ -565,6 +567,35 @@ static void send_publish_confirm(beaver_proto_t *p, uint16_t channel,
     bmqp_buf_free(&a);
 }
 
+/* Connection.Blocked / Unblocked (the RabbitMQ extension clients advertise as
+ * the "connection.blocked" capability). Tells the publisher WHY it stopped
+ * making progress instead of leaving it staring at a silent socket. */
+static void send_connection_blocked(beaver_proto_t *p, const char *reason)
+{
+    bmqp_buf_t a;
+    bmqp_buf_init(&a);
+    bmqp_buf_put_shortstr(&a, reason);
+    send_method(p, 0, BMQP_CLASS_CONNECTION, BMQP_CONNECTION_BLOCKED, &a);
+    bmqp_buf_free(&a);
+    LOG_WARN("conn #%" PRIu64 ": blocked (%s)", p->conn->id, reason);
+}
+
+static void send_connection_unblocked(beaver_proto_t *p)
+{
+    send_method(p, 0, BMQP_CLASS_CONNECTION, BMQP_CONNECTION_UNBLOCKED, NULL);
+    LOG_INFO("conn #%" PRIu64 ": unblocked", p->conn->id);
+}
+
+/* Called from the network layer when the memory alarm clears, for every
+ * connection that was told it was blocked. */
+void protocol_conn_unblock(beaver_proto_t *p)
+{
+    if (!p || !p->conn_blocked)
+        return;
+    p->conn_blocked = 0;
+    send_connection_unblocked(p);
+}
+
 static void pending_op_timer_cb(uv_timer_t *t)
 {
     pending_cluster_op_t *op = t->data;
@@ -924,6 +955,7 @@ static void put_capabilities(bmqp_buf_t *t)
     bmqp_buf_init(&caps);
     put_table_bool(&caps, "publisher_confirms", 1);
     put_table_bool(&caps, "basic.nack", 1);
+    put_table_bool(&caps, "connection.blocked", 1);
     bmqp_buf_put_shortstr(t, "capabilities");
     bmqp_buf_put_u8(t, 'F');                  /* field value type: field table */
     if (!caps.error) {
@@ -2373,6 +2405,20 @@ static void finalize_publish(beaver_proto_t *p, const uint8_t *body,
      * consumers. The per-server throttle timer resumes reads once the broker-wide
      * flow alarm clears (see on_throttle_timer / beaver_conn_throttle_read). This
      * complements the cluster-congestion throttle on the replicated path above. */
+    /* Broker-wide memory watermark (RabbitMQ's memory alarm): queues are
+     * unlimited by default, so TOTAL memory is what bounds a runaway producer.
+     * While the alarm is on, block this publisher - but never a connection that
+     * also CONSUMES: pausing that one would stop its ACKs, and the memory we are
+     * waiting to be freed can only be freed by consumers acking. Blocking pure
+     * publishers is safe because the alarm clears without anything from them. */
+    if (queue_memory_alarm_active() &&
+        !dispatcher_conn_has_consumers(srv->dispatcher, p->conn)) {
+        if (!p->conn_blocked) {
+            p->conn_blocked = 1;
+            send_connection_blocked(p, "low on memory");
+        }
+        beaver_conn_throttle_read(p->conn);
+    }
     /* NOTE: a queue at its length/byte limit does NOT pause the connection. The
      * limit is itself the memory bound - an over-limit publish is rejected
      * (QUEUE_FULL -> nack under confirms) or drop-head'd, so reading the client

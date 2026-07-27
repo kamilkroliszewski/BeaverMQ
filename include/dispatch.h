@@ -99,6 +99,12 @@ void dispatcher_resume_conn(beaver_dispatcher_t *d, beaver_conn_t *conn);
  * messages. Called when a connection closes. */
 void dispatcher_remove_connection(beaver_dispatcher_t *d, beaver_conn_t *conn);
 
+/* 1 if `conn` has at least one active consumer on this dispatcher. Used to keep
+ * memory-alarm backpressure deadlock-free: a connection that also CONSUMES must
+ * never be paused, or its ACKs cannot arrive and the memory it is waiting on can
+ * never be freed. Call on the connection's own loop thread. */
+int dispatcher_conn_has_consumers(beaver_dispatcher_t *d, beaver_conn_t *conn);
+
 /* Same, scoped to one channel - call on Channel.Close so a consumer
  * registered via Basic.Consume on that channel (and its unacked messages,
  * and its queue waiter registration) doesn't stay live until the whole

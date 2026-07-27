@@ -567,18 +567,26 @@ queue replicates through Raft. A **passive** declare (`Exchange`/`Queue.Declare`
 with the passive bit) is an existence probe: type/flags/arguments are ignored,
 nothing is created, and a missing object answers `404`.
 
-**Queue limits are the memory bound, not connection backpressure.** When a queue
-reaches `x-max-length` / `x-max-length-bytes` (or the `queue_max_*` defaults) it
-applies its overflow policy — `reject-publish` (the publish is refused, and
-`Basic.Nack`'ed under publisher confirms) or `drop-head` — and the broker keeps
-reading the connection. Discarded publishes are counted and
-reported per queue as `rejected` (reject-publish) and `dropped` (drop-head) on
-`GET /api/queues` and in the dashboard, so a capped queue whose depth has
-stopped moving is visibly full rather than silently lossy. It deliberately does **not** pause the socket: that also
-stops the consumer `Basic.Ack`s travelling on the same connection, which used to
-wedge a publish+consume connection permanently and made throughput swing in
-multi‑second stop/go cycles. Only the cluster replication backlog throttles a
-producer, and that pause is bounded in time.
+**Memory is bounded like RabbitMQ: a broker‑wide watermark, not per‑queue caps.**
+Queues are **unlimited by default** — they grow until the broker crosses
+`memory_high_watermark` (default **0.4**, i.e. 40% of total RAM). At that point
+**publishers** are blocked (`Connection.Blocked` + TCP backpressure) and stay
+blocked until memory falls back under 90% of the watermark; **consumers are
+never blocked**, so draining always clears the alarm. Nothing is discarded.
+
+A client can still cap an individual queue with `x-max-length` /
+`x-max-length-bytes`, and then `x-overflow` decides what happens when it is
+full: `reject-publish` (the default — refused, and `Basic.Nack`'ed under
+publisher confirms) or `drop-head` (the oldest is evicted). Those discards are
+counted and reported per queue as `rejected` and `dropped` on `GET /api/queues`
+and in the dashboard, so a capped queue whose depth has stopped moving is
+visibly full rather than silently lossy. `queue_max_length` / `queue_max_bytes`
+apply the same cap to every queue; both default to 0 (unlimited).
+
+A full queue never pauses its connection: doing so also stops the consumer
+`Basic.Ack`s travelling on it, which wedges a publish+consume connection.
+Only the memory watermark and the cluster replication backlog block producers,
+and neither can be cleared by the blocked client itself.
 
 **Not implemented / partial** (so clients don't assume more than is there):
 

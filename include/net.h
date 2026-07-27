@@ -120,6 +120,8 @@ struct beaver_server {
 
     uv_timer_t           stats_timer; /* periodic stats log (worker 0 only) */
     int                  stats_installed;
+    uv_timer_t           mem_timer;   /* memory watermark sampler (worker 0 only) */
+    int                  mem_installed;
     int64_t              last_reported;
 
     uv_timer_t           throttle_timer; /* polls cluster congestion to resume reads */
@@ -148,6 +150,10 @@ int beaver_server_install_signals(beaver_server_t *server);
 
 /* Periodic stats log every interval_ms (call on one worker only). */
 int beaver_server_install_stats(beaver_server_t *server, uint64_t interval_ms);
+
+/* Start sampling process memory to drive the broker-wide memory alarm (call on
+ * one worker only). No-op when the watermark is disabled. */
+int beaver_server_install_memory_alarm(beaver_server_t *server);
 
 /* Install an async handle so another thread can request this worker's shutdown
  * via beaver_server_request_shutdown(). */

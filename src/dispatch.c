@@ -788,6 +788,16 @@ void dispatcher_cancel(beaver_dispatcher_t *d, beaver_conn_t *conn,
     }
 }
 
+int dispatcher_conn_has_consumers(beaver_dispatcher_t *d, beaver_conn_t *conn)
+{
+    if (!d || !conn)
+        return 0;
+    for (consumer_t *c = d->consumers; c; c = c->next)
+        if (c->conn == conn)
+            return 1;
+    return 0;
+}
+
 void dispatcher_remove_connection(beaver_dispatcher_t *d, beaver_conn_t *conn)
 {
     if (!d)

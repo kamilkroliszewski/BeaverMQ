@@ -27,15 +27,54 @@ static uint64_t g_queue_max_bytes  = 0;
 
 /* Broker-wide producer flow control ("flow alarm"): the number of queues that
  * are currently congested (at/above their high-water mark and not yet drained
- * back below the low-water mark). While this is > 0, publishers are paused via
- * TCP backpressure (uv_read_stop) so they cannot outrun the consumers - the same
- * shape as RabbitMQ's global memory-alarm flow control. A queue only counts if
- * it has an effective length/byte limit (otherwise there is no ratio to watch). */
+ * back below the low-water mark). Kept as an observable congestion SIGNAL only -
+ * it must never pause a socket, because clearing it needs the client's ACKs (see
+ * the note in protocol.c). Real producer backpressure comes from the broker-wide
+ * memory watermark below. A queue only counts if it has an effective
+ * length/byte limit (otherwise there is no ratio to watch). */
 static _Atomic uint64_t g_flow_alarm_count = 0;
 
 int queue_flow_alarm_active(void)
 {
     return atomic_load_explicit(&g_flow_alarm_count, memory_order_relaxed) > 0;
+}
+
+/* ---- broker-wide memory alarm (RabbitMQ's memory high watermark) ---------- *
+ * Queues are UNLIMITED by default, so the thing that must stop a runaway
+ * producer is total broker memory, not an arbitrary per-queue cap. When the
+ * process crosses the watermark the alarm goes on and publishers are blocked;
+ * it clears once memory falls back under a low-water mark (hysteresis), which
+ * happens as consumers drain and the freed messages are released. */
+static _Atomic int      g_mem_alarm = 0;
+static uint64_t         g_mem_high_bytes = 0;  /* 0 = alarm disabled */
+
+int queue_memory_alarm_active(void)
+{
+    return atomic_load_explicit(&g_mem_alarm, memory_order_relaxed);
+}
+
+void queue_set_memory_watermark(uint64_t high_bytes)
+{
+    g_mem_high_bytes = high_bytes;
+    if (!high_bytes)
+        atomic_store_explicit(&g_mem_alarm, 0, memory_order_relaxed);
+}
+
+uint64_t queue_memory_watermark(void) { return g_mem_high_bytes; }
+
+int queue_memory_alarm_update(uint64_t used_bytes)
+{
+    if (!g_mem_high_bytes)
+        return 0;
+    int on = atomic_load_explicit(&g_mem_alarm, memory_order_relaxed);
+    /* Clear at 90% of the watermark so a broker hovering right at the line does
+     * not flap producers on and off every sample. */
+    uint64_t low = g_mem_high_bytes - g_mem_high_bytes / 10;
+    if (!on && used_bytes >= g_mem_high_bytes)
+        atomic_store_explicit(&g_mem_alarm, (on = 1), memory_order_relaxed);
+    else if (on && used_bytes <= low)
+        atomic_store_explicit(&g_mem_alarm, (on = 0), memory_order_relaxed);
+    return on;
 }
 
 void queue_set_default_limits(uint64_t max_length, uint64_t max_bytes)
