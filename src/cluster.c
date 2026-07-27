@@ -1304,11 +1304,19 @@ static void apply_op(cluster_node_t *n, const cluster_log_entry_t *e)
         const uint8_t *body = p;
         if ((uint64_t)(end - p) < bl) break;
         beaver_message_t *m = message_new_full(ex, rk, body, bl, pl ? props : NULL, pl);
-        if (m) {
-            m->cluster_id = e->index;   /* cluster-wide identity = log index */
-            broker_route(n->broker, vh, m);
-            message_unref(m);
+        if (!m) {
+            /* Applying a COMMITTED entry must be deterministic and must never be
+             * skipped: dropping this message would lose data the cluster already
+             * committed (and compaction would later free its log entry, making
+             * the loss permanent). An allocation failure here is node-local and
+             * non-deterministic, so fail-stop this node rather than diverge -
+             * it steps down and stops committing until restarted (audit P3). */
+            storage_write_failed(n, "apply CL_OP_PUBLISH (message allocation)");
+            break;
         }
+        m->cluster_id = e->index;   /* cluster-wide identity = log index */
+        broker_route(n->broker, vh, m);
+        message_unref(m);
         break;
     }
     case CL_OP_ACK: {
