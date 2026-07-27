@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -806,6 +807,27 @@ int main(int argc, char **argv)
     config_resolve_threads(&app.config);
     log_set_level(app.config.log_level);
     queue_set_default_limits(app.config.queue_max_length, app.config.queue_max_bytes);
+    /* Broker-wide memory watermark (RabbitMQ's model): queues are unlimited by
+     * default, so this - not a per-queue cap - is what stops a runaway producer
+     * from taking the machine down. Resolve the configured fraction of total RAM
+     * into an absolute byte figure once, at startup. */
+    if (app.config.memory_high_watermark > 0.0) {
+        long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && psz > 0) {
+            uint64_t total = (uint64_t)pages * (uint64_t)psz;
+            uint64_t high  = (uint64_t)((double)total * app.config.memory_high_watermark);
+            queue_set_memory_watermark(high);
+            LOG_INFO("memory watermark: %.0f%% of %" PRIu64 " MiB = %" PRIu64
+                     " MiB (publishers are blocked above this)",
+                     app.config.memory_high_watermark * 100.0,
+                     total / (1024 * 1024), high / (1024 * 1024));
+        } else {
+            LOG_WARN("cannot determine total RAM; memory watermark disabled");
+        }
+    } else {
+        LOG_WARN("memory_high_watermark = 0: publishers are never blocked; a "
+                 "queue with no consumer can grow until the broker is killed");
+    }
     authlimit_init(); /* login rate limiter / concurrent-hash cap */
 
     LOG_INFO("BeaverMQ %s (build %s) starting up "
@@ -891,6 +913,7 @@ int main(int argc, char **argv)
     w0->server.on_shutdown_ctx = &app;
     beaver_server_install_signals(&w0->server);
     beaver_server_install_stats(&w0->server, 2000 /* ms */);
+    beaver_server_install_memory_alarm(&w0->server);
     install_heartbeat_writer(&w0->loop);
 
     /* HTTP management server on a DEDICATED loop/thread (never starved by AMQP

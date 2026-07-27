@@ -21,6 +21,10 @@
 #include "cluster.h"
 
 #include <inttypes.h>
+
+#ifdef __GLIBC__
+#include <malloc.h>   /* malloc_trim: give freed arenas back so RSS is truthful */
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -479,6 +483,54 @@ static void on_new_connection(uv_stream_t *server_stream, int status)
 
 /* ---- periodic stats ------------------------------------------------------ */
 
+/* Current resident set size in bytes, or 0 if it cannot be read. RSS captures
+ * everything the broker holds - queued message bodies, the replicated log,
+ * connection buffers - which is exactly what the memory watermark must bound. */
+static uint64_t process_rss_bytes(void)
+{
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f)
+        return 0;
+    unsigned long total = 0, resident = 0;
+    int n = fscanf(f, "%lu %lu", &total, &resident);
+    fclose(f);
+    if (n != 2)
+        return 0;
+    long page = sysconf(_SC_PAGESIZE);
+    return (uint64_t)resident * (uint64_t)(page > 0 ? page : 4096);
+}
+
+/* Sample memory and drive the broker-wide alarm. Producers are blocked while it
+ * is on (see the publish path); consumers keep running, so draining is what
+ * clears it. Runs on worker 0 only - the alarm state itself is global. */
+static void on_memory_timer(uv_timer_t *timer)
+{
+    beaver_server_t *server = timer->data;
+    if (server->shutting_down)
+        return;
+    int was_on = queue_memory_alarm_active();
+#ifdef __GLIBC__
+    /* While blocked, hand freed arenas back to the OS before sampling. glibc
+     * keeps free()d memory in its arenas, so a queue that consumers have fully
+     * drained still shows the old RSS - without this the alarm could never
+     * clear and publishers would stay blocked on memory that is no longer used.
+     * Only runs while the alarm is on (a few times a second at most). */
+    if (was_on)
+        malloc_trim(0);
+#endif
+    uint64_t rss = process_rss_bytes();
+    if (!rss)
+        return;
+    int now_on = queue_memory_alarm_update(rss);
+    if (now_on && !was_on)
+        LOG_WARN("memory alarm ON: %" PRIu64 " MiB used >= watermark %" PRIu64
+                 " MiB - blocking publishers until consumers drain",
+                 rss / (1024 * 1024), queue_memory_watermark() / (1024 * 1024));
+    else if (!now_on && was_on)
+        LOG_INFO("memory alarm cleared: %" PRIu64 " MiB used - publishers resumed",
+                 rss / (1024 * 1024));
+}
+
 static void on_stats_timer(uv_timer_t *timer)
 {
     beaver_server_t *server = timer->data;
@@ -517,32 +569,24 @@ static void on_shutdown_async(uv_async_t *handle)
 
 /* While any producer is paused, this per-server timer polls the cluster's
  * congestion flag and resumes reads once it clears. */
-/* Longest a producer may stay paused before we let it run again even though the
- * congestion signal is still on. A pause stops reading the WHOLE connection,
- * which also stops any consumer ACKs travelling on it - and those acks are what
- * frees the prefetch window so deliveries can drain the queue that raised the
- * alarm. An unbounded pause therefore deadlocks a connection that both publishes
- * and consumes: acks can never arrive, the queue never drains, the alarm never
- * clears. Bounding the pause turns hard backpressure into a duty cycle: the
- * producer is still throttled to roughly the drain rate, but progress (and the
- * acks) is always possible. */
-#define BEAVER_MAX_THROTTLE_PAUSE_MS 50
-
 static void on_throttle_timer(uv_timer_t *timer)
 {
     beaver_server_t *server = timer->data;
-    /* Keep producers paused while the cluster is congested (durable replication
-     * backlog - the one signal with no other bound), but never for longer than
-     * BEAVER_MAX_THROTTLE_PAUSE_MS in one stretch (see above). A still-congested
-     * broker simply re-pauses the producer on its next publish.
-     * A full local queue deliberately does NOT hold producers paused: the queue
-     * limit already bounds memory by rejecting/evicting, and pausing the socket
-     * also blocked the consumer ACKs travelling on it (see protocol.c). */
-    uint64_t now = uv_now(server->loop);
-    int congested = server->cluster && cluster_should_throttle(server->cluster);
-    if (!server->shutting_down && congested &&
-        (server->throttle_since_ms == 0 ||
-         now - server->throttle_since_ms < BEAVER_MAX_THROTTLE_PAUSE_MS))
+    /* Producers stay paused for as long as the CLUSTER replication backlog is
+     * congested. That pause must not be time-bounded: the uncommitted Raft
+     * backlog is the only thing bounding the leader's memory, and letting
+     * producers back in on a timer lets the log grow without limit (measured:
+     * a leader ballooning to 12 GB while its followers sat at ~350 MB).
+     *
+     * It is safe to hold this one indefinitely because it CLEARS ON ITS OWN:
+     * replication and commit progress need nothing from the paused client. The
+     * congestion signal that must NEVER pause a socket is a full local queue -
+     * clearing that one requires the client's ACKs, so pausing it deadlocks the
+     * connection (see the note in protocol.c's publish path). Queue limits
+     * therefore bound memory by rejecting/evicting instead. */
+    int congested = (server->cluster && cluster_should_throttle(server->cluster)) ||
+                    queue_memory_alarm_active();
+    if (!server->shutting_down && congested)
         return;
 
     pthread_mutex_lock(&server->conns_lock);
@@ -551,11 +595,13 @@ static void on_throttle_timer(uv_timer_t *timer)
             c->read_paused = 0;
             uv_read_start((uv_stream_t *)&c->handle, alloc_buffer, on_read);
         }
+        /* Tell anyone we blocked that publishing may resume. */
+        if (!c->closing)
+            protocol_conn_unblock(c->proto);
     }
     pthread_mutex_unlock(&server->conns_lock);
     uv_timer_stop(timer);
-    server->throttle_started   = 0;
-    server->throttle_since_ms  = 0;
+    server->throttle_started = 0;
 }
 
 void beaver_conn_throttle_read(beaver_conn_t *conn)
@@ -566,8 +612,7 @@ void beaver_conn_throttle_read(beaver_conn_t *conn)
     uv_read_stop((uv_stream_t *)&conn->handle);
     conn->read_paused = 1;
     if (!server->throttle_started) {
-        server->throttle_started  = 1;
-        server->throttle_since_ms = uv_now(server->loop); /* bounds this pause */
+        server->throttle_started = 1;
         uv_timer_start(&server->throttle_timer, on_throttle_timer, 4, 4);
     }
 }
@@ -646,6 +691,21 @@ int beaver_server_install_stats(beaver_server_t *server, uint64_t interval_ms)
     server->stats_timer.data = server;
     server->stats_installed  = 1;
     uv_timer_start(&server->stats_timer, on_stats_timer, interval_ms, interval_ms);
+    return 0;
+}
+
+int beaver_server_install_memory_alarm(beaver_server_t *server)
+{
+    if (!queue_memory_watermark())
+        return 0; /* alarm disabled by config */
+    int rc = uv_timer_init(server->loop, &server->mem_timer);
+    if (rc != 0)
+        return rc;
+    server->mem_timer.data = server;
+    server->mem_installed  = 1;
+    /* 200 ms: fast enough that a 100+ MB/s producer overshoots the watermark by
+     * only tens of MB before it is blocked. */
+    uv_timer_start(&server->mem_timer, on_memory_timer, 200, 200);
     return 0;
 }
 

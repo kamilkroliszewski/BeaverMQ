@@ -36,6 +36,9 @@ typedef struct {
     uint32_t http_request_timeout_ms; /* max time to receive one full request */
     uint64_t queue_max_length;      /* max messages per queue; 0 = unlimited */
     uint64_t queue_max_bytes;       /* max body bytes per queue; 0 = unlimited */
+    /* Fraction of total system RAM at which publishers are blocked (RabbitMQ's
+     * memory high watermark; default 0.4). 0 disables the alarm. */
+    double   memory_high_watermark;
 
     /* Clustering (optional; disabled unless cluster_nodes is configured). */
     int  cluster_enabled;

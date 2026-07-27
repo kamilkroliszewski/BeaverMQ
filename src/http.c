@@ -206,13 +206,26 @@ static int queue_to_json(beaver_queue_t *q, void *ctx)
                         json_integer((json_int_t)queue_total_enqueued(q)));
     json_object_set_new(o, "dequeued",
                         json_integer((json_int_t)queue_total_dequeued(q)));
+    /* Messages the queue DISCARDED because it was at its limit. Without these a
+     * full queue looks identical to an idle one: the depth just stops moving
+     * while publishers keep sending into the void. */
+    json_object_set_new(o, "rejected",
+                        json_integer((json_int_t)queue_total_rejected(q)));
+    json_object_set_new(o, "dropped",
+                        json_integer((json_int_t)queue_total_dropped(q)));
     json_object_set_new(o, "durable",
                         json_boolean(queue_flags(q) & BMQP_FLAG_DURABLE));
     /* Per-queue policy (also lets a cluster test confirm it replicated). */
+    /* Report the EFFECTIVE limit: a queue with no per-queue override inherits
+     * the broker-wide default, and reporting 0 there made a capped queue look
+     * unlimited (the depth just stopped growing with no visible reason). */
+    uint64_t def_len = 0, def_bytes = 0;
+    queue_get_default_limits(&def_len, &def_bytes);
+    uint64_t qml = queue_max_length(q), qmb = queue_max_bytes(q);
     json_object_set_new(o, "max_length",
-                        json_integer((json_int_t)queue_max_length(q)));
+                        json_integer((json_int_t)(qml ? qml : def_len)));
     json_object_set_new(o, "max_bytes",
-                        json_integer((json_int_t)queue_max_bytes(q)));
+                        json_integer((json_int_t)(qmb ? qmb : def_bytes)));
     json_object_set_new(o, "overflow",
                         json_string(queue_overflow(q) == QUEUE_OVERFLOW_DROP_HEAD
                                     ? "drop-head" : "reject-publish"));

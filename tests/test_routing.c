@@ -124,6 +124,13 @@ static void test_queue_default_limits(void)
     CHECK_EQ(queue_enqueue(q, m2), 0);
     CHECK_EQ(queue_enqueue(q, m3), QUEUE_FULL); /* 3rd exceeds max_length=2 */
     CHECK_EQ(queue_depth(q), 2);
+    /* The refusal must be COUNTED: without publisher confirms this counter is
+     * the only signal that a full queue is discarding publishes (the depth just
+     * stops moving while producers keep sending). */
+    CHECK_EQ(queue_total_rejected(q), 1);
+    CHECK_EQ(queue_enqueue(q, m3), QUEUE_FULL);
+    CHECK_EQ(queue_total_rejected(q), 2);
+    CHECK_EQ(queue_total_dropped(q), 0); /* reject-publish never evicts */
     message_unref(m1); message_unref(m2); message_unref(m3);
     queue_unref(q);
 
@@ -569,6 +576,33 @@ static void test_producer_consumer_stress(void)
     queue_unref(g_stress_q);
 }
 
+
+/* The broker-wide memory alarm is what bounds an unlimited queue (queues have
+ * no default cap, like RabbitMQ). It must latch at the watermark and only clear
+ * after usage falls back under the low-water mark, so publishers are not
+ * flapped on and off around the line. */
+static void test_memory_alarm_hysteresis(void)
+{
+    TEST_SECTION("memory alarm latches at the watermark and clears at 90% of it");
+    queue_set_memory_watermark(1000);
+    CHECK(!queue_memory_alarm_active());
+
+    CHECK_EQ(queue_memory_alarm_update(500), 0);   /* well under */
+    CHECK_EQ(queue_memory_alarm_update(999), 0);   /* just under */
+    CHECK_EQ(queue_memory_alarm_update(1000), 1);  /* at the watermark: ON */
+    CHECK(queue_memory_alarm_active());
+
+    CHECK_EQ(queue_memory_alarm_update(950), 1);   /* still above low-water: stays ON */
+    CHECK_EQ(queue_memory_alarm_update(901), 1);
+    CHECK_EQ(queue_memory_alarm_update(900), 0);   /* 90%: clears */
+    CHECK(!queue_memory_alarm_active());
+
+    /* 0 disables the alarm entirely (and clears any latched state). */
+    queue_set_memory_watermark(0);
+    CHECK_EQ(queue_memory_alarm_update(1u << 30), 0);
+    CHECK(!queue_memory_alarm_active());
+}
+
 int main(void)
 {
     test_message_refcounting();
@@ -582,6 +616,7 @@ int main(void)
     test_queue_overflow_drop_head_lone_big();
     test_queue_dead_letter_drop_head();
     test_queue_flow_alarm();
+    test_memory_alarm_hysteresis();
     test_queue_requeue_bypasses_limits();
     test_exchange_type_name_roundtrip();
     test_exchange_direct_routing();

@@ -50,12 +50,28 @@ void        queue_set_vhost(beaver_queue_t *q, const char *vhost);
  * queue's memory use without bound even though each individual message
  * respects max_message_size. Set once at startup. */
 void queue_set_default_limits(uint64_t max_length, uint64_t max_bytes);
+/* Read back those broker-wide defaults (0 = unlimited), so callers can report
+ * the EFFECTIVE limit of a queue that has no per-queue override. */
+void queue_get_default_limits(uint64_t *max_length, uint64_t *max_bytes);
 
 /* Broker-wide producer flow control. Returns non-zero while at least one queue
  * is congested (has crossed its high-water mark and not yet drained below the
  * low-water mark). Publishers pause their socket reads (TCP backpressure) while
  * this holds, so they cannot outrun the consumers into an out-of-memory queue. */
 int queue_flow_alarm_active(void);
+
+/* ---- broker-wide memory alarm (RabbitMQ's memory high watermark) ---------- *
+ * Queues are unlimited by default, so total broker memory - not a per-queue cap
+ * - is what bounds a runaway producer. While the alarm is on, publishing
+ * connections are blocked (Connection.Blocked + paused reads) until memory
+ * falls back below 90% of the watermark. */
+/* Set the watermark in bytes (0 disables the alarm). */
+void     queue_set_memory_watermark(uint64_t high_bytes);
+uint64_t queue_memory_watermark(void);
+/* Feed the current usage; returns the new alarm state (with hysteresis). */
+int      queue_memory_alarm_update(uint64_t used_bytes);
+/* 1 while publishers should be blocked. Safe from any thread. */
+int      queue_memory_alarm_active(void);
 
 /* What a queue does when a publish would exceed its length/byte limit. */
 typedef enum {
@@ -78,6 +94,10 @@ void             queue_dead_letter_info(beaver_queue_t *q, char *ex_out,
 
 /* Messages evicted by the drop-head overflow policy (management metric). */
 uint64_t queue_total_dropped(beaver_queue_t *q);
+/* Publishes refused because the queue was at its limit (reject-publish). With
+ * no publisher confirms the client never learns about these, so this counter is
+ * the only visible signal that a full queue is discarding messages. */
+uint64_t queue_total_rejected(beaver_queue_t *q);
 
 /* ---- dead-lettering ------------------------------------------------------ *
  * A queue may have a dead-letter target: when a message leaves the queue as a

@@ -89,8 +89,16 @@ void config_defaults(beaver_config_t *c)
      * (QUEUE_FULL) rather than swallowing all RAM. Generous enough not to bite
      * normal workloads; an operator can raise them, or set either to 0 to
      * disable that dimension explicitly. */
-    c->queue_max_length = 1000000u;                 /* 1M messages per queue */
-    c->queue_max_bytes  = 256u * 1024u * 1024u;     /* 256 MiB body per queue */
+    /* UNLIMITED by default, like RabbitMQ: a queue grows until the client caps
+     * it (x-max-length / x-max-length-bytes) or the broker-wide memory
+     * watermark blocks publishers. Hard per-queue defaults silently DISCARD
+     * messages once hit, which is the wrong trade for a broker - the operator
+     * opts into that per queue, or sets these to bound every queue. */
+    c->queue_max_length = 0;
+    c->queue_max_bytes  = 0;
+    /* Broker-wide memory watermark: fraction of total RAM at which publishers
+     * are blocked (RabbitMQ's default is 0.4). 0 disables the alarm. */
+    c->memory_high_watermark = 0.4;
 
     c->cluster_enabled   = 0;
     c->cluster_explicit  = 0;
@@ -267,6 +275,14 @@ static void apply_kv(beaver_config_t *c, const char *key, const char *val,
                      "(bytes, or with k/m suffix)", src, val);
         else
             c->queue_max_bytes = v;
+    } else if (strcmp(key, "memory_high_watermark") == 0) {
+        char *end = NULL;
+        double v = strtod(val, &end);
+        if (end == val || *end != '\0' || v < 0.0 || v > 1.0)
+            LOG_WARN("config(%s): invalid memory_high_watermark '%s' "
+                     "(fraction of RAM, 0.0-1.0; 0 disables)", src, val);
+        else
+            c->memory_high_watermark = v;
     } else if (strcmp(key, "cluster") == 0) {
         if (parse_bool(val, &c->cluster_enabled) != 0)
             LOG_WARN("config(%s): invalid cluster '%s' (use on/off)", src, val);

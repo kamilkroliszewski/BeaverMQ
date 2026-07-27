@@ -51,6 +51,8 @@ typedef struct beaver_proto beaver_proto_t;
 #define BMQP_CONNECTION_OPEN_OK   41  /* S->C */
 #define BMQP_CONNECTION_CLOSE     50  /* either */
 #define BMQP_CONNECTION_CLOSE_OK  51  /* either */
+#define BMQP_CONNECTION_BLOCKED   60  /* S->C: publishers blocked (memory alarm) */
+#define BMQP_CONNECTION_UNBLOCKED 61  /* S->C: publishing may resume */
 
 /* ---- channel methods (class 20) ------------------------------------------ */
 #define BMQP_CHANNEL_OPEN      10  /* C->S */
@@ -116,6 +118,10 @@ beaver_proto_t *protocol_conn_new(beaver_conn_t *conn);
 
 /* Release all protocol state. Safe with NULL. */
 void protocol_conn_free(beaver_proto_t *p);
+
+/* Tell a previously-blocked connection it may publish again (Connection.Unblocked).
+ * No-op unless it was blocked. Call on the connection's own loop thread. */
+void protocol_conn_unblock(beaver_proto_t *p);
 
 /*
  * Feed `len` freshly-read bytes into the state machine. Buffers partial
